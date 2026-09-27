@@ -30,12 +30,12 @@
 #pragma once
 
 // ---------------------------------------------------------------------------
-// 实际 include 区（随批次逐步填充；当前为第 1 批骨架，尚无模块头）
+// 实际 include 区（随批次逐步填充）
 // ---------------------------------------------------------------------------
-// 第 2 批：
-// #include "core/util.h"
-// #include "core/logger.h"
-//
+// 第 2 批（已接入）
+#include "core/util.h"
+#include "core/logger.h"
+
 // 第 3 批：
 // #include "core/task_queue.h"
 // #include "core/thread_pool.h"

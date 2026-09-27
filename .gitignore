@@ -18,8 +18,10 @@ CTestTestfile.cmake
 # 日志与运行时文件
 logs/
 *.log
-core
-core.*
+# 崩溃转储：必须锚定仓库根目录，否则会误伤 src/core/ 整个目录（gitignore 的
+# "core" 规则会匹配任何层级的同名目录，导致核心模块源码永远无法入库）
+/core
+/core.[0-9]*
 
 # 媒体文件（体积大，不入库）
 media/*.h264

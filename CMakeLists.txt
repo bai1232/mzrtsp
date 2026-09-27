@@ -65,8 +65,8 @@ endif()
 # ============================================================================
 set(MZMEDIA_SOURCES
         # 第 2 批
-        # src/core/util.cpp
-        # src/core/logger.cpp
+        src/core/util.cpp
+        src/core/logger.cpp
         # 第 3 批
         # src/core/task_queue.cpp
         # src/core/thread_pool.cpp

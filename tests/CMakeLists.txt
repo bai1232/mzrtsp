@@ -13,8 +13,8 @@
 set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_main.cpp
         # ---- 第 2 批 ----
-        # ${CMAKE_CURRENT_SOURCE_DIR}/test_util.cpp
-        # ${CMAKE_CURRENT_SOURCE_DIR}/test_logger.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_util.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_logger.cpp
         # ---- 第 3 批 ----
         # ${CMAKE_CURRENT_SOURCE_DIR}/test_task_queue.cpp
         # ${CMAKE_CURRENT_SOURCE_DIR}/test_thread_pool.cpp
@@ -25,7 +25,9 @@ set(MZMEDIA_TEST_SOURCES
 
 set(MZMEDIA_TEST_GROUPS
         selftest
-        # ---- 第 2 批 ----  util logger
+        # ---- 第 2 批 ----
+        util
+        logger
         # ---- 第 3 批 ----  queue pool semaphore
         # ---- 第 4 批 ----  core
         )
