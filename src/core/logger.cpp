@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 
 namespace mzmedia {
 
@@ -42,6 +43,34 @@ const char *levelNameLong(LogLevel level) {
 namespace {
 
 constexpr const char *kColorReset = "\033[0m";
+
+// ---------------------------------------------------------------------------
+// 防御式调用封装
+//
+// LogWriter 是可扩展的（使用者可以实现网络 writer、数据库 writer 等），
+// 它抛出的异常绝不能影响其它 writer，更不能把日志线程弄死 ——
+// 日志线程一旦退出，整个进程的日志会永久静默，属于最严重的故障。
+// ---------------------------------------------------------------------------
+void writeToWriterSafely(const LogWriter::Ptr &writer, const LogContext &ctx) {
+    try {
+        writer->write(ctx);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "[mzmedia][Logger] writer 写日志抛异常（已忽略，日志线程继续）: %s\n",
+                     e.what());
+    } catch (...) {
+        std::fprintf(stderr, "[mzmedia][Logger] writer 写日志抛出未知异常（已忽略，日志线程继续）\n");
+    }
+}
+
+void flushWriterSafely(const LogWriter::Ptr &writer) {
+    try {
+        writer->flush();
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "[mzmedia][Logger] writer flush 抛异常（已忽略）: %s\n", e.what());
+    } catch (...) {
+        std::fprintf(stderr, "[mzmedia][Logger] writer flush 抛出未知异常（已忽略）\n");
+    }
+}
 
 const char *levelColor(LogLevel level) {
     switch (level) {
@@ -123,12 +152,44 @@ FileWriter::FileWriter(const std::string &file, uint64_t max_size, int max_files
           _name(basename(file)),
           _max_size(max_size),
           _max_files(max_files) {
-    createDirectory(_dir);
-    _ofs.open(_file, std::ios::binary | std::ios::app);
-    if (_ofs.good()) {
-        _ofs.seekp(0, std::ios::end);
-        _written = static_cast<uint64_t>(_ofs.tellp());
+    // 防御式编程：构造函数无法返回失败，所以每个可能失败的系统调用都必须
+    // ① 检查返回值 ② 让失败可见（stderr 告警） ③ 由 isOpen() 暴露给调用方。
+    if (!createDirectory(_dir)) {
+        // 这里不能走 ErrorP：构造 FileWriter 时日志器可能还没配好 writer，
+        // 直接写 stderr 才能保证一定被看到。
+        std::fprintf(stderr, "[mzmedia][FileWriter] 日志目录创建失败: %s (errno=%d)\n",
+                     _dir.c_str(), errno);
     }
+
+    _ofs.open(_file, std::ios::binary | std::ios::app);
+    if (!_ofs.good()) {
+        std::fprintf(stderr, "[mzmedia][FileWriter] 日志文件打开失败: %s\n", _file.c_str());
+        return;
+    }
+
+    // app 模式下打开后 put 指针的初始位置不保证在末尾，先 seek 再取大小
+    if (!_ofs.seekp(0, std::ios::end)) {
+        std::fprintf(stderr, "[mzmedia][FileWriter] 定位文件末尾失败: %s\n", _file.c_str());
+        return;
+    }
+    // tellp() 失败返回 -1，直接 static_cast<uint64_t> 会变成 18446744073709551615，
+    // 导致下一次写入立刻触发一次滚动（历史里出现空文件），必须先判断。
+    const std::streamoff size = static_cast<std::streamoff>(_ofs.tellp());
+    _written = size > 0 ? static_cast<uint64_t>(size) : 0;
+}
+
+bool FileWriter::isOpen() const {
+    std::lock_guard<std::mutex> lck(_mtx);
+    return _ofs.good();
+}
+
+void FileWriter::warnUnavailableOnce(const char *reason) {
+    // 调用者必须已持有 _mtx（本函数只读/写 _warned）
+    if (_warned) {
+        return;
+    }
+    _warned = true;
+    std::fprintf(stderr, "[mzmedia][FileWriter] %s，后续日志将被丢弃: %s\n", reason, _file.c_str());
 }
 
 uint64_t FileWriter::writtenBytes() const {
@@ -144,10 +205,18 @@ uint64_t FileWriter::rollCount() const {
 void FileWriter::write(const LogContext &ctx) {
     std::lock_guard<std::mutex> lck(_mtx);
     if (!_ofs.good()) {
+        // 已不可用（打开失败，或之前写失败）：告警一次后安静丢弃
+        warnUnavailableOnce("日志文件不可用");
         return;
     }
     const std::string line = ctx.str() + "\n";
     _ofs.write(line.data(), static_cast<std::streamsize>(line.size()));
+    if (!_ofs.good()) {
+        // 写盘失败（最常见原因：磁盘满、目录权限被改）—— 必须让运维看见，
+        // 否则日志静默消失，排查线上问题时会被彻底误导。
+        warnUnavailableOnce("日志写入失败（可能磁盘已满或权限不足）");
+        return;
+    }
     _written += line.size();
     if (_max_size > 0 && _written >= _max_size) {
         roll();
@@ -193,6 +262,8 @@ bool FileWriter::roll() {
     _written = 0;
     ++_roll_count;
     if (!_ofs.good()) {
+        // 滚动后重新打开失败：旧文件已改名走、新文件打不开 → writer 彻底不可用
+        std::fprintf(stderr, "[mzmedia][FileWriter] 滚动后重新打开失败: %s\n", _file.c_str());
         return false;
     }
     if (_max_files > 0) {
@@ -227,7 +298,11 @@ void FileWriter::removeOldFiles() {
     const size_t remove_count = history.size() - static_cast<size_t>(_max_files);
     for (size_t i = 0; i < remove_count; ++i) {
         const std::string path = _dir + "/" + history[i];
-        (void) ::remove(path.c_str());
+        if (::remove(path.c_str()) != 0) {
+            // 删不掉不致命（磁盘占用会缓慢增长），但必须让运维知道
+            std::fprintf(stderr, "[mzmedia][FileWriter] 删除历史日志失败: %s (errno=%d)\n",
+                         path.c_str(), errno);
+        }
     }
 }
 
@@ -243,8 +318,11 @@ Logger &Logger::Instance() {
 Logger::Logger() {
     _thread = std::thread([this]() { run(); });
     _thread_id = _thread.get_id();
-    // 退出阶段收尾：flush 队列、停日志线程
-    std::atexit(&Logger::atexitHandler);
+    // 退出阶段收尾：flush 队列、停日志线程。
+    // atexit 注册失败会导致退出阶段的日志丢失，所以必须检查返回值。
+    if (std::atexit(&Logger::atexitHandler) != 0) {
+        std::fprintf(stderr, "[mzmedia][Logger] atexit 注册失败，退出阶段的日志可能丢失\n");
+    }
 }
 
 Logger::~Logger() {
@@ -304,12 +382,13 @@ void Logger::write(const std::shared_ptr<LogContext> &ctx) {
 void Logger::writeNow(const LogContext &ctx) {
     const auto targets = writers();
     for (const auto &writer : targets) {
-        writer->write(ctx);
+        // 同步模式下 writer 抛异常会直接抛给业务代码 —— 日志绝不能弄坏业务逻辑
+        writeToWriterSafely(writer, ctx);
     }
     if (ctx.level() == LogLevel::Fatal) {
         // Fatal 立即落盘，保证崩溃前日志不丢
         for (const auto &writer : targets) {
-            writer->flush();
+            flushWriterSafely(writer);
         }
     }
 }
@@ -329,18 +408,27 @@ void Logger::run() {
             _writing = true;
         }
 
-        const auto targets = writers();
-        for (const auto &ctx : todo) {
-            for (const auto &writer : targets) {
-                writer->write(*ctx);
-            }
-            if (ctx->level() == LogLevel::Fatal) {
+        // 整批处理必须兜住所有异常：日志线程一旦退出，全进程日志会永久静默
+        try {
+            const auto targets = writers();
+            for (const auto &ctx : todo) {
                 for (const auto &writer : targets) {
-                    writer->flush();
+                    writeToWriterSafely(writer, *ctx);
+                }
+                if (ctx->level() == LogLevel::Fatal) {
+                    for (const auto &writer : targets) {
+                        flushWriterSafely(writer);
+                    }
                 }
             }
+        } catch (const std::exception &e) {
+            std::fprintf(stderr, "[mzmedia][Logger] 日志线程捕获异常（线程继续运行）: %s\n", e.what());
+        } catch (...) {
+            std::fprintf(stderr, "[mzmedia][Logger] 日志线程捕获未知异常（线程继续运行）\n");
         }
 
+        // 无论上面发生了什么，都必须复位 _writing 并唤醒等待者：
+        // 漏掉这一步会把"日志故障"升级成"业务线程在 flush() 上永久阻塞"。
         {
             std::lock_guard<std::mutex> lck(_mtx);
             _writing = false;
@@ -354,7 +442,7 @@ void Logger::flush() {
     // 同步模式、没有日志线程、或在日志线程内部 —— 直接刷新 writer，不能等待（会自等）
     if (!_async.load() || !_thread.joinable() || in_log_thread) {
         for (const auto &writer : writers()) {
-            writer->flush();
+            flushWriterSafely(writer);
         }
         return;
     }
@@ -364,7 +452,7 @@ void Logger::flush() {
         _cv_flush.wait(lck, [this]() { return _queue.empty() && !_writing; });
     }
     for (const auto &writer : writers()) {
-        writer->flush();
+        flushWriterSafely(writer);
     }
 }
 
@@ -380,7 +468,7 @@ void Logger::shutdown() {
     _thread.join();
     // 线程退出前已把队列写空，这里只需刷新 writer 缓冲
     for (const auto &writer : writers()) {
-        writer->flush();
+        flushWriterSafely(writer);
     }
 }
 

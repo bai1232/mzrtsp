@@ -102,6 +102,9 @@ private:
  *      若目标名已存在（同毫秒连续滚动），追加 -1 / -2 ... 序号，绝不覆盖已有历史；
  *   3. 滚动后清理旧历史，**只保留最近的 max_files 个**；max_files <= 0 表示不清理；
  *   4. 改名失败不致命：打 stderr 提示并截断重写，保证日志不丢。
+ *   5. 失败可见性（防御式设计）：目录创建失败、文件打开失败、定位失败、写入失败
+ *      都会向 stderr 告警一次，并通过 isOpen() 暴露给调用方 ——
+ *      日志系统自身的故障绝不能静默，否则排查线上问题时会被彻底误导。
  */
 class FileWriter : public LogWriter {
 public:
@@ -130,21 +133,35 @@ public:
     uint64_t writtenBytes() const;
     uint64_t rollCount() const;
 
+    /**
+     * 是否可用
+     *
+     * 防御式设计：构造函数无法返回失败，若不给调用方检查手段，日志会静默消失。
+     * 目录创建失败、文件打开失败、定位失败，或写入过程中出错（磁盘满/权限变更）
+     * 之后本函数返回 false；此时 write() 会丢弃日志（并已向 stderr 告警一次）。
+     */
+    bool isOpen() const;
+
 private:
     bool roll();
     std::string makeRollPath();
     void removeOldFiles();
 
-    const std::string _file;
-    const std::string _dir;
-    const std::string _name;
+    /// 不可用告警只打一次，避免刷屏。**调用者必须已持有 _mtx。**
+    void warnUnavailableOnce(const char *reason);
+
+    const std::string _file;   //完整路径名 logs/mzmedia.log
+    const std::string _dir;    //目录：logs
+    const std::string _name;   //文件名：mzmedia.log
+    // 如果只有一个 _file，每次滚动都要用字符串切割算出目录和文件名，容易出错
     const uint64_t _max_size;
     const int _max_files;
 
     mutable std::mutex _mtx;
     std::ofstream _ofs;
-    uint64_t _written = 0;
+    uint64_t _written = 0;   //当前文件已写了多少字节。
     uint64_t _roll_count = 0;
+    bool _warned = false;
 };
 
 // ---------------------------------------------------------------------------

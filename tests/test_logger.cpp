@@ -15,6 +15,7 @@
 
 #include <cstdlib>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -406,4 +407,100 @@ MZ_TEST(logger_file_relative_path) {
 
     MZ_ASSERT_EQ(::chdir("/"), 0);
     (void) ::system(("rm -rf " + root).c_str());
+}
+
+// ---------------------------------------------------------------------------
+// 防御式设计：失败必须可见
+// ---------------------------------------------------------------------------
+
+/*
+ * 构造失败必须可被调用方察觉
+ *
+ * 旧实现：createDirectory 返回值被忽略、open 失败也只是静默（good() 为假时直接 return），
+ * 调用方没有任何手段知道"这个 writer 根本写不出日志"。
+ */
+MZ_TEST(logger_file_writer_open_failure) {
+    LoggerGuard guard;
+    const std::string root = "/tmp/mzmedia_logger_bad";
+    (void) ::system(("rm -rf " + root).c_str());
+    // 让路径中间有一段是普通文件：目录创建与文件打开都必然失败
+    MZ_ASSERT_TRUE(saveFile(root + "/blocker", "x"));
+
+    FileWriter writer(root + "/blocker/sub/a.log", 0, 0);
+    // 关键：必须能察觉失败，否则日志会静默消失
+    MZ_ASSERT_FALSE(writer.isOpen());
+    MZ_ASSERT_EQ(writer.writtenBytes(), 0u);
+
+    // 失败后写入：不得崩溃、不得产生字节、不得创建文件
+    LogContext ctx(LogLevel::Info, __FILE__, __LINE__, __func__);
+    ctx.stream() << "should be dropped";
+    writer.write(ctx);
+    writer.flush();
+    MZ_ASSERT_EQ(writer.writtenBytes(), 0u);
+    MZ_ASSERT_FALSE(fileExists(root + "/blocker/sub/a.log"));
+
+    (void) ::system(("rm -rf " + root).c_str());
+}
+
+/// 以 app 模式打开已存在文件时必须接着已有大小继续累计（守住 seekp + tellp 那段逻辑）
+MZ_TEST(logger_file_writer_resume_existing) {
+    LoggerGuard guard;
+    const std::string root = "/tmp/mzmedia_logger_resume";
+    (void) ::system(("rm -rf " + root).c_str());
+    const std::string path = root + "/r.log";
+    MZ_ASSERT_TRUE(saveFile(path, std::string(100, 'x')));
+
+    FileWriter writer(path, 0, 0);
+    MZ_ASSERT_TRUE(writer.isOpen());
+    MZ_ASSERT_EQ(writer.writtenBytes(), 100u);
+
+    LogContext ctx(LogLevel::Info, __FILE__, __LINE__, __func__);
+    ctx.stream() << "appended";
+    writer.write(ctx);
+    writer.flush();
+    MZ_ASSERT_GT(writer.writtenBytes(), 100u);
+
+    std::string error;
+    const std::string content = loadFile(path, &error);
+    MZ_ASSERT_EQ(content.size(), writer.writtenBytes());
+    MZ_ASSERT_TRUE(startWith(content, std::string(100, 'x')));   // 原有内容没被覆盖
+    MZ_ASSERT_TRUE(content.find("appended") != std::string::npos);
+
+    (void) ::system(("rm -rf " + root).c_str());
+}
+
+namespace {
+
+/// 故意抛异常的坏 writer
+class ThrowingWriter : public LogWriter {
+public:
+    void write(const LogContext &) override { throw std::runtime_error("writer boom"); }
+};
+
+} // namespace
+
+/*
+ * 坏 writer 抛异常不能弄死日志线程
+ *
+ * 若日志线程被异常终止，全进程日志会永久静默（最严重的故障模式），
+ * 因此 run()/writeNow() 里每个 writer 的调用都必须兜住异常。
+ */
+MZ_TEST(logger_writer_exception_is_contained) {
+    LoggerGuard guard;
+    Logger &logger = Logger::Instance();
+    auto bad = std::make_shared<ThrowingWriter>();
+    auto good = std::make_shared<MemoryWriter>();
+    logger.add(bad);    // 先加坏的：它抛异常后，后面的好 writer 仍必须收到日志
+    logger.add(good);
+    logger.setLevel(LogLevel::Info);
+
+    InfoL << "first-after-throw";
+    logger.flush();
+    MZ_ASSERT_TRUE(good->containsMessage("first-after-throw"));
+
+    // 日志线程必须还活着
+    InfoL << "second-after-throw";
+    logger.flush();
+    MZ_ASSERT_TRUE(good->containsMessage("second-after-throw"));
+    MZ_ASSERT_EQ(good->size(), 2u);
 }
