@@ -1,0 +1,38 @@
+# 构建产物
+build/
+build-*/
+cmake-build-*/
+out/
+*.o
+*.a
+*.so
+*.exe
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+
+# 日志与运行时文件
+logs/
+*.log
+core
+core.*
+
+# 媒体文件（体积大，不入库）
+media/*.h264
+media/*.mp4
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cache/
+
+# 系统
+.DS_Store
+Thumbs.db
