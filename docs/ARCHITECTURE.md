@@ -130,6 +130,7 @@ mzmedia/
 │   ├── media/         # MediaSource、SourceManager、Subscriber、FrameQueue、GopCache
 │   ├── output/        # IMediaSink、FlvSender、HlsWriter
 │   ├── stats/         # StatsCenter
+│   ├── mzmedia.h      # 伞头：使用方的单行包含入口（库内部禁止包含）
 │   └── main.cpp
 ├── tests/             # 单元测试（自研轻量断言宏）
 ├── examples/          # 最小示例
@@ -137,6 +138,15 @@ mzmedia/
 ├── media/             # 测试素材（软链，不入库）
 └── docs/
 ```
+
+### 头文件包含约定
+
+| 角色 | 包含方式 | 原因 |
+|---|---|---|
+| **使用方**（`examples/`、`tests/`、外部集成） | `#include "mzmedia.h"` 伞头单行包含 | 少写 include，接入方便 |
+| **库内部**（`src/**/*.cpp`、模块头之间） | 只包含自己需要的模块头，**禁止**包含 `mzmedia.h` | 伞头会引入无关依赖、拖慢编译、掩盖真实耦合 |
+
+新增模块时，把它的公开头文件加进伞头的"实际 include 区"，并保持分层顺序。
 
 ## 9. 扩展路径（SC-2 的验证方式）
 

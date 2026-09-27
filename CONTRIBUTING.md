@@ -46,6 +46,8 @@ ctest --test-dir build --output-on-failure
 4. **时间戳换算用整数有理运算**，不要用浮点累加（会产生漂移并破坏单调性）。
 5. **新增输入/输出格式不得修改核心**（`media/`、`network/`）。若确实需要改核心，先提 issue 讨论架构。
 6. 头文件尽量自包含；跨模块依赖只能"上层依赖下层"（见 `docs/ARCHITECTURE.md`）。
+7. **头文件包含**：使用方（`examples/`、`tests/`、外部集成）优先用伞头 `#include "mzmedia.h"`；
+   库内部（`src/**/*.cpp` 与模块头之间）**禁止**包含伞头，只包含所需模块头。
 
 ## 提交前检查清单
 

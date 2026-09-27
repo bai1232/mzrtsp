@@ -1,0 +1,67 @@
+/*
+ * 单元测试入口（唯一的 main 编译单元）+ 测试框架自检用例
+ * ============================================================================
+ * 为什么需要这个文件：
+ *   1. test_main.h 是 header-only 框架，但可执行文件必须由"恰好一个"翻译单元
+ *      提供 main()，否则链接不出程序；
+ *   2. 骨架阶段若一个用例都没有，mzmedia_unittest 会以"零用例"退出，
+ *      而 ctest 会把它当成通过 —— 属于假绿。这里是第 1 批唯一的真实用例，
+ *      用于验证"注册 → 断言 → 计数 → 退出码"这条链路本身可用。
+ * ============================================================================
+ */
+
+#include "test_main.h"
+
+MZ_TEST(selftest_assertions) {
+    // 基础断言：全部应当通过
+    MZ_ASSERT_TRUE(1 + 1 == 2);
+    MZ_ASSERT_FALSE(1 + 1 == 3);
+
+    // 相等 / 不等（左值避免临时对象歧义）
+    const int six = 2 * 3;
+    MZ_ASSERT_EQ(six, 6);
+    MZ_ASSERT_NE(six, 7);
+
+    // 大小比较
+    const int three = 3;
+    MZ_ASSERT_GE(three, 3);
+    MZ_ASSERT_GT(three, 2);
+    MZ_ASSERT_LE(three, 3);
+    MZ_ASSERT_LT(three, 4);
+
+    // 字符串：char* 与 std::string 混用，验证 toStr 重载
+    const std::string joined = std::string("mz") + "media";
+    MZ_ASSERT_STR_EQ(joined, "mzmedia");
+    MZ_ASSERT_STR_EQ("mzmedia", joined);
+
+    // 指针
+    const char *nonNull = "value";
+    const char *nullValue = nullptr;
+    MZ_ASSERT_NOT_NULL(nonNull);
+    MZ_ASSERT_NULL(nullValue);
+
+    // 浮点近似
+    const double sum = 0.1 + 0.2;
+    MZ_ASSERT_NEAR(sum, 0.3, 1e-9);
+}
+
+MZ_TEST(selftest_describe) {
+    // 可打印类型走 operator<<
+    MZ_ASSERT_STR_EQ(::mztest::describe(42), "42");
+    MZ_ASSERT_STR_EQ(::mztest::describe("abc"), "abc");
+
+    // 不可打印类型降级为占位串，而不是编译失败
+    struct Opaque {
+        int x;
+    };
+    MZ_ASSERT_STR_EQ(::mztest::describe(Opaque{1}), "<类型不可打印>");
+}
+
+MZ_TEST(selftest_near_tolerance) {
+    // 容差边界：差异等于容差算通过，超过则失败（这里只验证通过的一侧）
+    MZ_ASSERT_NEAR(1.0, 1.5, 0.5);
+}
+
+int main(int argc, char **argv) {
+    return mztest::runMain(argc, argv);
+}

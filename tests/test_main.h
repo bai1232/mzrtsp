@@ -1,0 +1,446 @@
+/*
+ * mzmedia 轻量单元测试框架（header-only，零第三方依赖）
+ * ============================================================================
+ * 设计取舍：
+ *   1. 不引入 gtest / Catch2 —— 遵守"零第三方依赖"约束，离线可构建；
+ *   2. header-only + C++17 inline 变量 —— 多个测试 TU 各自 include 即可，
+ *      用例注册表与计数器跨 TU 唯一，不需要额外的初始化代码；
+ *   3. 断言默认"非致命"（失败后继续跑完当前用例）—— 一次运行暴露更多问题，
+ *      需要立即中断时用 MZ_FAIL；
+ *   4. 用例名重复会被拒绝并导致整轮失败 —— 防止复制粘贴时悄悄覆盖。
+ *
+ * 用例命名约定（必须遵守）：
+ *   MZ_TEST(<分组>_<用例名>)，例如 MZ_TEST(util_split)、MZ_TEST(logger_roll)
+ *   tests/CMakeLists.txt 按分组前缀注册 ctest 用例，分组名必须与其
+ *   MZMEDIA_TEST_GROUPS 中的名字一致。
+ *
+ * 用法：
+ *   MZ_TEST(util_trim) {
+ *       std::string s = "  a  ";
+ *       MZ_ASSERT_STR_EQ(mzmedia::trim(s), "a");
+ *   }
+ *
+ * 运行：
+ *   ./mzmedia_unittest              # 跑全部
+ *   ./mzmedia_unittest util         # 只跑名字包含 "util" 的用例
+ *   ./mzmedia_unittest --list       # 列出全部用例
+ * ============================================================================
+ */
+
+#pragma once
+
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <exception>
+#include <ostream>
+#include <sstream>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include <unistd.h>
+
+namespace mztest {
+
+// ---------------------------------------------------------------------------
+// 用例描述与注册表
+// ---------------------------------------------------------------------------
+struct TestCase {
+    const char *name;
+    const char *file;
+    int line;
+    void (*fn)();
+};
+
+inline std::vector<TestCase> &registry() {
+    static std::vector<TestCase> cases;
+    return cases;
+}
+
+// 用例名重复 / 空名 等"名单错误"计数：非零则整轮测试失败
+inline int &rosterErrors() {
+    static int errors = 0;
+    return errors;
+}
+
+// 已执行的断言总数
+inline int &assertCount() {
+    static int count = 0;
+    return count;
+}
+
+// 失败断言总数（同时作为进程退出码依据）
+inline int &failCount() {
+    static int failures = 0;
+    return failures;
+}
+
+// 当前正在执行的用例名，用于失败信息定位
+inline const char *&currentTest() {
+    static const char *name = "";
+    return name;
+}
+
+// ---------------------------------------------------------------------------
+// 输出着色（仅在 TTY 下着色，避免污染 ctest 日志）
+// ---------------------------------------------------------------------------
+inline bool useColor() {
+    static const bool enabled = (::isatty(STDOUT_FILENO) != 0);
+    return enabled;
+}
+
+inline const char *color(const char *code) {
+    return useColor() ? code : "";
+}
+
+inline const char *kRed = "\033[31m";
+inline const char *kGreen = "\033[32m";
+inline const char *kYellow = "\033[33m";
+inline const char *kCyan = "\033[36m";
+inline const char *kReset = "\033[0m";
+
+inline void registerTest(const char *name, const char *file, int line, void (*fn)()) {
+    if (name == nullptr || *name == '\0') {
+        ++rosterErrors();
+        std::fprintf(stderr, "%s测试框架错误：存在空用例名 (%s:%d)%s\n", color(kRed), file, line,
+                     color(kReset));
+        return;
+    }
+    for (const auto &existing : registry()) {
+        if (std::strcmp(existing.name, name) == 0) {
+            ++rosterErrors();
+            std::fprintf(stderr, "%s测试框架错误：用例名重复 \"%s\" (%s:%d 与 %s:%d)%s\n",
+                         color(kRed), name, existing.file, existing.line, file, line, color(kReset));
+            return;
+        }
+    }
+    registry().push_back(TestCase{name, file, line, fn});
+}
+
+struct Registrar {
+    Registrar(const char *name, const char *file, int line, void (*fn)()) {
+        registerTest(name, file, line, fn);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// 值的可读化输出（类型不可打印时降级为占位串，避免编译期报错）
+// ---------------------------------------------------------------------------
+template<typename T, typename = void>
+struct IsStreamable : std::false_type {};
+
+template<typename T>
+struct IsStreamable<T, std::void_t<decltype(std::declval<std::ostream &>()
+                                            << std::declval<const T &>())>> : std::true_type {};
+
+template<typename T>
+std::string describe(const T &value) {
+    if constexpr (IsStreamable<T>::value) {
+        std::ostringstream oss;
+        oss << value;
+        return oss.str();
+    } else {
+        return "<类型不可打印>";
+    }
+}
+
+inline std::string toStr(const std::string &value) {
+    return value;
+}
+
+inline std::string toStr(const char *value) {
+    return value == nullptr ? std::string("(null)") : std::string(value);
+}
+
+// ---------------------------------------------------------------------------
+// 失败上报
+// ---------------------------------------------------------------------------
+inline void reportFailure(const char *file, int line, const std::string &message) {
+    ++failCount();
+    std::fprintf(stderr, "%s    ✗ [%s] %s:%d%s\n      %s\n", color(kRed), currentTest(), file, line,
+                 color(kReset), message.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// 运行
+// ---------------------------------------------------------------------------
+inline void listTests() {
+    std::printf("共 %zu 个用例：\n", registry().size());
+    for (const auto &c : registry()) {
+        std::printf("  %-40s (%s:%d)\n", c.name, c.file, c.line);
+    }
+}
+
+inline void printUsage(const char *argv0) {
+    std::printf("用法：%s [过滤关键字|--list|-h]\n", argv0);
+    std::printf("  <无参数>  运行全部用例\n");
+    std::printf("  <关键字>  只运行名字中包含该关键字的用例\n");
+    std::printf("  --list    列出全部用例\n");
+}
+
+inline int runAll(const std::string &filter) {
+    int executed = 0;
+    int passed = 0;
+    const auto beginAll = std::chrono::steady_clock::now();
+
+    std::printf("%s=== mzmedia 单元测试 | 注册 %zu 个用例%s ===%s\n", color(kCyan),
+                registry().size(), filter.empty() ? "" : (", 过滤: " + filter).c_str(),
+                color(kReset));
+
+    for (const auto &c : registry()) {
+        if (!filter.empty() && std::string(c.name).find(filter) == std::string::npos) {
+            continue;
+        }
+        ++executed;
+        currentTest() = c.name;
+        const int failuresBefore = failCount();
+        const auto begin = std::chrono::steady_clock::now();
+
+        std::printf("%s[ RUN  ]%s %s\n", color(kYellow), color(kReset), c.name);
+
+        try {
+            c.fn();
+        } catch (const std::exception &e) {
+            reportFailure(c.file, c.line, std::string("用例抛出未捕获异常: ") + e.what());
+        } catch (...) {
+            reportFailure(c.file, c.line, "用例抛出未知类型异常");
+        }
+
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - begin)
+                                .count();
+        if (failCount() == failuresBefore) {
+            ++passed;
+            std::printf("%s[ PASS ]%s %s (%lld ms)\n", color(kGreen), color(kReset), c.name,
+                        static_cast<long long>(ms));
+        } else {
+            std::printf("%s[ FAIL ]%s %s (%lld ms)\n", color(kRed), color(kReset), c.name,
+                        static_cast<long long>(ms));
+        }
+    }
+
+    const auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - beginAll)
+                                 .count();
+
+    std::printf("------------------------------------------------------------------------\n");
+    std::printf("用例 %d 个（通过 %s%d%s / 失败 %s%d%s）| 断言 %d 条 | 用时 %lld ms\n", executed,
+                color(kGreen), passed, color(kReset), failCount() > 0 ? color(kRed) : color(kGreen),
+                failCount(), color(kReset), assertCount(), static_cast<long long>(totalMs));
+
+    if (rosterErrors() > 0) {
+        std::fprintf(stderr, "%s测试名单有 %d 处错误（用例名重复或为空），整轮判定为失败%s\n",
+                     color(kRed), rosterErrors(), color(kReset));
+        return 1;
+    }
+
+    if (executed == 0) {
+        // 关键保护：一个用例都没跑（例如分组名写错）必须判为失败，
+        // 否则 ctest 会把"什么都没测"当成绿色。
+        std::fprintf(stderr, "%s没有匹配 \"%s\" 的用例，判定为失败%s\n", color(kRed),
+                     filter.c_str(), color(kReset));
+        return 1;
+    }
+
+    return failCount() == 0 ? 0 : 1;
+}
+
+inline int runMain(int argc, char **argv) {
+    // 行缓冲，保证 ctest 能实时看到输出
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
+    std::string filter;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--list") {
+            listTests();
+            return 0;
+        }
+        if (arg == "-h" || arg == "--help") {
+            printUsage(argv[0]);
+            return 0;
+        }
+        filter = arg;
+    }
+    return runAll(filter);
+}
+
+} // namespace mztest
+
+// ---------------------------------------------------------------------------
+// 用例定义宏
+// ---------------------------------------------------------------------------
+#define MZ_TEST(name)                                                     \
+    static void mz_test_fn_##name();                                      \
+    static const ::mztest::Registrar mz_test_reg_##name(#name, __FILE__,  \
+                                                       __LINE__, &mz_test_fn_##name); \
+    static void mz_test_fn_##name()
+
+// ---------------------------------------------------------------------------
+// 断言宏
+//   说明：MZ_ASSERT_EQ 等宏内部使用 const auto&，两边类型不同时可能触发
+//   -Wsign-compare（例如 size_t 与 int 比较），测试里请写 3u 而不是 3。
+//   字符串比较请用 MZ_ASSERT_STR_EQ（避免退化为指针比较）。
+// ---------------------------------------------------------------------------
+#define MZ_ASSERT_TRUE(expr)                                                      \
+    do {                                                                          \
+        ++::mztest::assertCount();                                                \
+        if (!(expr)) {                                                            \
+            ::mztest::reportFailure(__FILE__, __LINE__, "期望为真: " #expr);      \
+        }                                                                         \
+    } while (0)
+
+#define MZ_ASSERT_FALSE(expr)                                                     \
+    do {                                                                          \
+        ++::mztest::assertCount();                                                \
+        if ((expr)) {                                                             \
+            ::mztest::reportFailure(__FILE__, __LINE__, "期望为假: " #expr);      \
+        }                                                                         \
+    } while (0)
+
+#define MZ_ASSERT_EQ(a, b)                                                              \
+    do {                                                                               \
+        ++::mztest::assertCount();                                                     \
+        const auto &mz_a = (a);                                                        \
+        const auto &mz_b = (b);                                                        \
+        if (!(mz_a == mz_b)) {                                                         \
+            ::mztest::reportFailure(__FILE__, __LINE__,                                \
+                                    std::string("期望相等: " #a " == " #b)              \
+                                            + "\n        实际: " + ::mztest::describe(mz_a) \
+                                            + "\n        期望: " + ::mztest::describe(mz_b)); \
+        }                                                                              \
+    } while (0)
+
+#define MZ_ASSERT_NE(a, b)                                                              \
+    do {                                                                               \
+        ++::mztest::assertCount();                                                     \
+        const auto &mz_a = (a);                                                        \
+        const auto &mz_b = (b);                                                        \
+        if (!(mz_a != mz_b)) {                                                         \
+            ::mztest::reportFailure(__FILE__, __LINE__,                                \
+                                    std::string("期望不等: " #a " != " #b)              \
+                                            + "\n        两者都是: " + ::mztest::describe(mz_a)); \
+        }                                                                              \
+    } while (0)
+
+#define MZ_ASSERT_LT(a, b)                                                        \
+    do {                                                                          \
+        ++::mztest::assertCount();                                                \
+        const auto &mz_a = (a);                                                   \
+        const auto &mz_b = (b);                                                   \
+        if (!(mz_a < mz_b)) {                                                     \
+            ::mztest::reportFailure(__FILE__, __LINE__,                           \
+                                    std::string("期望小于: " #a " < " #b)         \
+                                            + "\n        左值: " + ::mztest::describe(mz_a) \
+                                            + "\n        右值: " + ::mztest::describe(mz_b)); \
+        }                                                                         \
+    } while (0)
+
+#define MZ_ASSERT_LE(a, b)                                                        \
+    do {                                                                          \
+        ++::mztest::assertCount();                                                \
+        const auto &mz_a = (a);                                                   \
+        const auto &mz_b = (b);                                                   \
+        if (!(mz_a <= mz_b)) {                                                    \
+            ::mztest::reportFailure(__FILE__, __LINE__,                           \
+                                    std::string("期望小于等于: " #a " <= " #b)    \
+                                            + "\n        左值: " + ::mztest::describe(mz_a) \
+                                            + "\n        右值: " + ::mztest::describe(mz_b)); \
+        }                                                                         \
+    } while (0)
+
+#define MZ_ASSERT_GT(a, b)                                                        \
+    do {                                                                          \
+        ++::mztest::assertCount();                                                \
+        const auto &mz_a = (a);                                                   \
+        const auto &mz_b = (b);                                                   \
+        if (!(mz_a > mz_b)) {                                                     \
+            ::mztest::reportFailure(__FILE__, __LINE__,                           \
+                                    std::string("期望大于: " #a " > " #b)         \
+                                            + "\n        左值: " + ::mztest::describe(mz_a) \
+                                            + "\n        右值: " + ::mztest::describe(mz_b)); \
+        }                                                                         \
+    } while (0)
+
+#define MZ_ASSERT_GE(a, b)                                                        \
+    do {                                                                          \
+        ++::mztest::assertCount();                                                \
+        const auto &mz_a = (a);                                                   \
+        const auto &mz_b = (b);                                                   \
+        if (!(mz_a >= mz_b)) {                                                    \
+            ::mztest::reportFailure(__FILE__, __LINE__,                           \
+                                    std::string("期望大于等于: " #a " >= " #b)    \
+                                            + "\n        左值: " + ::mztest::describe(mz_a) \
+                                            + "\n        右值: " + ::mztest::describe(mz_b)); \
+        }                                                                         \
+    } while (0)
+
+#define MZ_ASSERT_STR_EQ(a, b)                                                          \
+    do {                                                                                \
+        ++::mztest::assertCount();                                                      \
+        const std::string mz_sa = ::mztest::toStr(a);                                   \
+        const std::string mz_sb = ::mztest::toStr(b);                                   \
+        if (mz_sa != mz_sb) {                                                           \
+            ::mztest::reportFailure(__FILE__, __LINE__,                                 \
+                                    std::string("期望字符串相等: " #a " == " #b)        \
+                                            + "\n        实际: [" + mz_sa + "]"         \
+                                            + "\n        期望: [" + mz_sb + "]");       \
+        }                                                                               \
+    } while (0)
+
+#define MZ_ASSERT_NEAR(a, b, eps)                                                       \
+    do {                                                                                \
+        ++::mztest::assertCount();                                                      \
+        const double mz_va = static_cast<double>(a);                                     \
+        const double mz_vb = static_cast<double>(b);                                     \
+        if (!(std::fabs(mz_va - mz_vb) <= static_cast<double>(eps))) {                   \
+            ::mztest::reportFailure(__FILE__, __LINE__,                                 \
+                                    std::string("期望近似相等: " #a " ≈ " #b)           \
+                                            + "\n        实际差值: " + ::mztest::describe(mz_va - mz_vb) \
+                                            + "\n        允许误差: " + ::mztest::describe(static_cast<double>(eps))); \
+        }                                                                               \
+    } while (0)
+
+#define MZ_ASSERT_NULL(ptr)                                                        \
+    do {                                                                          \
+        ++::mztest::assertCount();                                                \
+        if ((ptr) != nullptr) {                                                   \
+            ::mztest::reportFailure(__FILE__, __LINE__, "期望为空指针: " #ptr);   \
+        }                                                                         \
+    } while (0)
+
+#define MZ_ASSERT_NOT_NULL(ptr)                                                   \
+    do {                                                                          \
+        ++::mztest::assertCount();                                                \
+        if ((ptr) == nullptr) {                                                   \
+            ::mztest::reportFailure(__FILE__, __LINE__, "期望非空指针: " #ptr);   \
+        }                                                                         \
+    } while (0)
+
+#define MZ_ASSERT_THROW(expr, ex_type)                                            \
+    do {                                                                          \
+        ++::mztest::assertCount();                                                \
+        bool mz_caught = false;                                                   \
+        try {                                                                     \
+            expr;                                                                 \
+        } catch (const ex_type &) {                                               \
+            mz_caught = true;                                                     \
+        } catch (...) {                                                           \
+            mz_caught = true;                                                     \
+            ::mztest::reportFailure(__FILE__, __LINE__,                           \
+                                    "抛出异常类型不符: " #expr);                  \
+        }                                                                         \
+        if (!mz_caught) {                                                         \
+            ::mztest::reportFailure(__FILE__, __LINE__,                           \
+                                    "期望抛出 " #ex_type "，但没有异常: " #expr); \
+        }                                                                         \
+    } while (0)
+
+#define MZ_FAIL(message)                                                          \
+    do {                                                                          \
+        ++::mztest::assertCount();                                                \
+        ::mztest::reportFailure(__FILE__, __LINE__, (message));                   \
+    } while (0)
