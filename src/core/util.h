@@ -106,7 +106,8 @@ time_t getCurrentSecond();
 /**
  * 时间戳转字符串
  * @param fmt strftime 格式
- * @param t   时间戳，0 表示当前时间
+ * @param t   时间戳；**t == 0 被约定为"当前时间"**，因此本函数无法表示
+ *            1970-01-01 00:00:00 这一时刻（约定值占用了合法取值）
  */
 std::string getTimeStr(const char *fmt = "%Y-%m-%d %H:%M:%S", time_t t = 0);
 
@@ -141,17 +142,34 @@ uint64_t getThreadId();
 void sleepMs(uint32_t ms);
 
 /**
- * 可执行文件绝对路径 / 所在目录（无结尾 '/'）/ 文件名
+ * 可执行文件绝对路径
+ * @note 读取 /proc/self/exe；路径超长时会自动扩容重试（readlink 不保证 NUL 结尾，
+ *       缓冲区装不下会静默截断）；读取失败返回空串
  */
 std::string exePath();
+
+/**
+ * 可执行文件所在目录（无结尾 '/'）
+ * @note 无法定位可执行文件时返回 "."（当前目录）而不是空串 ——
+ *       否则调用方拼接 exeDir() + "/logs" 会得到 "/logs"（根目录），非常危险
+ */
 std::string exeDir();
+
+/// 可执行文件名；无法定位时返回空串
 std::string exeName();
 
 // ---------------------------------------------------------------------------
 // 文件系统
 // ---------------------------------------------------------------------------
 
+/**
+ * 是否是**普通文件**（regular file）
+ * @note 只认 S_ISREG：目录、字符/块设备（如 /dev/null）、FIFO、socket 一律返回 false。
+ *       需要"该路径已存在"请用 fileExists(path) || isDir(path)
+ */
 bool fileExists(const std::string &path);
+
+/// 是否是目录（判断时跟随符号链接）
 bool isDir(const std::string &path);
 
 /**
@@ -162,13 +180,22 @@ bool createDirectory(const std::string &path);
 
 /**
  * 读取整个文件
+ *
+ * 失败语义（必须靠 error 区分，因为空文件与失败都返回空串）：
+ *   - 成功（含空文件）：返回内容，*error 被清空
+ *   - 失败（不存在 / 无权限 / 路径是目录 / 读到一半出错）：返回空串，*error 非空
  * @param error 非空时写入失败原因
- * @return 文件内容；失败返回空串（需结合 error 判断，空文件与失败都会返回空串）
  */
 std::string loadFile(const std::string &path, std::string *error = nullptr);
 
 /**
  * 覆盖写入整个文件，父目录不存在时自动创建
+ *
+ * **原子写**：先写同目录下的临时文件，成功后用 rename(2) 原子替换。
+ * 因此并发读者要么看到旧内容、要么看到完整新内容，不会读到"被清空后的残缺状态"；
+ * 写入失败时原文件保持不变（旧实现直接 trunc，会先清空原文件）。
+ *
+ * @return 全部成功才返回 true；失败时会清理临时文件
  */
 bool saveFile(const std::string &path, const std::string &data);
 

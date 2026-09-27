@@ -6,7 +6,11 @@
 
 #include "core/util.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <fstream>
+#include <thread>
 #include <unistd.h>
 
 using namespace mzmedia;
@@ -153,8 +157,10 @@ MZ_TEST(util_time) {
     MZ_ASSERT_STR_EQ(with_ms.substr(10, 1), " ");
     MZ_ASSERT_STR_EQ(with_ms.substr(19, 1), ".");
 
-    // 指定时间戳
-    MZ_ASSERT_EQ(getTimeStr("%Y", 0).size(), 4u);
+    // 指定时间戳：必须用非 0 的真实时间戳验证（t == 0 被约定为"当前时间"，
+    // 原来的 size() == 4 是弱断言 —— 任何年份都是 4 个字符，测不出任何东西）
+    MZ_ASSERT_STR_EQ(getTimeStr("%Y", 1000000000), "2001");
+    MZ_ASSERT_STR_EQ(getTimeStr("%Y", 0), getTimeStr("%Y"));   // 0 等价于"当前时间"
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +182,9 @@ MZ_TEST(util_thread) {
     MZ_ASSERT_TRUE(endWith(exePath(), exeName()));
     MZ_ASSERT_TRUE(isDir(exeDir()));
     MZ_ASSERT_FALSE(exeName().empty());
+    // 防御式约定：无法定位时也必须返回当前目录，绝不能是空串
+    // （否则调用方拼 exeDir() + "/logs" 会得到根路径 "/logs"）
+    MZ_ASSERT_FALSE(exeDir().empty());
 
     // 还原，避免影响其他用例的日志输出
     setThreadName("mz-util-t");
@@ -252,5 +261,92 @@ MZ_TEST(util_file_relative) {
 
     // 还原工作目录，避免影响其它用例
     MZ_ASSERT_EQ(::chdir("/"), 0);
+    (void) ::system(("rm -rf " + root).c_str());
+}
+
+/*
+ * loadFile 的失败语义：必须能区分"空文件"与"失败"
+ *
+ * 曾经的 bug：ifstream 在 Linux 上能成功"打开"目录，读取失败后代码又把 error 清空，
+ * 于是返回空串且 error 为空 —— 调用方完全无法察觉失败，属于最隐蔽的静默失败。
+ */
+MZ_TEST(util_load_file_semantics) {
+    const std::string root = "/tmp/mzmedia_load_test";
+    (void) ::system(("rm -rf " + root).c_str());
+    MZ_ASSERT_TRUE(createDirectory(root));
+
+    // 1) 空文件：成功，error 必须为空
+    MZ_ASSERT_TRUE(saveFile(root + "/empty.txt", ""));
+    std::string error = "sentinel";
+    MZ_ASSERT_STR_EQ(loadFile(root + "/empty.txt", &error), "");
+    MZ_ASSERT_TRUE(error.empty());
+
+    // 2) 目录：必须失败且 error 非空（曾经的静默失败点）
+    error = "sentinel";
+    MZ_ASSERT_STR_EQ(loadFile(root, &error), "");
+    MZ_ASSERT_FALSE(error.empty());
+
+    // 3) 不存在的文件：必须失败
+    error = "sentinel";
+    MZ_ASSERT_STR_EQ(loadFile(root + "/none.txt", &error), "");
+    MZ_ASSERT_FALSE(error.empty());
+
+    // 4) 正常读取
+    MZ_ASSERT_TRUE(saveFile(root + "/a.txt", "hello 中文"));
+    error = "sentinel";
+    MZ_ASSERT_STR_EQ(loadFile(root + "/a.txt", &error), "hello 中文");
+    MZ_ASSERT_TRUE(error.empty());
+
+    (void) ::system(("rm -rf " + root).c_str());
+}
+
+/*
+ * saveFile 必须是原子写
+ *
+ * 旧实现直接 open(trunc)：写入期间并发读者会读到"被清空后的残缺状态"
+ * （实测 16MB 写入期间 45377 次轮询中有 25716 次读到空或残缺），
+ * 且写入中途失败会让原数据永久丢失。
+ * 本用例在写入期间持续轮询，要求只能看到"旧的 3 字节"或"完整新大小"。
+ */
+MZ_TEST(util_save_file_atomic) {
+    const std::string root = "/tmp/mzmedia_save_atomic";
+    (void) ::system(("rm -rf " + root).c_str());
+    const std::string path = root + "/data.bin";
+    MZ_ASSERT_TRUE(saveFile(path, "OLD"));
+
+    constexpr size_t kSize = 16 * 1024 * 1024;
+    std::atomic<size_t> polls{0};
+    std::atomic<size_t> torn{0};
+    std::atomic<bool> stop{false};
+    std::thread poller([&]() {
+        while (!stop.load()) {
+            std::ifstream ifs(path, std::ios::binary | std::ios::ate);
+            if (!ifs.good()) {
+                continue;
+            }
+            const long long size = static_cast<long long>(ifs.tellg());
+            ++polls;
+            // 合法状态只有两种：旧的 3 字节，或完整的新大小
+            if (size != 3 && size != static_cast<long long>(kSize)) {
+                ++torn;
+            }
+        }
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    MZ_ASSERT_TRUE(saveFile(path, std::string(kSize, 'x')));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    stop = true;
+    poller.join();
+
+    MZ_ASSERT_GT(polls.load(), 0u);
+    MZ_ASSERT_EQ(torn.load(), 0u);   // 关键：一次残缺都不能出现
+
+    // 临时文件必须已被 rename 掉，不留残渣
+    MZ_ASSERT_FALSE(fileExists(strFormat("%s.tmp.%llu", path.c_str(),
+                                        static_cast<unsigned long long>(getThreadId()))));
+    std::string error;
+    MZ_ASSERT_EQ(loadFile(path, &error).size(), kSize);
+
     (void) ::system(("rm -rf " + root).c_str());
 }
