@@ -196,9 +196,9 @@ cmake -B build-tsan -DMZMEDIA_ENABLE_TSAN=ON -DCMAKE_CXX_COMPILER=g++-12
 
 | 分组 | 用例数（去重） | TSAN 报告 |
 |---|---|---|
-| 严格组：`selftest` / `util` / `logger` / `queue` / `pool` / `semaphore` | 46 | **0** |
+| 严格组：`selftest` / `util` / `logger` / `queue` / `pool` / `semaphore` / `core` | 58 | **0** |
 | 已知误报组：`qtimed` / `ptimed` | 3 | 5（全部为第 8.2 节的误报） |
-| 合计 | 49 | 真问题 **0** |
+| 合计 | 61 | 真问题 **0** |
 
 > 分组按**用例名子串**匹配，因此个别用例会同时属于两个组
 > （如 `logger_queue_overflow_drop` 同时属于 `logger` 与 `queue`）。上表为去重后的数字。
