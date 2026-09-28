@@ -36,11 +36,11 @@
 #include "core/util.h"
 #include "core/logger.h"
 
-// 第 3 批：
-// #include "core/task_queue.h"
-// #include "core/thread_pool.h"
-// #include "core/semaphore.h"
-//
+// 第 3 批（已接入）
+#include "core/task_queue.h"
+#include "core/thread_pool.h"
+#include "core/semaphore.h"
+
 // 第 4 批：
 // #include "core/ticker.h"
 // #include "core/once_token.h"

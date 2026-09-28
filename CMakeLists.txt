@@ -11,6 +11,7 @@ project(mzmedia
 option(MZMEDIA_BUILD_TESTS    "构建单元测试"                     ON)
 option(MZMEDIA_BUILD_EXAMPLES "构建示例程序"                     ON)
 option(MZMEDIA_ENABLE_ASAN    "开启 AddressSanitizer（排查内存/泄漏问题）" OFF)
+option(MZMEDIA_ENABLE_TSAN    "开启 ThreadSanitizer（排查数据竞争）" OFF)
 
 # 决策：先不开 -Werror，等所有批次零警告后再打开（可随时 -DMZMEDIA_WARN_AS_ERROR=ON 验证）
 option(MZMEDIA_WARN_AS_ERROR  "把编译警告视为错误"               OFF)
@@ -49,9 +50,20 @@ if(MZMEDIA_WARN_AS_ERROR)
     add_compile_options(-Werror)
 endif()
 
+if(MZMEDIA_ENABLE_ASAN AND MZMEDIA_ENABLE_TSAN)
+    message(FATAL_ERROR "ASAN 与 TSAN 不能同时开启（两者都依赖编译器插桩，互斥）")
+endif()
+
 if(MZMEDIA_ENABLE_ASAN)
     add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
     add_link_options(-fsanitize=address)
+endif()
+
+if(MZMEDIA_ENABLE_TSAN)
+    # 并发组件（TaskQueue / ThreadPool / Semaphore）必须过 TSAN：
+    # 数据竞争不会在单线程测试里暴露，只会以"偶发崩溃"的形式出现在生产环境。
+    add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=thread)
 endif()
 
 # ============================================================================
@@ -68,9 +80,9 @@ set(MZMEDIA_SOURCES
         src/core/util.cpp
         src/core/logger.cpp
         # 第 3 批
-        # src/core/task_queue.cpp
-        # src/core/thread_pool.cpp
-        # src/core/semaphore.cpp
+        src/core/task_queue.cpp
+        src/core/thread_pool.cpp
+        src/core/semaphore.cpp
         # 第 4 批
         # src/core/notice_center.cpp
         )
@@ -116,4 +128,4 @@ endif()
 
 message(STATUS "mzmedia ${PROJECT_VERSION} | 构建类型=${CMAKE_BUILD_TYPE} 编译器=${CMAKE_CXX_COMPILER_ID} "
                "| tests=${MZMEDIA_BUILD_TESTS} examples=${MZMEDIA_BUILD_EXAMPLES} "
-               "asan=${MZMEDIA_ENABLE_ASAN} werror=${MZMEDIA_WARN_AS_ERROR}")
+               "asan=${MZMEDIA_ENABLE_ASAN} tsan=${MZMEDIA_ENABLE_TSAN} werror=${MZMEDIA_WARN_AS_ERROR}")

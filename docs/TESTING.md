@@ -113,13 +113,104 @@ curl -s http://127.0.0.1:8080/api/stats | python3 -m json.tool
 | FR-5.2 慢客户端丢帧 | `tc` 限速或 `kill -STOP` 阻塞客户端，观察 `dropped` 计数与其他客户端 |
 | 各 codec 组合 | `CODEC_MATRIX.md` 每个组合一条 ffprobe 用例 |
 
-## 8. 发版前验收清单（配合 VERSIONING.md）
+## 8. 并发检查（TSAN）
+
+并发组件（`TaskQueue` / `ThreadPool` / `Semaphore`，以及后续的 `EventPoller`）必须过
+ThreadSanitizer —— 数据竞争不会在单线程测试里暴露，只会以"偶发崩溃"的形式出现在生产环境。
+
+```bash
+./scripts/tsan.sh              # 配置 + 编译 + 检查
+./scripts/tsan.sh --no-build   # 复用已有 build-tsan
+```
+
+### 8.1 必须用 `setarch -R`（环境限制）
+
+本机 TSAN 与高熵 ASLR 冲突，直接运行会立刻 FATAL：
+
+```
+FATAL: ThreadSanitizer: unexpected memory mapping 0x...
+```
+
+这不是代码问题，而是 TSAN 与内核 ASLR 熵位的已知冲突。`scripts/tsan.sh` 已统一用
+`setarch -R` 关闭该进程的地址随机化（不需要 root）；也可临时降熵
+`sudo sysctl vm.mmap_rnd_bits=28`。
+
+### 8.2 已知误报：带超时的等待（重要）
+
+glibc 2.35 把 `std::condition_variable` 的超时接口（`wait_for` / `wait_until`）
+实现为 `pthread_cond_clockwait`，而 **GCC 11 的 libtsan 没有该拦截器**：
+
+| 符号 | libtsan 中的拦截器数量 |
+|---|---|
+| `pthread_cond_timedwait` | 2 |
+| `pthread_cond_clockwait` | **0** |
+
+于是 TSAN 看不到超时等待内部的"解锁 → 睡眠 → 重锁"，误以为线程仍持锁，
+从而误报 `double lock of a mutex` 与随之而来的 `data race`。
+
+**最小复现**（30 行、完全正确的双线程程序）：
+
+```cpp
+std::thread t([] { sleep 50ms; { lock; ready = true; } cv.notify_one(); });
+std::unique_lock<std::mutex> lck(mtx);
+cv.wait_for(lck, 1s, [&] { return ready; });   // → TSAN 误报 2 处
+cv.wait(lck, [&] { return ready; });           // → TSAN 0 报告
+```
+
+### 8.3 应对方式：分组 + 签名判定（不做抑制）
+
+抑制会把真竞争一起藏掉，因此 `scripts/tsan.sh` **不做任何 suppression**，而是：
+
+1. **分组**：使用超时等待的用例单独命名并单列分组（`qtimed_*` → 组 `qtimed`，
+   `ptimed_*` → 组 `ptimed`）；其余分组（`selftest`/`util`/`logger`/`queue`/`pool`/`semaphore`）
+   是**严格组，必须 0 报告**，否则脚本失败。
+2. **签名校验**：误报组允许有报告，但必须满足两个特征，否则按真问题处理：
+   - 报告类型只能是 `double lock of a mutex` 或 `data race`
+   - 每条 `data race` 的**两个访问点都带 `(mutexes: ...)` 标注**
+     —— 双方都持锁却报竞争，才是"TSAN 丢失 happens-before"的误报特征
+
+### 8.4 签名判定为什么可信（已实测）
+
+真竞争一定有一方**没持锁**，其访问点不会带 `(mutexes: ...)` 标注：
+
+```
+Write of size 4 ... by thread T1 (mutexes: write M9):   ← 持锁写
+Previous read of size 4 ... by main thread:             ← ★无标注 = 真竞争
+```
+
+实测：该真竞争样例产生 2 条 `data race`，带标注的访问点只有 3 个 < 阈值 4，
+脚本**正确判定为真问题**；而 `qtimed` / `ptimed` 的已知误报标注数均达到阈值，被正确归类为误报。
+即：这套规则既能过滤噪音，也没有失去发现真竞争的能力。
+
+### 8.5 根治方案
+
+换掉 sanitizer 运行时即可彻底消除误报（之后可把 `qtimed`/`ptimed` 并入严格组）：
+
+```bash
+sudo apt install g++-12
+cmake -B build-tsan -DMZMEDIA_ENABLE_TSAN=ON -DCMAKE_CXX_COMPILER=g++-12
+./scripts/tsan.sh --no-build
+```
+
+### 8.6 当前基线
+
+| 分组 | 用例数（去重） | TSAN 报告 |
+|---|---|---|
+| 严格组：`selftest` / `util` / `logger` / `queue` / `pool` / `semaphore` | 46 | **0** |
+| 已知误报组：`qtimed` / `ptimed` | 3 | 5（全部为第 8.2 节的误报） |
+| 合计 | 49 | 真问题 **0** |
+
+> 分组按**用例名子串**匹配，因此个别用例会同时属于两个组
+> （如 `logger_queue_overflow_drop` 同时属于 `logger` 与 `queue`）。上表为去重后的数字。
+
+## 9. 发版前验收清单（配合 VERSIONING.md）
 
 - [ ] 单元测试全部通过（`ctest --output-on-failure`）
 - [ ] 集成测试：目标码流 `ffprobe` 参数与源一致，零错误输出
 - [ ] 端到端：`ffplay` + 浏览器均能播
 - [ ] 压测：达标（NFR-2）
 - [ ] 长跑：达标（NFR-3，含 ASAN 无报错）
+- [ ] 并发检查：`./scripts/tsan.sh` 无真问题（严格组 0 报告，误报组签名校验通过）
 - [ ] `-Wall -Wextra` 零警告
 - [ ] `CHANGELOG.md` 已更新
 - [ ] 该 tag 代码可独立构建通过（保证可回滚）

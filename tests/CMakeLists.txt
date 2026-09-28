@@ -16,9 +16,9 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_util.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/test_logger.cpp
         # ---- 第 3 批 ----
-        # ${CMAKE_CURRENT_SOURCE_DIR}/test_task_queue.cpp
-        # ${CMAKE_CURRENT_SOURCE_DIR}/test_thread_pool.cpp
-        # ${CMAKE_CURRENT_SOURCE_DIR}/test_semaphore.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_task_queue.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_thread_pool.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_semaphore.cpp
         # ---- 第 4 批 ----
         # ${CMAKE_CURRENT_SOURCE_DIR}/test_core_misc.cpp
         )
@@ -28,7 +28,15 @@ set(MZMEDIA_TEST_GROUPS
         # ---- 第 2 批 ----
         util
         logger
-        # ---- 第 3 批 ----  queue pool semaphore
+        # ---- 第 3 批 ----
+        queue
+        pool
+        semaphore
+        # 带超时等待的用例单列分组：本环境 TSAN 对 std::condition_variable 的
+        # 超时接口存在已知误报（见 scripts/tsan.sh 头部说明）。
+        # 单列后其余分组可以严格执行"0 报告"。
+        qtimed
+        ptimed
         # ---- 第 4 批 ----  core
         )
 
