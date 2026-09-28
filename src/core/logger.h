@@ -269,6 +269,11 @@ public:
     uint64_t droppedCount() const { return _dropped.load(); }
 
 private:
+    /*
+     * 日志只由**一个专门的日志线程**运行 run()：run() 负责从队列取日志并写盘。
+     * 业务线程调用 write() 时只是入队（或被丢弃），自己不会去写文件 ——
+     * 这样磁盘再慢也不会拖住 demux/转码等关键路径。
+     */
     Logger();
     ~Logger();
 

@@ -20,7 +20,7 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_thread_pool.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/test_semaphore.cpp
         # ---- 第 4 批 ----
-        # ${CMAKE_CURRENT_SOURCE_DIR}/test_core_misc.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_core_misc.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS
@@ -37,7 +37,8 @@ set(MZMEDIA_TEST_GROUPS
         # 单列后其余分组可以严格执行"0 报告"。
         qtimed
         ptimed
-        # ---- 第 4 批 ----  core
+        # ---- 第 4 批 ----
+        core
         )
 
 add_executable(mzmedia_unittest ${MZMEDIA_TEST_SOURCES})

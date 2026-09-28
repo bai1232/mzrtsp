@@ -41,9 +41,9 @@
 #include "core/thread_pool.h"
 #include "core/semaphore.h"
 
-// 第 4 批：
-// #include "core/ticker.h"
-// #include "core/once_token.h"
-// #include "core/task_cancelable.h"
-// #include "core/thread_group.h"
-// #include "core/notice_center.h"
+// 第 4 批（已接入）
+#include "core/ticker.h"
+#include "core/once_token.h"
+#include "core/task_cancelable.h"
+#include "core/thread_group.h"
+#include "core/notice_center.h"
