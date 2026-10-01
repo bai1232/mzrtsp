@@ -111,6 +111,7 @@ curl -s http://127.0.0.1:8080/api/stats | python3 -m json.tool
 | NFR-5 转码 ≥1.0x | `/api/stats` 的 `speed` 字段 |
 | NFR-6 资源回收 | 断开前后对比 `/api/stats` 与 `/proc/<pid>/fd` |
 | FR-5.2 慢客户端丢帧 | `tc` 限速或 `kill -STOP` 阻塞客户端，观察 `dropped` 计数与其他客户端 |
+| FR-4.4 连接上限 / 读空闲 / 写阻塞 | 单测：连接上限设为 1 时第 2 个连接被拒且 `totalRejected()` 增长；`recv_idle=50ms` + 连上不发数据的客户端 → 阈内断开且 `onError` 为超时；`send_blocked=50ms` + 只连不读的客户端 → 断开且 `bytesOut` 停止增长 |
 | 各 codec 组合 | `CODEC_MATRIX.md` 每个组合一条 ffprobe 用例 |
 
 ## 8. 并发检查（TSAN）

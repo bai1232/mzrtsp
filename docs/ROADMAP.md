@@ -9,7 +9,7 @@
 | 阶段 | 任务 | 产出 | 验收标准 |
 |---|---|---|---|
 | **M1** Core | 日志（分级/异步/滚动）、util、`Ticker`、`TaskQueue`、`ThreadPool`、`Semaphore` | `libmzmedia` 骨架 | 单测：日志分级与滚动、线程池 1000 任务无丢失、任务队列 abort 正确 |
-| **M2** Network | `PipeWrap`、`EventPoller`（epoll ET/LT、跨线程 `async`）、`Timer`、`Socket`、`Buffer`、`TcpServer`、`Session` | 可用的 TCP 服务端 | `echo` 示例用 `nc` 回显 100MB 无错；定时器精度 ±5ms |
+| **M2** Network | `PipeWrap`、`EventPoller`（epoll ET/LT、跨线程 `async`）、`Timer`、`Socket`、`Buffer`、`TcpServer`、`Session`、**连接空闲检测与心跳钩子（FR-4.4：读空闲 60s / 写阻塞 30s）+ TCP KeepAlive** | 可用的 TCP 服务端 | `echo` 示例用 `nc` 回显 100MB 无错；定时器精度 ±5ms；**空闲超时按 FR-4.4 触发，断开后 fd 回落（NFR-6）** |
 | **M3** Http | `HttpParser`、`HttpServer`、`HttpConnection`、chunked、CORS、Range、内置测试页 | 可访问的 HTTP 服务 | `curl` 取到测试页；chunked 响应可被 `curl -N` 流式接收 |
 | **M4** FFmpeg 封装 | `AvPtr` 系列（RAII）、`Demuxer`、`CodecMatrix`、时间基换算 | 能解封装 MP4/H264 | 单测：从样本 MP4 解出正确的流参数；裸流能提取 SPS/PPS 并报出分辨率 |
 | **M5** Media | `MediaSource`、`SourceManager`、`Subscriber`、`FrameQueue`、`GopCache`、节流 | 一源多消费者分发 | 单测：3 个订阅者收到完全一致的帧序列；慢订阅者丢帧但关键帧不丢 |
