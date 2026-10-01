@@ -21,6 +21,8 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_semaphore.cpp
         # ---- 第 4 批 ----
         ${CMAKE_CURRENT_SOURCE_DIR}/test_core_misc.cpp
+        # ---- M2-1 网络层 ----
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_network_poller.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS
@@ -39,6 +41,8 @@ set(MZMEDIA_TEST_GROUPS
         ptimed
         # ---- 第 4 批 ----
         core
+        # ---- M2-1 网络层 ----
+        poller
         )
 
 add_executable(mzmedia_unittest ${MZMEDIA_TEST_SOURCES})

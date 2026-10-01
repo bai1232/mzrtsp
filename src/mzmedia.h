@@ -47,3 +47,7 @@
 #include "core/task_cancelable.h"
 #include "core/thread_group.h"
 #include "core/notice_center.h"
+
+// M2 网络层（已接入）
+#include "network/pipe_wrap.h"
+#include "network/event_poller.h"

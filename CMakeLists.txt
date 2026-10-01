@@ -85,6 +85,9 @@ set(MZMEDIA_SOURCES
         src/core/semaphore.cpp
         # 第 4 批
         src/core/notice_center.cpp
+        # M2-1 网络层
+        src/network/pipe_wrap.cpp
+        src/network/event_poller.cpp
         )
 
 # 骨架阶段（第 1 批）没有任何源文件，此时不能创建 STATIC 库目标
