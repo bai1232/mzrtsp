@@ -187,6 +187,18 @@ void EventPoller::runLoop() {
     _delay_task_map.clear();
     _timer_count.store(0);
     _fd_count.store(0);
+    {
+        // 退出时被丢弃的"已受理但未执行"任务：静默丢弃也是失败（§4.5），
+        // 因此计数 + Warn，让它可被发现
+        std::lock_guard<std::mutex> lck(_mtx_task);
+        if (!_list_task.empty()) {
+            _dropped_on_exit_count.fetch_add(_list_task.size());
+            WarnP("EventPoller[%s]: 退出时丢弃了 %zu 个已受理但未执行的任务",
+                  _name.c_str(), _list_task.size());
+            _list_task.clear();
+            _pending_task_count.store(0);
+        }
+    }
 }
 
 void EventPoller::onPipeEvent() {
@@ -431,11 +443,32 @@ bool EventPoller::async(Task task, bool may_sync) {
         if (_exit.load()) {
             return false;   // 已退出：明确拒绝，调用方必须检查
         }
+        // 队列有上限：满了拒绝 + 计数（不阻塞、不静默丢）。
+        // 判定必须在锁内、emplace 之前，否则判定与插入之间的窗口会让队列超限。
+        const size_t limit = _max_pending_tasks.load();
+        if (_list_task.size() >= limit) {
+            _async_rejected_count.fetch_add(1);
+            // 每次拒绝都打 Warn：拒绝虽已由返回值与计数体现，但"谁在猛投"需要日志线索。
+            // 计数持续增长才是"该调大上限"的信号。
+            WarnP("EventPoller[%s]: 任务队列已满（上限 %zu），本次投递被拒绝", _name.c_str(), limit);
+            return false;
+        }
         _list_task.emplace_back(std::move(task));
         _pending_task_count.fetch_add(1);
     }
     _pipe.notify();
     return true;
+}
+
+void EventPoller::setMaxPendingTasks(size_t limit) {
+    if (limit == 0) {
+        // 不允许把上限关掉：无上限在内存耗尽时会让整个进程死掉，
+        // 那时连待执行的 delEvent 也一起丢 —— 比"拒绝一个任务"糟得多
+        WarnP("EventPoller[%s]: setMaxPendingTasks(0) 被拒绝（不允许无上限），保持 %zu",
+              _name.c_str(), _max_pending_tasks.load());
+        return;
+    }
+    _max_pending_tasks.store(limit);
 }
 
 EventPoller::DelayTask::Ptr EventPoller::doDelayTask(uint64_t delay_ms, std::function<uint64_t()> task) {

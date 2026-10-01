@@ -333,3 +333,46 @@ MZ_TEST(poller_pool_get_poller) {
     EventPollerPool::setPoolSize(1);
     MZ_ASSERT_EQ(pool.size(), expected);
 }
+
+// ---------------------------------------------------------------------------
+// 任务队列上限（§4：有界 + 拒绝 + 可见）
+// ---------------------------------------------------------------------------
+
+MZ_TEST(poller_async_rejected_when_full) {
+    auto poller = EventPoller::create("test-async-full");
+    poller->setMaxPendingTasks(4);   // 默认 65536，这里调小以便构造满队列
+    MZ_ASSERT_EQ(poller->maxPendingTasks(), 4u);
+
+    // 用阻塞的**定时任务**卡住轮询线程：定时任务在 processDelayTask 里跑，
+    // 位于 runPendingTasks **之前**，所以此时 _list_task 不会被整批取走
+    Semaphore entered(0);
+    Semaphore blocker(0);
+    auto timer = poller->doDelayTask(0, [&entered, &blocker]() -> uint64_t {
+        entered.post();
+        blocker.wait();
+        return 0;
+    });
+    MZ_ASSERT_NOT_NULL(timer.get());
+    entered.wait();
+
+    // 灌满队列
+    MZ_ASSERT_TRUE(poller->async([]() {}));
+    MZ_ASSERT_TRUE(poller->async([]() {}));
+    MZ_ASSERT_TRUE(poller->async([]() {}));
+    MZ_ASSERT_TRUE(poller->async([]() {}));
+    MZ_ASSERT_EQ(poller->pendingTaskCount(), 4u);
+
+    // 第 5 个必须被拒绝，而不是无限增长
+    const uint64_t rejected_before = poller->asyncRejectedCount();
+    MZ_ASSERT_FALSE(poller->async([]() {}));
+    MZ_ASSERT_GT(poller->asyncRejectedCount(), rejected_before);
+    MZ_ASSERT_EQ(poller->pendingTaskCount(), 4u);   // 被拒绝的任务不占队列
+
+    // 不允许把上限关掉（0 会被拒绝并告警）
+    const size_t limit_before = poller->maxPendingTasks();
+    poller->setMaxPendingTasks(0);
+    MZ_ASSERT_EQ(poller->maxPendingTasks(), limit_before);
+
+    blocker.post();   // 放行
+    poller->shutdown();
+}

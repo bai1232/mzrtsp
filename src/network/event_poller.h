@@ -110,9 +110,14 @@ public:
     /**
      * 投递任务到轮询线程
      * @param may_sync true 且当前已经在轮询线程时，**直接执行**（保证时序）
-     * @return 成功受理返回 true；poller 已退出时返回 false（调用方必须检查）
-     * @note 任务队列**不设上限**：它承载控制面语义（例如 delEvent），
-     *       丢任务会破坏不变式。队列长度可用 pendingTaskCount() 观测。
+     * @return 成功受理返回 true；**poller 已退出或队列已满**时返回 false（调用方必须检查）
+     * @note 队列**有上限**（`maxPendingTasks()`，初值 65536 ≈ 3 MB）：满了就拒绝 + 计数，
+     *       绝不无限增长。无上限在内存耗尽时会让整个进程死掉，那时所有待执行的
+     *       delEvent 一起丢 —— 反而更彻底地破坏 fd 回收。
+     *       可观测（pendingTaskCount / asyncRejectedCount）用于**事后校准**，
+     *       不能替代上限本身。
+     * @note 控制面接口（addEvent/delEvent/modifyEvent）走的是 sync 而不是 async：
+     *       队列满时它们会**抛异常**（loud），不会被静默丢弃。
      */
     bool async(Task task, bool may_sync = true);
 
@@ -161,6 +166,18 @@ public:
     size_t timerCount() const { return _timer_count.load(); }
     /// 排队等待执行的跨线程任务数
     size_t pendingTaskCount() const { return _pending_task_count.load(); }
+    /// 任务队列上限（初值 65536，待实测校准）
+    size_t maxPendingTasks() const { return _max_pending_tasks.load(); }
+    /// 因队列满被拒绝的任务数（背压信号：持续增长说明该调大上限）
+    uint64_t asyncRejectedCount() const { return _async_rejected_count.load(); }
+    /// 退出时被丢弃的"已受理但未执行"任务数（静默丢弃也算失败，必须可见）
+    uint64_t droppedOnExitCount() const { return _dropped_on_exit_count.load(); }
+
+    /**
+     * 设置任务队列上限
+     * @note 传 0 会被**拒绝**（不允许把上限关掉）：只打 Warn 并保持当前值
+     */
+    void setMaxPendingTasks(size_t limit);
     /// 因超过 INT_MAX 被截断的 epoll_wait 超时次数（静默降级必须可见）
     uint64_t timeoutClampCount() const { return _timeout_clamp_count.load(); }
     /// epoll_ctl / epoll_wait 失败次数
@@ -199,6 +216,11 @@ private:
     std::atomic<size_t> _fd_count{0};
     std::atomic<size_t> _timer_count{0};
     std::atomic<size_t> _pending_task_count{0};
+    /// 队列上限初值(v0.1)：65536 个任务 ≈ 3 MB（std::function 32B + list 节点 ≈ 48B/任务），
+    /// 待实测校准。取值偏松：太小会拒掉合法突发，而 3 MB 的上界可以忽略。
+    std::atomic<size_t> _max_pending_tasks{65536};
+    std::atomic<uint64_t> _async_rejected_count{0};
+    std::atomic<uint64_t> _dropped_on_exit_count{0};
     std::atomic<uint64_t> _timeout_clamp_count{0};
     std::atomic<uint64_t> _epoll_error_count{0};
     std::atomic<uint64_t> _rejected_timer_count{0};

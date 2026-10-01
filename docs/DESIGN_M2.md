@@ -244,7 +244,8 @@ public:
 
 | 项 | 约定 |
 |---|---|
-| 失败返回 | `addEvent/modifyEvent/delEvent` 返回 `int`（0/-1）；`async` 返回 `bool`（恒 true，保留返回值是为了将来背压） |
+| 失败返回 | `addEvent/modifyEvent/delEvent` 返回 `int`（0/-1）；`async` 返回 `bool`（**队列满或已退出时为 false**，调用方必须检查） |
+| 队列上限 | `EventPoller` 的任务队列**有上限**（初值 65536 ≈ 3 MB，`setMaxPendingTasks()` 可调，**传 0 被拒绝**）；满了 **拒绝 + `asyncRejectedCount()` + Warn**。控制面接口走 `sync`，满时抛异常而非静默丢 |
 | 错误报告 | 内部失败一律**记日志**（含 fd 与 errno）；调用方不需要解析 errno |
 | 线程 | `addEvent/modifyEvent/delEvent` 可从任意线程调（内部投递）；`async(may_sync=true)` 在同线程直接执行 |
 | `delEvent` 的 `complete_cb` | 参数是 `bool success`；**在 poller 线程上、删除完成后**调用（回调内不得再 delayed-delete 同一 fd） |
@@ -512,6 +513,8 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | `TcpServer::totalRecvOverflow()` | TcpServer | 接收缓冲超限被断开 |
 | `TcpServer::totalAcceptError()` | TcpServer | `accept` 失败（EMFILE 等） |
 | `EventPoller::timerCount()` | EventPoller | 当前定时器数（观测泄漏/堆积） |
+| `EventPoller::asyncRejectedCount()` | EventPoller | 任务队列满导致的投递被拒（背压信号） |
+| `EventPoller::droppedOnExitCount()` | EventPoller | 退出时丢弃的"已受理但未执行"任务 |
 
 **心跳钩子**：网络层只负责"检测 + 调用 `onIdle()`"；**发什么包由协议层重写 `onIdle()` 决定**（RTSP 用 `OPTIONS`/`GET_PARAMETER`、WebSocket 用 ping 帧）。网络层自己往连接里塞空包是非法流量。
 
