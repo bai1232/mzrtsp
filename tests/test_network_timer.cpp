@@ -248,19 +248,34 @@ MZ_TEST(timer_shutdown_cancels) {
 // ---------------------------------------------------------------------------
 
 MZ_TEST(timer_huge_delay_clamped) {
-    auto poller = EventPoller::create("test-timer-clamp");
-    const uint64_t before = poller->timeoutClampCount();
+    // 两个边界值都必须被 clamp 且**可见**：
+    //   a) UINT64_MAX/2 → deadline - now 恰好等于 INT64_MAX（int64 上界，仍不溢出）
+    //   b) UINT64_MAX/2 + 1000 → 再往上就越过 int64 上界。若实现是
+    //      `static_cast<int64_t>(next - now)`，这里会溢出成**负数**，被
+    //      clampTimeout 当成"没有定时器" → epoll_wait 永久等待 →
+    //      超长定时器**静默永不触发**，且计数与告警都不涨（违反 §4.5）
+    //
+    // 每个值各用一个**独立的 poller**：超长定时器一旦入堆就不会出来（deadline 在
+    // 1.5 亿年后，cancel 只是标记，仍要等到期才出堆），留在同一个 poller 里会让
+    // "计数有没有涨"被前一个定时器每轮的 clamp 顶上去 —— 断言就失去区分度了
+    // （这个坑是真实踩到的：同 poller 版本对溢出漏洞是绿的）。
+    const uint64_t delays[2] = {UINT64_MAX / 2, UINT64_MAX / 2 + 1000};
+    for (uint64_t delay : delays) {
+        auto poller = EventPoller::create("test-timer-clamp");
+        const uint64_t before = poller->timeoutClampCount();   // 该 poller 上还没有任何定时器
 
-    // UINT64_MAX/2 毫秒 ≈ 1.5 亿年：deadline 远超 epoll_wait 的 int 上限
-    auto task = poller->doDelayTask(UINT64_MAX / 2, []() -> uint64_t { return 0; });
-    MZ_ASSERT_NOT_NULL(task.get());
+        auto task = poller->doDelayTask(delay, []() -> uint64_t { return 0; });
+        MZ_ASSERT_NOT_NULL(task.get());
 
-    // 走一圈：sync 会写唤醒管道 → 事件循环重算超时并触发 clamp
-    poller->sync([]() {});
-    MZ_ASSERT_GT(poller->timeoutClampCount(), before);
+        // 两次 sync：第一次只保证"插入已完成"（插入与它可能落在同一批任务里被执行），
+        // 第二次才保证事件循环又走完至少一轮 —— 截断计数是轮首算超时时加的
+        poller->sync([]() {});
+        poller->sync([]() {});
 
-    task->cancel();
-    poller->shutdown();
+        MZ_ASSERT_GT(poller->timeoutClampCount(), before);
+        task->cancel();
+        poller->shutdown();
+    }
 }
 
 // ---------------------------------------------------------------------------

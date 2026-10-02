@@ -289,7 +289,20 @@ int64_t EventPoller::minDelayInLoop() const {
     }
     const uint64_t now = getCurrentMillisecond();
     const uint64_t next = _delay_task_map.begin()->first;
-    return next <= now ? 0 : static_cast<int64_t>(next - now);
+    if (next <= now) {
+        return 0;
+    }
+    // 必须**饱和**返回：next - now 可能超过 INT64_MAX（deadline 落在 int64 上界之外，
+    // 即延时 > INT64_MAX ms 的那一段），直接 static_cast<int64_t> 会得到负数，
+    // 而 clampTimeout 把负数当成"没有定时器" → epoll_wait 永久等待 →
+    // 超长定时器**静默永不触发**，且 timeoutClampCount / 告警都不涨（违反 §4.5）。
+    // 饱和成 INT64_MAX 后，clampTimeout 会照常截断到 INT_MAX 并计数 + 告警。
+    // 边界用例：tests/test_network_timer.cpp 的 timer_huge_delay_clamped（该用例修前为红）。
+    const uint64_t delay = next - now;
+    if (delay > static_cast<uint64_t>(INT64_MAX)) {
+        return INT64_MAX;
+    }
+    return static_cast<int64_t>(delay);
 }
 
 int EventPoller::addEvent(int fd, int event, PollEventCB cb) {

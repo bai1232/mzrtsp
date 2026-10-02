@@ -588,7 +588,7 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | `timer_no_timer_path` | 池里没有任何定时器时跨线程 `sync` | 无限 `epoll_wait` 能被唤醒管道叫醒 |
 | `timer_many_1000` | 一次投 1000 个 10ms 定时器 | 1000 个全部触发；`timerCount()` 归 0 |
 | `timer_shutdown_cancels` | 投 1000ms 定时器 → `sync` 冲刷 → `shutdown()` | 未到期不触发；退出后 `timerCount()==0`（用 `sync` 而不是"睡 20ms 赌它已入堆"，避免宿主抖动导致 flaky） |
-| `timer_huge_delay_clamped` | `doDelayTask(UINT64_MAX / 2, …)` | `timeoutClampCount()` 增长（静默降级必须可见，风险 6） |
+| `timer_huge_delay_clamped` | 两个边界值，**各用一个独立 poller**：`UINT64_MAX/2`（`deadline - now` 正好是 `INT64_MAX`）与 `UINT64_MAX/2 + 1000`（越过 int64 上界） | 两个值都要让 `timeoutClampCount()` 增长（静默降级必须可见，风险 6）。**修前第二个值是红的**：负差值被当成"没有定时器" → 永久等待 → 超长定时器静默永不触发；修复办法是 `minDelayInLoop` 饱和返回 |
 | `timer_order_by_deadline` | 乱序投 300 / 100 / 200ms | 触发顺序 100 → 200 → 300 |
 | `timer_cancel_race` | 200 次"投 1ms 定时器后立刻 `cancel()`" | 不崩；触发次数 ≤200；`timerCount()` 归 0（取出后先判 `isCanceled()`，风险 7） |
 | `timer_repeat_count` | 返回 20ms 的循环任务，第 5 次返回 0 | **恰好 5 次**（不是"跑 200ms 数次数 ±2"：本宿主 10ms 级抖动会让窗口计数 flaky）；`timerCount()` 归 0 |
@@ -629,7 +629,7 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | 3 | **`EPOLLOUT` 挂摘不配对** | 加队列不挂、flush 完不摘 | 收敛到 `updateEpollOut()` 单点 |
 | 4 | 部分写导致数据错乱 | 大包 + 慢读 | 发送队列 + 读游标前移；1MB 用例 |
 | 5 | `EMFILE`（fd 耗尽） | 并发连接数超过 `ulimit -n` | `totalAcceptError()` 计数 + 日志；`ulimit` 写入 TESTING |
-| 6 | `epoll_wait` timeout 溢出 | 定时器超过 `INT_MAX` 毫秒 | clamp 到 `INT_MAX`；超长定时器用例；`timeoutClampCount()` **逐次累加**，但 Warn 只在**进入**截断状态的那一次打（否则每轮事件循环都打 → 一条定时器刷爆日志，把真问题淹掉） |
+| 6 | `epoll_wait` timeout 溢出 | 定时器超过 `INT_MAX` 毫秒 | clamp 到 `INT_MAX`；`timeoutClampCount()` **逐次累加**，但 Warn 只在**进入**截断状态的那一次打（否则每轮事件循环都打 → 一条定时器刷爆日志，把真问题淹掉）。另外 `minDelayInLoop` 的 `next - now` 必须**饱和**到 `INT64_MAX`：越过 int64 上界时直接 `static_cast<int64_t>` 会得到负数，被当成"没有定时器" → 永久等待 → **静默永不触发** |
 | 7 | 定时器与 `cancel` 竞态 | 到期瞬间取消 | 取出后先判 `isCanceled()`；`timer_cancel_race` 用例 |
 | 8 | **空闲检测误杀正常客户端** | `recv_idle` 小于客户端心跳周期 | 保守初值（60s）+ `totalIdleTimeout()` 计数暴露；协议层可重写 `onIdle()` 改为发心跳 |
 | 9 | 半开连接泄漏 fd | 对端断电/拔网线 | TCP KeepAlive（90s）+ 应用层检测；`ntimed_fd_recycle` 用例 |
@@ -652,6 +652,7 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | `EventPoller` 线程归属 | poller 自带线程 | 排除"由 Pool 统一管理线程"（连接亲和需要"当前线程 == 该 poller"这一不变式） |
 | 定时器精度门禁 | "0 早触发 + 相对同进程裸基线增量 ≤5ms"，对拍取**最小值** | 排除"绝对 ±10ms"（本宿主裸 `nanosleep` 自身超出量就 0~14ms，门禁与被测对象无关地红，见 §7.1）；排除"直接放宽到绝对 ±20ms"（把宿主噪声算进库的指标，库自身偏置会被掩盖）；排除"对拍平均值/最大值"（本机噪声会让它随机翻红） |
 | clamp 告警频率 | Warn 只在进入"超时截断"状态时打一次；`timeoutClampCount()` 仍逐次累加 | 排除"每轮事件循环都 Warn"（超长定时器 + 频繁唤醒 = 日志洪水）；排除"只计数不告警"（违反 §4.5 可见性） |
+| 超长延时的溢出处理 | `minDelayInLoop` 的差值**饱和**到 `INT64_MAX`，再交给 `clampTimeout` 截断 + 计数 + 告警 | 排除"直接 `static_cast<int64_t>(next - now)`"（deadline 越过 int64 上界 → 负数 → 被当成"没有定时器" → `epoll_wait` 永久等待 → 超长定时器静默永不触发，违反 §4.5）；排除"用 assert 拒绝超大延时"（业务错误不该 assert，违反 §4.4） |
 | 定时器测试的等待方式 | 只用无超时等待（`Semaphore::wait()` / `sleepMs()`），代价是坏实现会让用例挂到 ctest TIMEOUT | 排除 `wait_for` / `tryWait(ms)`（本环境 TSAN 对 `pthread_cond_clockwait` 有已知误报，会把 timer 组从严格组里踢出去） |
 | 计时门禁在 TSAN 下放宽 | 编译期判定 sanitizer，TSAN 构建容差 5ms→25ms（并在输出里打印"已放宽"） | 排除"用同一套容差"（TSAN 只插桩库代码、不插桩内核 `nanosleep`，差值里混进插桩开销 → 随机翻红，实测已红过一次）；排除"TSAN 下跳过计时断言"（静默降级，违反 §4）；排除"把计时用例从 TSAN 严格组里挪走"（同样会少掉并发覆盖） |
 
