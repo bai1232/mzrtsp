@@ -110,6 +110,7 @@ curl -s http://127.0.0.1:8080/api/stats | python3 -m json.tool
 | NFR-4 remux CPU <5% | `top -H -p $(pgrep mzmedia)` 观察单路负载 |
 | NFR-5 转码 ≥1.0x | `/api/stats` 的 `speed` 字段 |
 | NFR-6 资源回收 | 断开前后对比 `/api/stats` 与 `/proc/<pid>/fd` |
+| ROADMAP M2 验收：定时器精度 | 单测 `timer` 分组（`tests/test_network_timer.cpp`，用例清单见 `DESIGN_M2.md` §7.1）：**0 早触发** + 相对宿主裸 `nanosleep` 基线增量 ≤5ms。**绝对 ±10ms 在本宿主实测不可达**（裸 `nanosleep` 自身的超出量就有 0~14ms，且与延时长短无关），原始数据见 `DESIGN_M2.md` §7.1 / §8 R11 |
 | FR-5.2 慢客户端丢帧 | `tc` 限速或 `kill -STOP` 阻塞客户端，观察 `dropped` 计数与其他客户端 |
 | FR-4.4 连接上限 / 读空闲 / 写阻塞 | 单测：连接上限设为 1 时第 2 个连接被拒且 `totalRejected()` 增长；`recv_idle=50ms` + 连上不发数据的客户端 → 阈内断开且 `onError` 为超时；`send_blocked=50ms` + 只连不读的客户端 → 断开且 `bytesOut` 停止增长 |
 | 各 codec 组合 | `CODEC_MATRIX.md` 每个组合一条 ffprobe 用例 |

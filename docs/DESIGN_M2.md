@@ -13,7 +13,7 @@
 | `Session`（含空闲检测与心跳钩子）、`TcpServer` | UDP（v0.2 视需要） |
 | `examples/echo_server.cpp` + `scripts/echo_test.sh` | TLS（明确不做） |
 
-**验收标准**（对应 `docs/ROADMAP.md:12`）：`echo` 示例用 `nc` 回显 100MB 无错；定时器精度 ±10ms（含调度抖动）；**空闲超时按 FR-4.4 触发，断开后 fd 回落（NFR-6）**。
+**验收标准**（对应 `docs/ROADMAP.md:12`）：`echo` 示例用 `nc` 回显 100MB 无错；定时器精度 **0 早触发 + 相对宿主裸 `nanosleep` 基线增量 ≤5ms**（原稿写"绝对 ±10ms"，实测在本宿主不可达，口径修正见 §7.1 / §8 R11）；**空闲超时按 FR-4.4 触发，断开后 fd 回落（NFR-6）**。
 
 ## 2. 分层位置与依赖方向
 
@@ -542,7 +542,7 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | 批次 | 内容 | 验收（可执行） | 涉及的 FR/NFR |
 |---|---|---|---|
 | **M2-1** | `PipeWrap` + `EventPoller`（epoll / ET-LT / 延迟删除 / `async` / `sync`）+ `EventPollerPool` | 单测：pipe 读事件、`async` 投递 10 万次无丢、`sync` 取值、`delEvent` 后不再触发、**回调内 `shutdown()` 不崩**；TSAN 严格组 0 报告 | NFR-7 |
-| **M2-2** | 定时器（`doDelayTask` / 取消 / 循环任务）+ `getMinDelay` | 单测：精度 ±10ms、取消后不触发、循环任务次数正确、取消与到期的竞态 | NFR-7、ROADMAP:12（精度 ±10ms） |
+| **M2-2** | 定时器（`doDelayTask` / 取消 / 循环任务）+ `getMinDelay` | 单测 `tests/test_network_timer.cpp`（10 个用例，清单见 §7.1）：**0 早触发** + 相对宿主裸基线增量 ≤5ms、取消后不触发、循环任务次数正确、取消与到期的竞态、超长延时 clamp 可见 | ROADMAP:12（精度门禁）、NFR-7 |
 | **M2-3** | `Socket` / `Buffer` / `Session` / `TcpServer` + 空闲检测 + `examples/echo_server` | `nc` 回显 100MB 校验和一致；50 并发正确；**空闲超时按 FR-4.4 触发**；断开后 fd 回落；`totalRejected/totalIdleTimeout` 计数增长 | FR-4.4、FR-5.2、NFR-2、NFR-6、SC-3 |
 
 **每批门禁（不变）**：零警告（`-Wall -Wextra`）+ `ctest` 全绿 + ASAN 干净 + TSAN 严格组 0 报告。
@@ -559,9 +559,7 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | `poller_sync_value` | 从非 poller 线程 `sync` 取值 | 返回值正确（不超时、不死锁） |
 | `poller_del_event_in_callback` | 回调里 `delEvent` 自己 | 不崩；回调返回后对象才析构 |
 | `poller_lt_vs_et` | 同一 fd 分别用 LT / ET 注册 | LT 反复触发、ET 只在新数据到达时触发 |
-| `timer_precision` | 100ms 定时器，测实际间隔 | 在 `[100, 110] ms` 内 |
-| `timer_cancel_race` | 到期瞬间 `cancel()` | 要么执行且返回 0、要么不执行；**不崩溃** |
-| `timer_repeat_count` | 返回 20ms 的循环任务，跑 200ms | 触发约 10 次（允许 ±2） |
+| `timer_*`（M2-2 共 10 个用例） | 实现文件 `tests/test_network_timer.cpp` | 完整清单与门禁口径见 §7.1 |
 | `buffer_read_write_fd` | pipe 灌 1MB | `readFromFd` 读到 EAGAIN 才返回；`writeToFd` 部分写后余量正确 |
 | `buffer_frame_find` | 半包 / 多包混在一起 | `find` 偏移正确、`consume` 后 `size()` 正确 |
 | `ntimed_echo_100mb` | `nc` 灌 100MB 随机数据 | 回显校验和一致（`scripts/echo_test.sh`） |
@@ -569,6 +567,56 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | `ntimed_session_send_blocked` | 只连不读 + 持续 `send` | 超过 `send_blocked` 后断开、`bytesOut` 停止增长 |
 | `ntimed_session_recv_overflow` | 发送超过 1MB 且服务器不消费 | 断开、`totalRecvOverflow()` +1 |
 | `ntimed_fd_recycle` | 50 并发连上再断开 | `/proc/self/fd` 数目回落到基线 |
+
+### 7.1 定时器分组（M2-2，实现文件 `tests/test_network_timer.cpp`）
+
+`ctest -R timer` 实际跑 **11 个**用例：下表 10 个 + M2-1 的两个冒烟用例
+（`poller_timer_fires` / `poller_timer_repeat_and_cancel`）——因为分组过滤是**子串匹配**，
+用例名里含 `timer` 的都会被命中（无害，只是重复跑一遍）。
+
+等待策略：本组**刻意只用无超时等待**（`Semaphore::wait()` 无超时 / `sleepMs()`），
+因此留在 TSAN **严格组**（要求 0 报告），见 `scripts/tsan.sh` 的 `STRICT_GROUPS`。
+代价：实现坏掉时用例会挂住，由 ctest 的 `TIMEOUT(120s)` 判失败（不引入 `wait_for`，
+因为本环境 TSAN 对 `pthread_cond_clockwait` 存在已知误报）。
+另一条纪律：**回调在轮询线程执行，禁止在回调里断言**（测试框架非线程安全），
+回调只写 `std::atomic` 或受信号量同步的变量，断言回到测试主线程。
+
+| 用例 | 怎么造 | 断言 |
+|---|---|---|
+| `timer_precision` | 10 轮，每轮先量一次裸 `nanosleep(100ms)` 基线，再量一次库定时器 | ①每轮库值都 ≥100ms（**不早触发**，硬保证）②`min(库) ≤ min(裸) + 5ms`（库不引入系统性额外延迟）③`max(库) ≤ 50ms`（灾难性回归守卫）；两组的 min/avg/max 都打印出来 |
+| `timer_zero_delay` | `doDelayTask(0, …)` | 触发，且耗时 <50ms（不退化成"等一个 tick"） |
+| `timer_no_timer_path` | 池里没有任何定时器时跨线程 `sync` | 无限 `epoll_wait` 能被唤醒管道叫醒 |
+| `timer_many_1000` | 一次投 1000 个 10ms 定时器 | 1000 个全部触发；`timerCount()` 归 0 |
+| `timer_shutdown_cancels` | 投 1000ms 定时器 → `sync` 冲刷 → `shutdown()` | 未到期不触发；退出后 `timerCount()==0`（用 `sync` 而不是"睡 20ms 赌它已入堆"，避免宿主抖动导致 flaky） |
+| `timer_huge_delay_clamped` | `doDelayTask(UINT64_MAX / 2, …)` | `timeoutClampCount()` 增长（静默降级必须可见，风险 6） |
+| `timer_order_by_deadline` | 乱序投 300 / 100 / 200ms | 触发顺序 100 → 200 → 300 |
+| `timer_cancel_race` | 200 次"投 1ms 定时器后立刻 `cancel()`" | 不崩；触发次数 ≤200；`timerCount()` 归 0（取出后先判 `isCanceled()`，风险 7） |
+| `timer_repeat_count` | 返回 20ms 的循环任务，第 5 次返回 0 | **恰好 5 次**（不是"跑 200ms 数次数 ±2"：本宿主 10ms 级抖动会让窗口计数 flaky）；`timerCount()` 归 0 |
+| `timer_exception_stops_repeat` | 第 2 次触发时抛异常 | 计数停在 2；异常后不再入堆 |
+
+**两处刻意的设计偏离（相对 §7 初稿）**：
+1. `timer_order_by_deadline` 的档位间隔从 10ms 改为 **100ms**。每个 deadline 都是在
+   **调用线程**上按"当时时刻"算出来的，若两次投递之间被宿主调度打断超过档位间隔，
+   期望顺序本身就不成立（本宿主有 10ms 级调度抖动，用 10ms 间隔会真翻红）。
+2. `timer_repeat_count` 从"固定跑 200ms 数触发次数（允许 ±2）"改为"等到第 5 次触发"。
+   前者把宿主抖动当成了被测对象的指标。
+
+**精度门禁口径（ROADMAP:12 的验收项）**：绝对 `±10ms` 在**本宿主上不可达** ——
+裸 `nanosleep` 的超出量本身就是 **0~14ms，且与延时长短无关**
+（10ms / 100ms / 1s 档实测 +6 / +10 / +13），即连一个裸系统调用都过不了这个门禁。
+因此门禁拆成"绝对下限（不早触发）+ 相对同进程基线增量 ≤5ms"，并且用**最小值**对拍：
+系统性偏置（向上取整到 tick、单位算错）会把整个分布连同最小值一起平移 → 抓得到；
+随机 tick 噪声只抬高个别样本、抓不到最小值 → 不会误红。
+实测两组数据：库 `min/avg/max = 0/7/15 ms`，裸基线 `0/7/13 ms`（即库自身没有额外延迟）。
+
+**TSAN 构建下的门禁（编译期 `__SANITIZE_THREAD__` 判定，运行时打印）**：TSAN 会给
+**库代码**插桩（跨线程投递 / mutex / map 操作），却不会给内核里的 `nanosleep` 插桩，
+于是"库 vs 裸基线"的差值里混进了插桩开销（实测 TSAN 下 min 差值 ~3ms 且抖动更大）。
+因此 TSAN 构建下把 ② 的容差从 5ms 放宽到 25ms、③ 从 50ms 放宽到 100ms，
+并在输出里明确打印"门禁已放宽，正式门禁见普通构建"——**不静默**。
+计时精度以普通构建的 `ctest timer` 为准；TSAN 那一轮只负责并发正确性。
+> 注意 SPEC 的 `NFR-7` 是**代码质量**（零警告 + 单测覆盖），与定时器精度无关；
+> 精度目前只写在 `ROADMAP.md` 的 M2 验收里，是否升格为正式 NFR 见 §10。
 
 **验证要求**（`AI_COLLAB.md` §3.4）：每条用例必须覆盖 正常 / 空 / 满 / 断开 / 超大输入中适用的分支；"修前必红"的用例（如 `ntimed_session_idle_timeout`）要附变异验证输出。
 
@@ -581,11 +629,12 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | 3 | **`EPOLLOUT` 挂摘不配对** | 加队列不挂、flush 完不摘 | 收敛到 `updateEpollOut()` 单点 |
 | 4 | 部分写导致数据错乱 | 大包 + 慢读 | 发送队列 + 读游标前移；1MB 用例 |
 | 5 | `EMFILE`（fd 耗尽） | 并发连接数超过 `ulimit -n` | `totalAcceptError()` 计数 + 日志；`ulimit` 写入 TESTING |
-| 6 | `epoll_wait` timeout 溢出 | 定时器超过 `INT_MAX` 毫秒 | clamp 到 `INT_MAX`；超长定时器用例 |
+| 6 | `epoll_wait` timeout 溢出 | 定时器超过 `INT_MAX` 毫秒 | clamp 到 `INT_MAX`；超长定时器用例；`timeoutClampCount()` **逐次累加**，但 Warn 只在**进入**截断状态的那一次打（否则每轮事件循环都打 → 一条定时器刷爆日志，把真问题淹掉） |
 | 7 | 定时器与 `cancel` 竞态 | 到期瞬间取消 | 取出后先判 `isCanceled()`；`timer_cancel_race` 用例 |
 | 8 | **空闲检测误杀正常客户端** | `recv_idle` 小于客户端心跳周期 | 保守初值（60s）+ `totalIdleTimeout()` 计数暴露；协议层可重写 `onIdle()` 改为发心跳 |
 | 9 | 半开连接泄漏 fd | 对端断电/拔网线 | TCP KeepAlive（90s）+ 应用层检测；`ntimed_fd_recycle` 用例 |
 | 10 | TSAN 已知误报掩盖真竞争 | 网络测试用带超时的等待 | `ntimed` 分组 + 签名判定（`scripts/tsan.sh`）；根治靠 `apt install g++-12` |
+| 11 | **绝对精度门禁在虚拟化宿主上不可达** | 宿主 tick 量化唤醒延迟 **0~14ms 且与延时无关**（裸 `nanosleep` 10ms/100ms/1s 档实测 +6/+10/+13） | 门禁改为"**0 早触发** + 相对同进程裸基线增量 ≤5ms"（§7.1）；对拍取**最小值**以剔除随机噪声、保留系统性偏置；换裸机后可收紧回绝对 ±5ms（§10.7） |
 
 ## 9. 决策记录（为什么这么选 / 排除了什么）
 
@@ -601,6 +650,10 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | 心跳 | `onIdle()` 钩子，协议层重写 | 排除"网络层内建空包"（HTTP 里塞空包是非法流量） |
 | 超时阈值 | 先用 SPEC 的 64 / 60s / 30s + 计数 | 排除"先调参再实现"（没数据无从调）；排除"不设阈值"（半开连接泄漏 fd） |
 | `EventPoller` 线程归属 | poller 自带线程 | 排除"由 Pool 统一管理线程"（连接亲和需要"当前线程 == 该 poller"这一不变式） |
+| 定时器精度门禁 | "0 早触发 + 相对同进程裸基线增量 ≤5ms"，对拍取**最小值** | 排除"绝对 ±10ms"（本宿主裸 `nanosleep` 自身超出量就 0~14ms，门禁与被测对象无关地红，见 §7.1）；排除"直接放宽到绝对 ±20ms"（把宿主噪声算进库的指标，库自身偏置会被掩盖）；排除"对拍平均值/最大值"（本机噪声会让它随机翻红） |
+| clamp 告警频率 | Warn 只在进入"超时截断"状态时打一次；`timeoutClampCount()` 仍逐次累加 | 排除"每轮事件循环都 Warn"（超长定时器 + 频繁唤醒 = 日志洪水）；排除"只计数不告警"（违反 §4.5 可见性） |
+| 定时器测试的等待方式 | 只用无超时等待（`Semaphore::wait()` / `sleepMs()`），代价是坏实现会让用例挂到 ctest TIMEOUT | 排除 `wait_for` / `tryWait(ms)`（本环境 TSAN 对 `pthread_cond_clockwait` 有已知误报，会把 timer 组从严格组里踢出去） |
+| 计时门禁在 TSAN 下放宽 | 编译期判定 sanitizer，TSAN 构建容差 5ms→25ms（并在输出里打印"已放宽"） | 排除"用同一套容差"（TSAN 只插桩库代码、不插桩内核 `nanosleep`，差值里混进插桩开销 → 随机翻红，实测已红过一次）；排除"TSAN 下跳过计时断言"（静默降级，违反 §4）；排除"把计时用例从 TSAN 严格组里挪走"（同样会少掉并发覆盖） |
 
 ## 10. 未决事项（待定，走到对应步骤再定）
 
@@ -611,3 +664,5 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | 3 | 接收缓冲上限校准（1MB → ？） | 同上（看 `totalRecvOverflow()`） |
 | 4 | `docs/ARCHITECTURE.md` §1 分层图 / `src/mzmedia.h` 注释的同步修正 | 下一批文档改动时一并做（本文件 §2 是修正后版本） |
 | 5 | TSAN 误报根治（装 `g++-12` 或 clang） | 你有 sudo 密码时（需要你执行 `sudo apt install g++-12`） |
+| 6 | 定时器精度是否升格为 SPEC 的正式 NFR | 你决定（当前只写在 `ROADMAP.md` 的 M2 验收里；SPEC 的 `NFR-7` 是"代码质量"，与精度无关） |
+| 7 | 精度门禁是否在裸机/物理机上收紧回**绝对 ±5ms** | 有裸机环境时（本宿主 0~14ms 唤醒延迟是虚拟化造成的，不是代码问题） |

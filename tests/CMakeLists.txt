@@ -23,6 +23,8 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_core_misc.cpp
         # ---- M2-1 网络层 ----
         ${CMAKE_CURRENT_SOURCE_DIR}/test_network_poller.cpp
+        # ---- M2-2 定时器专项 ----
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_network_timer.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS
@@ -43,6 +45,9 @@ set(MZMEDIA_TEST_GROUPS
         core
         # ---- M2-1 网络层 ----
         poller
+        # ---- M2-2 定时器专项 ----
+        # 本组刻意只用无超时等待（Semaphore::wait / sleepMs），因此留在 TSAN 严格组。
+        timer
         )
 
 add_executable(mzmedia_unittest ${MZMEDIA_TEST_SOURCES})
