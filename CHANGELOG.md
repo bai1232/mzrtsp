@@ -73,7 +73,26 @@
   `SockException` 新增 `ErrType`（FR-4.4 四类断开要靠原因分桶计数）
 - 测试：`tests/test_network_buffer.cpp` 12 个用例（socketpair + 非阻塞，无等待 → TSAN 严格组），
   新增 ctest 分组 `buffer`；关键契约 `hit_limit` 已做变异验证（改坏即红）
-- 测试总数：**102 个用例 / 2467 条断言**（M1 61 + M2 41：poller 13 + timer 16 + buffer 12）
+- 测试总数：**110 个用例 / 2597 条断言**（M1 61 + M2 49：poller 13 + timer 16 + buffer 12 + ntimed 8）
+
+#### M2-3b Session / TcpServer / echo 示例（**WIP：100MB 验收未通过，见下**）
+- 新增 `network/session.h/.cpp`、`network/tcp_server.h/.cpp`、`examples/echo_server.cpp`、
+  `scripts/echo_test.sh`；ctest 新增分组 `ntimed`（带时间维度，与严格组分开跑 TSAN）
+- 8 个用例全绿：回显往返、读空闲超时（FR-4.4）、写阻塞超时（FR-4.4/FR-5.2）、发送队列
+  超限、接收超限、连接数上限、断开后 fd 回落（NFR-6）、`onRecv` 未实现必须报错关闭
+- 修掉 4 个真缺陷（都被新用例/验收脚本抓到）：
+  ① `close(fd)` 必须等 `delEvent` 的 `complete_cb`（否则 fd 号立刻被内核复用 → 新连接的
+     `addEvent` 被判"重复注册" → 连接全废）
+  ② 读写共用一个事件回调，**EPOLLOUT 必须按位分发**（原先 `onWriteEvent` 从未被执行，
+     积压数据只能靠后续读操作顺带写出）
+  ③ ET 写路径必须**循环写到 EAGAIN**（只写一次会让尾部数据永远发不出去）
+  ④ 收发**流控**：发送队列到高水位就停止收数据（否则一个读事件收 64MB 会顶爆发送上限）
+- 测试可用 `MZ_TEST_LOG=1` 打开库日志（Logger 默认无 writer，等于静默）
+- ✅ 8MB 端到端回显 `cmp` 逐字节一致；8 路并发一致；空闲超时与 fd 回落通过
+- ❌ **未达成**：`SIZE_MB=100 ./scripts/echo_test.sh` 内容校验失败（字节数正确、约 3.9MB
+  处开始不一致）。根因未定位，已排除项与复现步骤见 `docs/DESIGN_M2.md` §8 R13 / §10 未决 9。
+  因此本批**不按完成收尾**：`DESIGN_M2` §3.6/§3.7 的形状同步与 §9 决策记录待 M2-3b 真正
+  达标时补齐（AI_COLLAB §3.8 的欠账，已在此显式记录）
 
 
 ### 说明

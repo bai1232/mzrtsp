@@ -91,6 +91,9 @@ set(MZMEDIA_SOURCES
         # M2-3a 缓冲与 socket
         src/network/buffer.cpp
         src/network/socket.cpp
+        # M2-3b 会话与服务器
+        src/network/session.cpp
+        src/network/tcp_server.cpp
         )
 
 # 骨架阶段（第 1 批）没有任何源文件，此时不能创建 STATIC 库目标

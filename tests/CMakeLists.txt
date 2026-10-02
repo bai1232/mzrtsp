@@ -27,6 +27,8 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_network_timer.cpp
         # ---- M2-3a 缓冲与 socket ----
         ${CMAKE_CURRENT_SOURCE_DIR}/test_network_buffer.cpp
+        # ---- M2-3b 会话与服务器 ----
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_network_session.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS
@@ -53,6 +55,9 @@ set(MZMEDIA_TEST_GROUPS
         # ---- M2-3a 缓冲与 socket ----
         # 单线程 + 非阻塞 fd（socketpair），没有跨线程投递，也能留在严格组。
         buffer
+        # ---- M2-3b 会话与服务器 ----
+        # 带时间维度（等连接建立 / 等超时发生）：按 §6 约定单独命名，和严格组分开跑 TSAN。
+        ntimed
         )
 
 add_executable(mzmedia_unittest ${MZMEDIA_TEST_SOURCES})

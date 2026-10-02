@@ -127,7 +127,10 @@ public:
      *          ① 继续读（放大 max_bytes 再来一次）；② 按超限断开。
      *          **绝不能当作"读完了"忽略**，否则连接永久假死（DESIGN_M2 §8 R1）。
      */
-    ssize_t readFromFd(int fd, size_t max_bytes, bool *hit_limit = nullptr, int *err = nullptr);
+    /// @param eof 写出"对端是否已关闭"：**必须与 EAGAIN 分开**（EAGAIN 要继续等、
+    ///            EOF 要关连接；两者都返回 0，不给标志就分不出来）
+    ssize_t readFromFd(int fd, size_t max_bytes, bool *eof = nullptr, bool *hit_limit = nullptr,
+                       int *err = nullptr);
 
     /**
      * 尽量写出可读区（部分写时消费已写出的部分）

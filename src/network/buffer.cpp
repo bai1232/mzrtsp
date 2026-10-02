@@ -209,7 +209,10 @@ bool Buffer::endWith(const void *suffix, size_t len) const {
     return std::memcmp(data() + size() - len, suffix, len) == 0;
 }
 
-ssize_t Buffer::readFromFd(int fd, size_t max_bytes, bool *hit_limit, int *err) {
+ssize_t Buffer::readFromFd(int fd, size_t max_bytes, bool *eof, bool *hit_limit, int *err) {
+    if (eof != nullptr) {
+        *eof = false;
+    }
     if (hit_limit != nullptr) {
         *hit_limit = false;
     }
@@ -236,7 +239,11 @@ ssize_t Buffer::readFromFd(int fd, size_t max_bytes, bool *hit_limit, int *err) 
             continue;   // ET：必须一直读到 EAGAIN
         }
         if (n == 0) {
-            // 对端关闭（EOF）：先把已读到的交给调用方，下次调用再返回 0
+            // 对端关闭（EOF）：必须**显式**告诉调用方 —— 与 EAGAIN 一样返回 0，
+            // 但语义完全相反（EAGAIN 要继续等，EOF 要关连接）
+            if (eof != nullptr) {
+                *eof = true;
+            }
             return static_cast<ssize_t>(total);
         }
         if (errno == EINTR) {

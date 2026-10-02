@@ -51,3 +51,7 @@
 // M2 网络层（已接入）
 #include "network/pipe_wrap.h"
 #include "network/event_poller.h"
+#include "network/buffer.h"
+#include "network/socket.h"
+#include "network/session.h"
+#include "network/tcp_server.h"

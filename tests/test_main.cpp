@@ -12,6 +12,11 @@
 
 #include "test_main.h"
 
+#include "core/logger.h"
+
+#include <cstdlib>
+#include <cstring>
+
 MZ_TEST(selftest_assertions) {
     // 基础断言：全部应当通过
     MZ_ASSERT_TRUE(1 + 1 == 2);
@@ -63,5 +68,12 @@ MZ_TEST(selftest_near_tolerance) {
 }
 
 int main(int argc, char **argv) {
+    // 诊断开关：MZ_TEST_LOG=1 时把库日志（InfoP/WarnP/ErrorP）打到控制台。
+    // 为什么需要：Logger 默认**没有任何 writer**，调试失败用例时"库明明报了错却看不见"，
+    // 只能靠猜。默认关闭是为了不被"故意触发的错误路径用例"刷屏。
+    if (const char *log = ::getenv("MZ_TEST_LOG"); log != nullptr && std::strcmp(log, "0") != 0) {
+        mzmedia::Logger::Instance().add(std::make_shared<mzmedia::ConsoleWriter>());
+        mzmedia::Logger::Instance().setLevel(mzmedia::LogLevel::Debug);
+    }
     return mztest::runMain(argc, argv);
 }

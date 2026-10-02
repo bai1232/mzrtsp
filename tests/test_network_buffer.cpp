@@ -192,17 +192,20 @@ MZ_TEST(buffer_read_from_fd_to_eagain) {
     MZ_ASSERT_EQ(peer.send(payload.data(), payload.size()), static_cast<ssize_t>(payload.size()));
 
     Buffer buf;
+    bool eof = true;
     bool hit = true;
     int err = 0;
-    const ssize_t n = buf.readFromFd(me.rawFD(), 65536, &hit, &err);
+    const ssize_t n = buf.readFromFd(me.rawFD(), 65536, &eof, &hit, &err);
     MZ_ASSERT_EQ(n, 1000);
     MZ_ASSERT_FALSE(hit);        // 没到上限：是把 socket 读空了
     MZ_ASSERT_EQ(hashOf(buf.data(), buf.size()), hashOf(payload.data(), payload.size()));
 
     // 再来一次：EAGAIN → 0（不是错误，也不是 EOF）
     hit = true;
-    MZ_ASSERT_EQ(buf.readFromFd(me.rawFD(), 65536, &hit, &err), 0);
+    eof = true;
+    MZ_ASSERT_EQ(buf.readFromFd(me.rawFD(), 65536, &eof, &hit, &err), 0);
     MZ_ASSERT_FALSE(hit);
+    MZ_ASSERT_FALSE(eof);   // EAGAIN 不是 EOF：调用方必须能分开这两种"读出 0"
 }
 
 MZ_TEST(buffer_read_from_fd_max_bytes_contract) {
@@ -217,15 +220,16 @@ MZ_TEST(buffer_read_from_fd_max_bytes_contract) {
     MZ_ASSERT_EQ(peer.send(payload.data(), payload.size()), static_cast<ssize_t>(payload.size()));
 
     Buffer buf;
+    bool eof = false;
     bool hit = false;
-    MZ_ASSERT_EQ(buf.readFromFd(me.rawFD(), 100, &hit, nullptr), 100);
+    MZ_ASSERT_EQ(buf.readFromFd(me.rawFD(), 100, &eof, &hit, nullptr), 100);
     MZ_ASSERT_TRUE(hit);
     MZ_ASSERT_EQ(buf.size(), 100u);
 
     // 按契约继续读，直到某次不再 hit_limit
     size_t total = buf.size();
     while (hit) {
-        const ssize_t m = buf.readFromFd(me.rawFD(), 100, &hit, nullptr);
+        const ssize_t m = buf.readFromFd(me.rawFD(), 100, &eof, &hit, nullptr);
         MZ_ASSERT_GE(m, 0);
         total += static_cast<size_t>(m);
     }
@@ -245,10 +249,15 @@ MZ_TEST(buffer_read_from_fd_eof) {
     MZ_ASSERT_TRUE(peer.close());   // 对端关闭
 
     Buffer buf;
+    bool eof = false;
     bool hit = true;
-    MZ_ASSERT_EQ(buf.readFromFd(me.rawFD(), 4096, &hit, nullptr), 64);   // 先把已到的数据交出来
+    // 有数据 + 对端已关闭：**数据和 EOF 要同时报出来**（否则调用方要么丢数据、要么永远不关连接）
+    MZ_ASSERT_EQ(buf.readFromFd(me.rawFD(), 4096, &eof, &hit, nullptr), 64);
     MZ_ASSERT_FALSE(hit);
-    MZ_ASSERT_EQ(buf.readFromFd(me.rawFD(), 4096, &hit, nullptr), 0);    // 下一次才报 EOF
+    MZ_ASSERT_TRUE(eof);
+    eof = false;
+    MZ_ASSERT_EQ(buf.readFromFd(me.rawFD(), 4096, &eof, &hit, nullptr), 0);   // 纯 EOF
+    MZ_ASSERT_TRUE(eof);
     MZ_ASSERT_EQ(buf.size(), 64u);
 }
 
@@ -259,11 +268,13 @@ MZ_TEST(buffer_read_from_fd_invalid_max) {
     Socket me(b);
 
     Buffer buf;
+    bool eof = false;
     bool hit = false;
     int err = 0;
     // max_bytes == 0 是非法调用（放行会变成"永远读不完"的忙等）：必须拒绝并说清楚
-    MZ_ASSERT_EQ(buf.readFromFd(me.rawFD(), 0, &hit, &err), -1);
+    MZ_ASSERT_EQ(buf.readFromFd(me.rawFD(), 0, &eof, &hit, &err), -1);
     MZ_ASSERT_TRUE(hit);
+    MZ_ASSERT_FALSE(eof);
     MZ_ASSERT_EQ(err, EINVAL);
 }
 
