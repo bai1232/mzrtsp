@@ -187,6 +187,7 @@ inline void printUsage(const char *argv0) {
 inline int runAll(const std::string &filter) {
     int executed = 0;
     int passed = 0;
+    int failed_cases = 0;   // 失败的是**用例**数；断言失败数另算（见下方汇总行）
     const auto beginAll = std::chrono::steady_clock::now();
 
     std::printf("%s=== mzmedia 单元测试 | 注册 %zu 个用例%s ===%s\n", color(kCyan),
@@ -220,6 +221,7 @@ inline int runAll(const std::string &filter) {
             std::printf("%s[ PASS ]%s %s (%lld ms)\n", color(kGreen), color(kReset), c.name,
                         static_cast<long long>(ms));
         } else {
+            ++failed_cases;
             std::printf("%s[ FAIL ]%s %s (%lld ms)\n", color(kRed), color(kReset), c.name,
                         static_cast<long long>(ms));
         }
@@ -230,9 +232,14 @@ inline int runAll(const std::string &filter) {
                                  .count();
 
     std::printf("------------------------------------------------------------------------\n");
-    std::printf("用例 %d 个（通过 %s%d%s / 失败 %s%d%s）| 断言 %d 条 | 用时 %lld ms\n", executed,
-                color(kGreen), passed, color(kReset), failCount() > 0 ? color(kRed) : color(kGreen),
-                failCount(), color(kReset), assertCount(), static_cast<long long>(totalMs));
+    // 单位必须写清楚：通过/失败是**用例**数，括号里的才是**断言**失败数。
+    // 修前把 failCount()（断言数）与 passed（用例数）并列打印，会出现
+    // "用例 18 个（通过 16 / 失败 3）" 这种自相矛盾的输出（3 是断言数）
+    std::printf("用例 %d 个（通过 %s%d%s / 失败 %s%d%s）| 断言 %d 条（失败 %s%d%s）| 用时 %lld ms\n",
+                executed, color(kGreen), passed, color(kReset),
+                failed_cases > 0 ? color(kRed) : color(kGreen), failed_cases, color(kReset),
+                assertCount(), color(kRed), failCount(), color(kReset),
+                static_cast<long long>(totalMs));
 
     if (rosterErrors() > 0) {
         std::fprintf(stderr, "%s测试名单有 %d 处错误（用例名重复或为空），整轮判定为失败%s\n",
