@@ -23,6 +23,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <string>
+#include <cstring>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <utility>
@@ -303,4 +304,43 @@ MZ_TEST(buffer_write_to_fd_partial) {
     // 空缓冲时 writeToFd 也不该崩
     Buffer empty_buf;
     MZ_ASSERT_EQ(empty_buf.writeToFd(me.rawFD(), &err), 0);
+}
+
+MZ_TEST(buffer_random_differential) {
+    int a = -1, b = -1;
+    MZ_ASSERT_TRUE(makeSocketPair(&a, &b));
+    Socket peer(a), me(b);
+    Buffer buf;
+    std::string model;
+    uint32_t seed = 12345;
+    auto rnd = [&seed]() { seed = seed * 1103515245u + 12345u; return seed >> 16; };
+
+    for (int step = 0; step < 20000; ++step) {
+        const int op = rnd() % 3;
+        if (op == 0 || model.empty()) {                       // append
+            const size_t n = rnd() % 4096 + 1;
+            std::string chunk(n, '\0');
+            for (auto &c : chunk) c = static_cast<char>(rnd());
+            MZ_ASSERT_EQ(buf.append(chunk.data(), chunk.size()), chunk.size());
+            model += chunk;
+        } else if (op == 1) {                                 // consume（含 0 与整段）
+            const size_t n = rnd() % (model.size() + 1);
+            MZ_ASSERT_EQ(buf.consume(n), n);
+            model.erase(0, n);
+        } else {                                              // writeToFd：部分写才是关键路径
+            char tmp[8192];
+            while (::recv(peer.rawFD(), tmp, sizeof(tmp), MSG_DONTWAIT) > 0) { }   // 先腾空对端
+            const ssize_t n = buf.writeToFd(me.rawFD(), nullptr);
+            MZ_ASSERT_GE(n, 0);
+            if (n > 0) model.erase(0, static_cast<size_t>(n));
+        }
+        MZ_ASSERT_EQ(buf.size(), model.size());               // ★ 每步比对逻辑内容
+        if (buf.size() > 0) {
+            MZ_ASSERT_EQ(std::memcmp(buf.data(), model.data(), model.size()), 0);
+        }
+        if (model.size() > 256 * 1024) {                      // 防止越滚越大
+            MZ_ASSERT_EQ(buf.consume(model.size() / 2), model.size() / 2);
+            model.erase(0, model.size() / 2);
+        }
+    }
 }

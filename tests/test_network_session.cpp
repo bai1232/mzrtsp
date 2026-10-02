@@ -429,3 +429,78 @@ MZ_TEST(ntimed_onrecv_not_implemented) {
     server->shutdown();
     poller->shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// §4.5 / 顺序：发送队列非空时**绝不能**直写 socket（否则新数据插到旧数据前面 = 乱序）
+// 这是确定性用例：把服务端发送缓冲压到 8KB，保证第 1 块发不完 → 队列非空 →
+// 第 2 块若被直接写出去，客户端就会在第 1 块结束前收到第 2 块的字节。
+// 不依赖 100MB、不依赖日志（今天的两次错误结论都来自"测量工具本身"，所以判据用这个）。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// 收到 1 字节就连续发两块不同数据
+class TwoChunkSession : public RecordingSession {
+public:
+    TwoChunkSession(const Socket::Ptr &sock, const EventPoller::Ptr &poller, std::atomic<int> *out)
+        : RecordingSession(sock, poller, out), _a(1u << 20, 'A'), _b(1u << 20, 'B') {}
+
+protected:
+    void onRecv(const Buffer::Ptr &) override {
+        send(_a.data(), _a.size());   // 第 1 块：1MB 'A'（8KB 发送缓冲 → 必然发不完，余量入队）
+        send(_b.data(), _b.size());   // 第 2 块：1MB 'B'（此时队列非空！）
+    }
+
+private:
+    std::string _a;
+    std::string _b;
+};
+
+} // namespace
+
+MZ_TEST(ntimed_send_order_with_backlog) {
+    constexpr size_t kChunk = 1u << 20;
+
+    auto poller = EventPoller::create("test-send-order");
+    std::atomic<int> last_err{-1};
+    auto server = std::make_shared<TcpServer>(poller);
+    MZ_ASSERT_TRUE(server->setSessionCreator([&last_err](const Socket::Ptr &sock) -> Session::Ptr {
+        // 发送缓冲压到 8KB：保证第一次 send(1MB) 只写出去一小截，余下进队列
+        sock->setSendBufSize(8 * 1024);
+        return std::make_shared<TwoChunkSession>(sock, EventPollerPool::Instance().getPoller(), &last_err);
+    }));
+    MZ_ASSERT_TRUE(server->setSessionTimeout(0, 0));   // 不设空闲检测，避免干扰
+    MZ_ASSERT_TRUE(server->start(0));
+
+    const int cli = connectTo(server->port());
+    MZ_ASSERT_GT(cli, 0);
+    MZ_ASSERT_EQ(::send(cli, "x", 1, 0), 1);           // 触发服务端连发两块
+
+    // 故意延迟读：让服务端把第 1 块塞进队列（队列非空的时刻就是本用例要抓的）
+    sleepMs(1000);
+
+    std::string got;
+    const uint64_t deadline = getCurrentMillisecond() + 5000;
+    char buf[64 * 1024];
+    while (got.size() < 2 * kChunk && getCurrentMillisecond() < deadline) {
+        const ssize_t n = ::recv(cli, buf, sizeof(buf), 0);
+        if (n <= 0) {
+            break;
+        }
+        got.append(buf, static_cast<size_t>(n));
+    }
+
+    MZ_ASSERT_EQ(got.size(), 2 * kChunk);
+
+    // ★ 期望：前 1MB 全是 'A'，后 1MB 全是 'B'
+    const size_t first_b = got.find('B');
+    const size_t first_a_after_b = (first_b == std::string::npos) ? std::string::npos : got.find('A', first_b);
+    std::printf("    [ INFO ] 发送顺序检查：总长 %zu，首个 'B' 在偏移 %zu（期望 %zu），'B' 之后又出现 'A' 的位置 %zu\n",
+                got.size(), first_b, kChunk, first_a_after_b);
+    MZ_ASSERT_EQ(first_b, kChunk);                                        // 第 1 个 'B' 必须在 1MB 边界
+    MZ_ASSERT_EQ(got.find('A', first_b == std::string::npos ? 2 * kChunk : first_b), std::string::npos);
+
+    ::close(cli);
+    server->shutdown();
+    poller->shutdown();
+}

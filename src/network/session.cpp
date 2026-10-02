@@ -365,13 +365,19 @@ ssize_t Session::send(const void *data, size_t len) {
         return -1;
     }
 
-    ssize_t sent = _sock->send(data, len);
-    if (sent < 0) {
-        if (Socket::isEagain(errno)) {
-            sent = 0;   // EAGAIN 不是错误：转成"这次写出 0 字节"，余下进队列
-        } else {
-            emitError(SockException(SockException::ErrType::SendFailed, errno, "send 失败"));
-            return -1;
+    // 队列非空时**绝不能**直写 socket：socket 是 FIFO，新数据会插到队列里旧数据的前面
+    // → 客户端收到块级乱序（字节数不变、内容错位）。由 ntimed_send_order_with_backlog
+    // 确定性复现：首个 'B' 出现在 16KB 处（= 发送缓冲大小）而不是 1MB 处。
+    ssize_t sent = 0;
+    if (_send_queue->empty()) {
+        sent = _sock->send(data, len);
+        if (sent < 0) {
+            if (Socket::isEagain(errno)) {
+                sent = 0;   // EAGAIN 不是错误：转成"这次写出 0 字节"，余下进队列
+            } else {
+                emitError(SockException(SockException::ErrType::SendFailed, errno, "send 失败"));
+                return -1;
+            }
         }
     }
 

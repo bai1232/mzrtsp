@@ -75,7 +75,7 @@
   新增 ctest 分组 `buffer`；关键契约 `hit_limit` 已做变异验证（改坏即红）
 - 测试总数：**110 个用例 / 2597 条断言**（M1 61 + M2 49：poller 13 + timer 16 + buffer 12 + ntimed 8）
 
-#### M2-3b Session / TcpServer / echo 示例（**WIP：100MB 验收未通过，见下**）
+#### M2-3b Session / TcpServer / echo 示例（已完成）
 - 新增 `network/session.h/.cpp`、`network/tcp_server.h/.cpp`、`examples/echo_server.cpp`、
   `scripts/echo_test.sh`；ctest 新增分组 `ntimed`（带时间维度，与严格组分开跑 TSAN）
 - 8 个用例全绿：回显往返、读空闲超时（FR-4.4）、写阻塞超时（FR-4.4/FR-5.2）、发送队列
@@ -89,10 +89,18 @@
   ④ 收发**流控**：发送队列到高水位就停止收数据（否则一个读事件收 64MB 会顶爆发送上限）
 - 测试可用 `MZ_TEST_LOG=1` 打开库日志（Logger 默认无 writer，等于静默）
 - ✅ 8MB 端到端回显 `cmp` 逐字节一致；8 路并发一致；空闲超时与 fd 回落通过
-- ❌ **未达成**：`SIZE_MB=100 ./scripts/echo_test.sh` 内容校验失败（字节数正确、约 3.9MB
-  处开始不一致）。根因未定位，已排除项与复现步骤见 `docs/DESIGN_M2.md` §8 R13 / §10 未决 9。
-  因此本批**不按完成收尾**：`DESIGN_M2` §3.6/§3.7 的形状同步与 §9 决策记录待 M2-3b 真正
-  达标时补齐（AI_COLLAB §3.8 的欠账，已在此显式记录）
+- ❌→✅ **曾经的 100MB 内容损坏已定位并修复**（`Session::send` 在发送队列非空时仍直写
+  socket → 块级乱序）：修法见下一条，判据换成确定性用例 `ntimed_send_order_with_backlog`
+- 修复：`Session::send` **只在发送队列为空时**才直接写 socket；队列非空时整段入队（FIFO 保序）。
+  原先"能塞就塞"会让新块插到队列里旧块前面 —— 字节数不变、内容错位（socket 是 FIFO，
+  顺序就是正确性）。确定性用例证据：修前首个 `'B'` 出现在偏移 **16384**（= 发送缓冲大小）、
+  修后正好在 **1048576**（1MB 边界）且其后不再出现 `'A'`
+- 验收：`SIZE_MB=100 ./scripts/echo_test.sh` 连跑，**有效 2 次全部四项通过**（`cmp` 逐字节
+  一致 + 8 路并发 + 空闲超时 + fd 回落）；第 2 次因脚本自身启动竞态（上一轮服务器未释放
+  19000 端口）而中止，属脚本缺陷，待修
+- 教训（已写进 `DESIGN_M2` §8 R13）：今天两次错误结论都来自**测量工具本身** —— 异步日志
+  未落盘导致"插队=0"的假象、进程内探针把 reader 线程建在发送之后导致 7.5MB 就 send-overflow。
+  因此顺序类判据改用**确定性用例**，日志只作辅助
 
 
 ### 说明
