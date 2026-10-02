@@ -180,6 +180,12 @@ public:
     void setMaxPendingTasks(size_t limit);
     /// 因超过 INT_MAX 被截断的 epoll_wait 超时次数（静默降级必须可见）
     uint64_t timeoutClampCount() const { return _timeout_clamp_count.load(); }
+    /// 退出时被丢弃的**未触发**定时器数（只统计未被 cancel 的；静默丢弃也算失败）
+    uint64_t droppedTimerOnExitCount() const { return _dropped_timer_on_exit_count.load(); }
+    /// processDelayTask 处理的**非空**批次数（观测"同刻大量到期"的频度）
+    uint64_t delayBatchCount() const { return _delay_batch_count.load(); }
+    /// 单批处理定时器数的高水位（观测 0 延时自投链 / 定时器风暴，见 §8 R12）
+    size_t delayBatchMax() const { return _delay_batch_max.load(); }
     /// epoll_ctl / epoll_wait 失败次数
     uint64_t epollErrorCount() const { return _epoll_error_count.load(); }
     /// 已退出导致 doDelayTask 被拒绝的次数
@@ -222,6 +228,11 @@ private:
     std::atomic<uint64_t> _async_rejected_count{0};
     std::atomic<uint64_t> _dropped_on_exit_count{0};
     std::atomic<uint64_t> _timeout_clamp_count{0};
+    /// 退出时丢弃的未触发定时器数（只统计未被 cancel 的）
+    std::atomic<uint64_t> _dropped_timer_on_exit_count{0};
+    /// 非空批次计数 + 单批高水位（观测"同刻到期/自投链"，见 §8 R12）
+    std::atomic<uint64_t> _delay_batch_count{0};
+    std::atomic<size_t> _delay_batch_max{0};
     std::atomic<uint64_t> _epoll_error_count{0};
     std::atomic<uint64_t> _rejected_timer_count{0};
 

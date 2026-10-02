@@ -191,6 +191,19 @@ void EventPoller::runLoop() {
     }
 
     // 退出清理：定时器与事件都不再触发
+    // 未触发的定时器必须**可见**：未执行的"任务"有 droppedOnExitCount + Warn，
+    // 而定时器原先一条计数都没有 = 静默丢弃（§4.5）。
+    // 只统计未被 cancel 的（已取消的本来就不会触发，不算丢弃）
+    size_t dropped_timers = 0;
+    for (const auto &entry : _delay_task_map) {
+        if (entry.second && !entry.second->isCanceled()) {
+            ++dropped_timers;
+        }
+    }
+    if (dropped_timers > 0) {
+        _dropped_timer_on_exit_count.fetch_add(dropped_timers);
+        WarnP("EventPoller[%s]: 退出时丢弃了 %zu 个未触发的定时器", _name.c_str(), dropped_timers);
+    }
     _event_map.clear();
     _deleted_cbs.clear();
     _delay_task_map.clear();
@@ -253,6 +266,7 @@ void EventPoller::collectDeletedEvents() {
 }
 
 void EventPoller::processDelayTask() {
+    size_t processed = 0;   // 本批处理了多少个（观测"同刻到期 / 0 延时自投链"，见 §8 R12）
     while (!_delay_task_map.empty()) {
         auto it = _delay_task_map.begin();
         const uint64_t now = getCurrentMillisecond();   // 每轮重取：任务可能执行很久
@@ -262,6 +276,7 @@ void EventPoller::processDelayTask() {
         DelayTask::Ptr task = it->second;
         _delay_task_map.erase(it);
         _timer_count.fetch_sub(1);
+        ++processed;
         if (!task || task->isCanceled()) {
             continue;   // 取消的任务：静默跳过是正确行为，不是失败
         }
@@ -279,6 +294,14 @@ void EventPoller::processDelayTask() {
             task->setDeadline(getCurrentMillisecond() + next_delay);
             _delay_task_map.emplace(task->deadline(), task);
             _timer_count.fetch_add(1);
+        }
+    }
+    // 只记"非空批次"；高水位用于发现 0 延时自投链 / 定时器风暴。
+    // 只有轮询线程写，读侧拿到的是观测值（不做 CAS：这里追求的是可见而不是精确同步）
+    if (processed > 0) {
+        _delay_batch_count.fetch_add(1);
+        if (processed > _delay_batch_max.load()) {
+            _delay_batch_max.store(processed);
         }
     }
 }
@@ -499,6 +522,16 @@ EventPoller::DelayTask::Ptr EventPoller::doDelayTask(uint64_t delay_ms, std::fun
         ErrorP("EventPoller[%s]: doDelayTask 收到空任务，已拒绝", _name.c_str());
         return nullptr;
     }
+    // 退出语义必须与跨线程路径一致：已退出就**明确拒绝**。
+    // 修前这里只检查跨线程路径，于是"轮询线程内投递"（例如某个回调里、或 shutdown
+    // 之后）会拿到一个非空 handle，却永远不会触发，也没有任何计数/告警 —— 静默降级
+    // （AI_COLLAB §4.5）。用例：timer_submit_after_shutdown（修前为红）
+    if (_exit.load()) {
+        _rejected_timer_count.fetch_add(1);
+        ErrorP("EventPoller[%s]: poller 已退出，doDelayTask 被拒绝", _name.c_str());
+        return nullptr;
+    }
+
     auto ret = std::make_shared<DelayTask>(std::move(task));
     ret->setDeadline(getCurrentMillisecond() + delay_ms);
 
