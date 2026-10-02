@@ -130,15 +130,24 @@ void EventPoller::runLoop() {
     _sem_started.post();
 
     std::vector<struct epoll_event> events(kMaxEvents);
+    // 上一轮是否处于"超时被截断"状态（只在轮询线程访问）
+    bool clamp_warned = false;
     while (!_exit.load()) {
         bool clamped = false;
         const int timeout = clampTimeout(minDelayInLoop(), &clamped);
         if (clamped) {
-            // §4.5：静默降级也算失败 —— 截断必须计数 + 告警
+            // §4.5：静默降级也算失败 —— 截断必须计数 + 告警。
+            // 但告警按"状态进入"去重：一个超长定时器会让**每一轮** epoll_wait 的
+            // 超时都被截断，每轮都 Warn 等于用一条定时器刷爆日志（真问题会被淹掉）。
+            // 计数仍然逐次累加，可观测性不打折；退出截断状态后再出现会重新告警。
             _timeout_clamp_count.fetch_add(1);
-            WarnP("EventPoller[%s]: 定时器延时超过 INT_MAX ms，epoll_wait 超时被截断为 %d ms",
-                  _name.c_str(), INT_MAX);
+            if (!clamp_warned) {
+                WarnP("EventPoller[%s]: 定时器延时超过 INT_MAX ms，epoll_wait 超时被截断为 %d ms"
+                      "（同一段截断状态只告警一次，计数仍逐次累加）",
+                      _name.c_str(), INT_MAX);
+            }
         }
+        clamp_warned = clamped;
 
         const int n = ::epoll_wait(_epoll_fd, events.data(), kMaxEvents, timeout);
         if (n < 0) {
