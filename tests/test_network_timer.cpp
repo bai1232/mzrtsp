@@ -13,7 +13,8 @@
  * 生存期纪律：等待用的 Semaphore 必须**活得比轮询线程长** —— 只能在
  *   `poller->shutdown()`（内部 join）之后销毁。若声明在循环里，上一轮的
  *   `~Semaphore()`（pthread_cond_destroy）会与轮询线程仍在进行的 `post()`
- *   （pthread_cond_broadcast）并发，这是**真实竞态**，TSAN 严格组抓到过一次。
+ *   （pthread_cond_broadcast）并发，这是**真实竞态**，TSAN 严格组抓到过一次
+ *   （规矩与实测报告见 docs/TESTING.md §8.7）。
  *
  * 断言纪律：回调都在轮询线程执行，**不允许在回调里调用 MZ_ASSERT_***；
  * 回调只写 std::atomic / 受信号量同步的普通变量，断言回到测试主线程。

@@ -205,7 +205,7 @@ cmake -B build-tsan -DMZMEDIA_ENABLE_TSAN=ON -DCMAKE_CXX_COMPILER=g++-12
 > 分组按**用例名子串**匹配，因此个别用例会同时属于两个组
 > （如 `logger_queue_overflow_drop` 同时属于 `logger` 与 `queue`）。上表为去重后的数字。
 
-### 8.4 已抓到的真实竞态（不是误报，要照规矩避开）
+### 8.7 已抓到的真实竞态（不是误报，要照规矩避开）
 
 **测试里同步对象的生存期**：`Semaphore` 被销毁时，另一个线程不能还在 `post()` 里。
 M2-2b 踩到过一次：`timer_precision` 把 `Semaphore` 声明在**循环里**，上一轮的

@@ -60,7 +60,7 @@
   "用例 18 个（通过 16 / 失败 3）"这种自相矛盾的输出；现在两处都写明单位
 - 修复（真实竞态）：`timer_precision` 把 `Semaphore` 声明在循环里，上一轮的 `~Semaphore()`
   与轮询线程仍在进行的 `post()` 并发 —— TSAN 严格组抓到（`pthread_cond_destroy` vs
-  `pthread_cond_broadcast`）；生存期提到 `poller->shutdown()` 之后，规矩记入 `TESTING.md` §8.4
+  `pthread_cond_broadcast`）；生存期提到 `poller->shutdown()` 之后，规矩记入 `TESTING.md` §8.7
 - 测试总数：**90 个用例 / 2034 条断言**（M1 的 61/779 + M2 的 29：poller 13 + timer 16）
 
 ### 说明
