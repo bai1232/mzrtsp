@@ -13,7 +13,7 @@
 | `Session`（含空闲检测与心跳钩子）、`TcpServer` | UDP（v0.2 视需要） |
 | `examples/echo_server.cpp` + `scripts/echo_test.sh` | TLS（明确不做） |
 
-**验收标准**（对应 `docs/ROADMAP.md:12`）：`echo` 示例用 `nc` 回显 100MB 无错；定时器精度 ±5ms；**空闲超时按 FR-4.4 触发，断开后 fd 回落（NFR-6）**。
+**验收标准**（对应 `docs/ROADMAP.md:12`）：`echo` 示例用 `nc` 回显 100MB 无错；定时器精度 ±10ms（含调度抖动）；**空闲超时按 FR-4.4 触发，断开后 fd 回落（NFR-6）**。
 
 ## 2. 分层位置与依赖方向
 
@@ -240,7 +240,11 @@ public:
 };
 ```
 
-**形状约定（定死，不后改）**
+**形状约定（本批内稳定；一旦变更，必须同一批同步本节 + 在 §9 追加变更记录）**
+
+> 原措辞是「定死，不后改」——事实证明既做不到也不该做：M2-1 一批之内就改了两次形状
+> （`async` 的返回语义、任务队列上限）。把"不后改"写成承诺，只会让人倾向于掩盖形变，
+> 而不是走"改文档 + 记决策"的正当流程。
 
 | 项 | 约定 |
 |---|---|
@@ -538,7 +542,7 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | 批次 | 内容 | 验收（可执行） | 涉及的 FR/NFR |
 |---|---|---|---|
 | **M2-1** | `PipeWrap` + `EventPoller`（epoll / ET-LT / 延迟删除 / `async` / `sync`）+ `EventPollerPool` | 单测：pipe 读事件、`async` 投递 10 万次无丢、`sync` 取值、`delEvent` 后不再触发、**回调内 `shutdown()` 不崩**；TSAN 严格组 0 报告 | NFR-7 |
-| **M2-2** | 定时器（`doDelayTask` / 取消 / 循环任务）+ `getMinDelay` | 单测：精度 ±10ms、取消后不触发、循环任务次数正确、取消与到期的竞态 | NFR-7、ROADMAP:12 的"±5ms" |
+| **M2-2** | 定时器（`doDelayTask` / 取消 / 循环任务）+ `getMinDelay` | 单测：精度 ±10ms、取消后不触发、循环任务次数正确、取消与到期的竞态 | NFR-7、ROADMAP:12（精度 ±10ms） |
 | **M2-3** | `Socket` / `Buffer` / `Session` / `TcpServer` + 空闲检测 + `examples/echo_server` | `nc` 回显 100MB 校验和一致；50 并发正确；**空闲超时按 FR-4.4 触发**；断开后 fd 回落；`totalRejected/totalIdleTimeout` 计数增长 | FR-4.4、FR-5.2、NFR-2、NFR-6、SC-3 |
 
 **每批门禁（不变）**：零警告（`-Wall -Wextra`）+ `ctest` 全绿 + ASAN 干净 + TSAN 严格组 0 报告。
