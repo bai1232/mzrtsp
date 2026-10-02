@@ -72,9 +72,20 @@ private:
 ```cpp
 class SockException : public std::runtime_error {
 public:
-    SockException(int err = 0, const std::string &msg = "");
-    int errCode() const;      // errno；0 表示无 errno（例如自定义错误）
-    bool isEof() const;       // 对端正常关闭（read 返回 0）
+    /// ErrType 是 M2-3 新增：FR-4.4 的四类断开在 errno 里都是 0 或笼统的 ETIMEDOUT，
+    /// 光靠 errno 无法分类（计数要分桶、用例要断言"onError 为超时"）
+    enum class ErrType {
+        None = 0, PeerClosed, Timeout, RecvOverflow, SendOverflow,
+        Rejected, AcceptError, SendFailed, RecvFailed, Shutdown,
+    };
+
+    explicit SockException(int err_code, const std::string &msg = "");   // 只用 errno
+    SockException(ErrType type = ErrType::None, int err_code = 0, const std::string &msg = "");
+
+    ErrType type() const;
+    const char *typeName() const;   // 日志用
+    int errCode() const;            // errno；0 表示无 errno（例如自定义错误）
+    bool isEof() const;             // 对端正常关闭（read 返回 0）
 };
 ```
 
@@ -92,32 +103,41 @@ public:
 
     explicit Buffer(size_t initial_capacity = 0);
     Buffer(const Buffer &) = delete;
-    Buffer(Buffer &&) = default;
+    Buffer(Buffer &&) noexcept;
+    Buffer &operator=(Buffer &&) noexcept;
 
     const char *data() const;
     size_t size() const;
     size_t capacity() const;
     bool empty() const;
+    size_t readPos() const;     // 已消费字节数（诊断 compact 是否生效）
 
-    void append(const void *data, size_t len);
-    void append(const std::string &str);
-    void reserve(size_t capacity);
+    // 返回值策略：**没有 void 接口**（M2-3 起，AI_COLLAB "尽量不用 void"）——
+    // 写/消费返回实际完成量，清空/释放返回被处理的字节数，
+    // 调用方永远能判断"我要求的"和"实际发生的"差多少
+    size_t append(const void *data, size_t len);   // 实际写入量（nullptr/0 → 0）
+    size_t append(const std::string &str);
+    size_t reserve(size_t capacity);               // 处理后的实际容量
 
-    void consume(size_t len);   // len 超长时按 size() 截断
-    void clear();               // 数据清空、容量保留
-    void release();             // 容量释放
+    size_t consume(size_t len);  // 实际消费量；len > size() → **0 且不改数据 + ErrorP**
+    size_t clear();              // 返回被丢弃的字节数（容量保留）
+    size_t release();            // 返回被释放的容量字节数
 
     size_t find(char ch, size_t from = 0) const;                          // 返回偏移
     size_t find(const void *needle, size_t needle_len, size_t from = 0) const;
     bool startWith(const void *prefix, size_t len) const;
     bool endWith(const void *suffix, size_t len) const;
 
-    /// 循环 read() 直到 EAGAIN —— ET 模式下必须一次读空
-    /// @return >0 新增字节数；0 = 对端关闭(EOF)；-1 = 出错（*err 带 errno）
-    ssize_t readFromFd(int fd, int *err = nullptr);
+    /// 循环 read() 追加，直到 EAGAIN / EOF / 出错 / 达到 max_bytes
+    /// @param max_bytes **必填**：没有上限的读循环等于把内存交给对端控制（§4.3）；
+    ///                  §3.3 决定"上限在 Session"，原签名却让 Session 无法在循环中途设限
+    /// @param hit_limit 写出"是否因为到上限而停下"：**true 表示 socket 里可能还有数据**，
+    ///                  ET 下不会再有通知，调用方必须继续读或断开（§8 R1）
+    /// @return >0 新增字节数；0 = EAGAIN 或 EOF；-1 = 真错误 / 非法调用(max_bytes==0)
+    ssize_t readFromFd(int fd, size_t max_bytes, bool *hit_limit = nullptr, int *err = nullptr);
 
     /// 尽量写出可读区；部分写时消费已写部分
-    /// @return >0 本次写出字节数（可能 < size()）；-1 = 出错（*err 带 errno）
+    /// @return >0 本次写出字节数；0 = EAGAIN（不是错误）；-1 = 真错误
     ssize_t writeToFd(int fd, int *err = nullptr);
 
     std::string toString() const;
@@ -132,6 +152,9 @@ public:
 | 清空 | 游标归零、**保留容量** | 长连接反复收发不要反复 malloc |
 | `find` 返回偏移 | 不返回指针 | 扩容后 `data()` 会失效，偏移量天然安全 |
 | 上限 | **Buffer 不设上限**，上限策略在 `Session`（见 §5.4） | 容器职责单一；"多大算攻击"是协议层策略 |
+| `consume` 越界 | **拒绝执行**（返回 0 + ErrorP），不按 `size()` 截断 | "少读了几个字节"会变成后续一直错位、极难定位的 bug |
+| `readFromFd` 的上限 | 上限**作为必填参数**进来，并把"没读完"用 `hit_limit` 说出来 | 原签名做不到：Session 拿不到读循环中途的控制权 → 与"上限在 Session"自相矛盾；ET 下漏报"没读完"会永久假死 |
+| 返回值风格 | **尽量不用 `void`**：写/消费返回实际量，清空/释放返回处理量 | `void` 把"我要求的 vs 实际发生的"这个差值抹掉，只能靠"约定一定全部完成"推理 |
 
 ### 3.4 `Socket`（fd RAII + 系统调用封装）
 
@@ -148,12 +171,14 @@ public:
 
     int rawFD() const;
     bool valid() const;
-    void close();
+    /// @return true = 本次真的关闭了 fd；false = 原本就无效 / 真失败（幂等语义可判定）
+    bool close();
 
     // 全部返回 bool：失败已记日志，调用方按需处理（禁止静默失败）
     bool setNonBlock(bool enable);
     bool setNoDelay(bool enable);                // TCP_NODELAY
     bool setReuseAddr(bool enable);
+    bool setReusePort(bool enable);
     bool setKeepAlive(bool enable);
     bool setKeepAliveParams(int idle_sec, int interval_sec, int count);   // Linux TCP_KEEP*
     bool setSendBufSize(int bytes);
@@ -161,8 +186,9 @@ public:
 
     bool bind(const std::string &ip, uint16_t port);
     bool listen(int backlog);
-    /// 返回新连接的 fd；-1 = 失败（*err 带 errno，EMFILE/ENFILE 会单独计数）
-    int accept(std::string *peer_ip = nullptr, uint16_t *peer_port = nullptr);
+    /// 返回新连接的 fd（accept4 + NONBLOCK|CLOEXEC）；-1 = 失败
+    /// **EAGAIN 与真错误都返回 -1，必须靠 *err 区分**（ET 下要一直 accept 到 EAGAIN）
+    int accept(std::string *peer_ip = nullptr, uint16_t *peer_port = nullptr, int *err = nullptr);
 
     /// @return >0 已发送字节数；-1 = 出错（*err 带 errno，EAGAIN 需调用方区分）
     ssize_t send(const void *data, size_t len, int flags = 0);
@@ -573,7 +599,8 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 |---|---|---|---|
 | **M2-1** | `PipeWrap` + `EventPoller`（epoll / ET-LT / 延迟删除 / `async` / `sync`）+ `EventPollerPool` | 单测：pipe 读事件、`async` 投递 10 万次无丢、`sync` 取值、`delEvent` 后不再触发、**回调内 `shutdown()` 不崩**；TSAN 严格组 0 报告 | NFR-7 |
 | **M2-2** | 定时器（`doDelayTask` / 取消 / 循环任务）+ `getMinDelay` | 单测 `tests/test_network_timer.cpp`（10 个用例，清单见 §7.1）：**0 早触发** + 相对宿主裸基线增量 ≤5ms、取消后不触发、循环任务次数正确、取消与到期的竞态、超长延时 clamp 可见 | ROADMAP:12（精度门禁）、NFR-7 |
-| **M2-3** | `Socket` / `Buffer` / `Session` / `TcpServer` + 空闲检测 + `examples/echo_server` | `nc` 回显 100MB 校验和一致；50 并发正确；**空闲超时按 FR-4.4 触发**；断开后 fd 回落；`totalRejected/totalIdleTimeout` 计数增长 | FR-4.4、FR-5.2、NFR-2、NFR-6、SC-3 |
+| **M2-3a** | `Buffer` + `Socket` / `SockException`（新增 `ErrType`） | 12 个用例（§7.3）：`readFromFd` 读到 EAGAIN、**上限契约 `hit_limit`**、部分写、EOF、越界消费被拒 | NFR-7、§4.3 |
+| **M2-3b** | `Session` + `TcpServer` + 空闲检测 + `examples/echo_server` + `scripts/echo_test.sh` | `nc` 回显 100MB 校验和一致；50 并发正确；**空闲超时按 FR-4.4 触发**；断开后 fd 回落；`totalRejected / totalIdleTimeout / totalRecvOverflow / totalSendOverflow` 计数增长 | FR-4.4、FR-5.2、NFR-2、NFR-6、SC-3 |
 
 **每批门禁（不变）**：零警告（`-Wall -Wextra`）+ `ctest` 全绿 + ASAN 干净 + TSAN 严格组 0 报告。
 
@@ -590,8 +617,7 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | `poller_del_event_in_callback` | 回调里 `delEvent` 自己 | 不崩；回调返回后对象才析构 |
 | `poller_lt_vs_et` | 同一 fd 分别用 LT / ET 注册 | LT 反复触发、ET 只在新数据到达时触发 |
 | `timer_*`（M2-2 共 10 个用例） | 实现文件 `tests/test_network_timer.cpp` | 完整清单与门禁口径见 §7.1 |
-| `buffer_read_write_fd` | pipe 灌 1MB | `readFromFd` 读到 EAGAIN 才返回；`writeToFd` 部分写后余量正确 |
-| `buffer_frame_find` | 半包 / 多包混在一起 | `find` 偏移正确、`consume` 后 `size()` 正确 |
+| `buffer_*`（12 个用例） | 实现文件 `tests/test_network_buffer.cpp`：socketpair + **非阻塞 fd**，全程无等待 → 进 TSAN 严格组 | 逐条清单见 §7.3 |
 | `ntimed_echo_100mb` | `nc` 灌 100MB 随机数据 | 回显校验和一致（`scripts/echo_test.sh`） |
 | `ntimed_session_idle_timeout` | 连上不发数据，`recv_idle=50ms` | 阈内断开、`onError` 为超时、`totalIdleTimeout()` +1 |
 | `ntimed_session_send_blocked` | 只连不读 + 持续 `send` | 超过 `send_blocked` 后断开、`bytesOut` 停止增长 |
@@ -675,6 +701,26 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 
 "—" 表示判定为**没有差异化代码路径、不需要单独覆盖**，不是"忘了写"；每格的理由见括注。
 
+### 7.3 Buffer / Socket 分组（M2-3a，实现文件 `tests/test_network_buffer.cpp`）
+
+12 个用例全部**单线程 + 非阻塞 fd**（`socketpair`），不睡眠、不等待 → 留在 TSAN 严格组。
+大 payload 用 FNV-1a 哈希比较而不是逐字节 dump（失败信息要能看，不能刷 5KB 的字符）。
+
+| 用例 | 造法 | 断言 |
+|---|---|---|
+| `buffer_append_consume_basic` | append/consume 基本流 | 返回值 == 实际量、`size()` 一致、消费干净后读游标归零 |
+| `buffer_consume_overflow_rejected` | 只有 3 字节却 `consume(10)` | 返回 0 且**数据不变**（不截断） |
+| `buffer_clear_release` | 先 clear 再 release | clear 返回被丢弃量且**容量保留**；release 返回释放的容量 |
+| `buffer_compact_no_growth` | 100 轮 append 1KB + 半消费 + 消费干净 | 容量仍停在初始量级（≤2×）：compact 生效 |
+| `buffer_find_and_affix` | HTTP 头字符串 | `find("\r\n\r\n")` 偏移、`find(char, from)`、未找到 = `npos`、startWith/endWith |
+| `buffer_append_null_and_empty` | `append(nullptr,10)` / `append("",0)` / `reserve` | 写入 0；reserve 返回实际容量、够大时原样返回 |
+| `buffer_move` | move 构造 / move 赋值 | 数据随所有权转移；被移走的是**可用的空对象** |
+| `buffer_read_from_fd_to_eagain` | 对端发 1000 字节 | 一次读空并返回 1000；`hit_limit=false`；再读 = 0（EAGAIN 不是错误） |
+| `buffer_read_from_fd_max_bytes_contract` | 对端发 5000 字节，上限 100 | 返回 100 且 **`hit_limit=true`**；按契约循环读到 `hit_limit=false` 后总量 == 5000（**ET 关键契约**，已变异验证会红） |
+| `buffer_read_from_fd_eof` | 发 64 字节后关闭对端 | 先把已到的 64 字节交出来，**下一次**才返回 0（EOF） |
+| `buffer_read_from_fd_invalid_max` | `max_bytes == 0` | 返回 -1 + `hit_limit=true` + `err=EINVAL`（拒绝"永远读不完"的忙等） |
+| `buffer_write_to_fd_partial` | 对端不读，灌 1MB | 部分写：写出量 < 1MB 且已写部分被消费；再写 = 0（EAGAIN）；空缓冲写 = 0 |
+
 ## 8. 风险清单
 
 | # | 风险 | 触发条件 | 应对 |
@@ -714,6 +760,13 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | `doDelayTask` 的退出语义 | 已退出一律 `nullptr` + `rejectedTimerCount()`（**含轮询线程内**调用） | 排除"轮询线程内返回非空 handle"（永不触发且无告警 = 静默降级，§4.5）；排除"直接抛异常"（在关停路径上抛异常会把关停流程复杂化） |
 | 0 延时自投链 | **只观测**（`delayBatchMax` / `delayBatchCount` + 文档写明性质），不限制 | 排除"限制每轮处理上限"（引入"积压时延迟一轮"的新行为，需要真实场景证明值得）；排除"禁止 delay=0"（`0` 有合法语义：下个循环周期执行）；改判条件：线上单批远超客户端数 |
 | 同 deadline 的顺序 | 不写成契约（只保证不丢、不饿死） | 排除"承诺插入序"（deadline 是内部 `now+delay` 算出的，"同 deadline"从外部不可控；承诺了就要为它负责） |
+| `SockException` 加 `ErrType`（M2-3a） | 见 §3.2：errno 之外再带"原因" | 排除"只看 errno"：FR-4.4 的四类断开在 errno 里都是 0/ETIMEDOUT，无法分桶计数、也无法断言"onError 为超时" |
+| `Buffer::consume` 越界（M2-3a） | 拒绝执行（返回 0 + ErrorP），不截断 | 排除"按 `size()` 截断"（静默错位，最难查）；排除"抛异常"（解析热路径上抛异常代价过大） |
+| `Buffer::readFromFd` 带上限（M2-3a） | `max_bytes` **必填** + `hit_limit` 出参 | 排除"容器内部定一个固定上限"（策略不该写死在容器里）；排除"不加上限"（读循环把内存交给对端） |
+| 尽量不用 `void`（M2-3a 起） | 公开接口全面给出有意义的返回值；只有"被调用的钩子"保留 void | 排除"保持 void + 文档约定一定成功"：约定被破坏时没人会发现，而返回值让调用方当场可判定 |
+| `TcpServer` 连接上限默认（M2-3b） | 默认 **64**（FR-4.4），传 0 **被拒** | 排除"0 = 不限"：有界性不可协商（与 `EventPoller::setMaxPendingTasks(0)` 同一处理） |
+| `Session` 发送队列上限（M2-3b） | `setMaxSendBuffer`（默认 8MB）+ `totalSendOverflow()` | 排除"只靠 30s 写阻塞兜底"：时间兜底限制不了**字节数**，只连不读的对端能把内存涨到 OOM |
+| `TcpServer` 未设 session creator（M2-3b） | `start()` 明确失败（ErrorP + false） | 排除"接受连接然后丢数据"：那是最难查的一类问题 |
 
 ## 10. 未决事项（待定，走到对应步骤再定）
 

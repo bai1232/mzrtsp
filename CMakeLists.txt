@@ -88,6 +88,9 @@ set(MZMEDIA_SOURCES
         # M2-1 网络层
         src/network/pipe_wrap.cpp
         src/network/event_poller.cpp
+        # M2-3a 缓冲与 socket
+        src/network/buffer.cpp
+        src/network/socket.cpp
         )
 
 # 骨架阶段（第 1 批）没有任何源文件，此时不能创建 STATIC 库目标

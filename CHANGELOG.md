@@ -61,7 +61,20 @@
 - 修复（真实竞态）：`timer_precision` 把 `Semaphore` 声明在循环里，上一轮的 `~Semaphore()`
   与轮询线程仍在进行的 `post()` 并发 —— TSAN 严格组抓到（`pthread_cond_destroy` vs
   `pthread_cond_broadcast`）；生存期提到 `poller->shutdown()` 之后，规矩记入 `TESTING.md` §8.7
-- 测试总数：**90 个用例 / 2034 条断言**（M1 的 61/779 + M2 的 29：poller 13 + timer 16）
+#### M2-3a Buffer / Socket（含 `ErrType`）
+- `network/buffer.h/.cpp`：线性可扩容缓冲（compact 回收前导空间、读游标、`find` 返回偏移）。
+  **返回值策略：没有 void 公开接口** —— `consume` 返回实际消费量（越界 → 0 + ErrorP，不截断）、
+  `clear/release` 返回被处理的字节数、`append/reserve` 返回实际量
+- `readFromFd(fd, max_bytes, hit_limit, err)`：上限**必填**（原签名让 Session 无法在循环中途
+  设限，与"上限在 Session"自相矛盾）；`hit_limit` 显式告知"没读完"（ET 下漏了会永久假死）；
+  非法 `max_bytes==0` 拒绝执行
+- `network/socket.h/.cpp`：fd RAII + syscall 封装；`accept4` 带 NONBLOCK|CLOEXEC；
+  `send` 带 MSG_NOSIGNAL；`EAGAIN/EWOULDBLOCK/EINTR` 不记日志（不是错误）；
+  `SockException` 新增 `ErrType`（FR-4.4 四类断开要靠原因分桶计数）
+- 测试：`tests/test_network_buffer.cpp` 12 个用例（socketpair + 非阻塞，无等待 → TSAN 严格组），
+  新增 ctest 分组 `buffer`；关键契约 `hit_limit` 已做变异验证（改坏即红）
+- 测试总数：**102 个用例 / 2467 条断言**（M1 61 + M2 41：poller 13 + timer 16 + buffer 12）
+
 
 ### 说明
 - `v0.1.0` 尚未发布。按 `VERSIONING.md`，tag 只能打在**可独立构建且测试通过**的提交上。

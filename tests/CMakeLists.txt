@@ -25,6 +25,8 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_network_poller.cpp
         # ---- M2-2 定时器专项 ----
         ${CMAKE_CURRENT_SOURCE_DIR}/test_network_timer.cpp
+        # ---- M2-3a 缓冲与 socket ----
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_network_buffer.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS
@@ -48,6 +50,9 @@ set(MZMEDIA_TEST_GROUPS
         # ---- M2-2 定时器专项 ----
         # 本组刻意只用无超时等待（Semaphore::wait / sleepMs），因此留在 TSAN 严格组。
         timer
+        # ---- M2-3a 缓冲与 socket ----
+        # 单线程 + 非阻塞 fd（socketpair），没有跨线程投递，也能留在严格组。
+        buffer
         )
 
 add_executable(mzmedia_unittest ${MZMEDIA_TEST_SOURCES})
