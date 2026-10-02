@@ -205,6 +205,24 @@ cmake -B build-tsan -DMZMEDIA_ENABLE_TSAN=ON -DCMAKE_CXX_COMPILER=g++-12
 > 分组按**用例名子串**匹配，因此个别用例会同时属于两个组
 > （如 `logger_queue_overflow_drop` 同时属于 `logger` 与 `queue`）。上表为去重后的数字。
 
+### 8.4 已抓到的真实竞态（不是误报，要照规矩避开）
+
+**测试里同步对象的生存期**：`Semaphore` 被销毁时，另一个线程不能还在 `post()` 里。
+M2-2b 踩到过一次：`timer_precision` 把 `Semaphore` 声明在**循环里**，上一轮的
+`~Semaphore()`（`pthread_cond_destroy`）与轮询线程仍在进行的 `post()`
+（`pthread_cond_broadcast`）并发：
+
+```
+WARNING: ThreadSanitizer: data race
+  Write of size 8 by main thread:  pthread_cond_destroy ← Semaphore::~Semaphore()
+  Previous read of size 8 by thread T3:  pthread_cond_broadcast ← Semaphore::post()
+```
+
+规矩：**等待用的 `Semaphore` 必须活得比它等待的线程长** —— 只能在
+`poller->shutdown()`（内部 join）之后销毁，不要声明在循环体 / 回调作用域里。
+（这与 §8.2 的误报不同：误报的特征是两个访问点都带 `(mutexes: ...)` 标注，
+这里是一个 `destroy` 与一个 `broadcast` 撞在一起，是真 UB。）
+
 ## 9. 发版前验收清单（配合 VERSIONING.md）
 
 - [ ] 单元测试全部通过（`ctest --output-on-failure`）

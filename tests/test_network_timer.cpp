@@ -10,6 +10,11 @@
  *   因此本组可以留在 TSAN 严格组（要求 0 报告）。
  *   代价：实现坏掉时用例会挂住，由 ctest 的 TIMEOUT(120s) 判失败。
  *
+ * 生存期纪律：等待用的 Semaphore 必须**活得比轮询线程长** —— 只能在
+ *   `poller->shutdown()`（内部 join）之后销毁。若声明在循环里，上一轮的
+ *   `~Semaphore()`（pthread_cond_destroy）会与轮询线程仍在进行的 `post()`
+ *   （pthread_cond_broadcast）并发，这是**真实竞态**，TSAN 严格组抓到过一次。
+ *
  * 断言纪律：回调都在轮询线程执行，**不允许在回调里调用 MZ_ASSERT_***；
  * 回调只写 std::atomic / 受信号量同步的普通变量，断言回到测试主线程。
  *
@@ -37,7 +42,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <functional>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 using namespace mzmedia;
@@ -114,10 +121,16 @@ MZ_TEST(timer_precision) {
     std::vector<int64_t> lib_over;   // 库定时器超出量
     std::vector<int64_t> raw_over;   // 裸 nanosleep 超出量（宿主基线）
 
+    // fired 必须**在循环外**、活得比轮询线程长：
+    // 若声明在循环里，上一轮的 ~Semaphore()（pthread_cond_destroy）会与轮询线程
+    // 仍在进行的 post()（pthread_cond_broadcast）并发 —— 这是**真实竞态**，
+    // TSAN 严格组抓到过（main 线程 destroy vs poller 线程 broadcast）。
+    // 规矩：等待用的 Semaphore 只有在 poller->shutdown()（内部 join）之后才能销毁。
+    Semaphore fired(0);
+
     for (int i = 0; i < kRuns; ++i) {
         raw_over.push_back(rawSleepOverrun(kDelay));
 
-        Semaphore fired(0);
         const uint64_t begin = getCurrentMillisecond();
         auto task = poller->doDelayTask(kDelay, [&fired]() -> uint64_t {
             fired.post();
@@ -214,6 +227,10 @@ MZ_TEST(timer_many_1000) {
     done.wait();
     MZ_ASSERT_EQ(fired.load(), kCount);
     MZ_ASSERT_EQ(poller->timerCount(), 0u);   // 全部出堆，无残留
+    // 1000 个同刻到期 ≈ "100 路客户端秒级校验同时到点"的放大版：
+    // 观测它们被分成几批（批次越大，单次 processDelayTask 占用的时间越长）
+    mzReport("timer_many_1000: 单批最大 %zu 个 / 非空批次数 %llu",
+             poller->delayBatchMax(), static_cast<unsigned long long>(poller->delayBatchCount()));
     poller->shutdown();
 }
 
@@ -241,6 +258,9 @@ MZ_TEST(timer_shutdown_cancels) {
     sleepMs(50);
     MZ_ASSERT_EQ(fired.load(), 0);
     MZ_ASSERT_EQ(poller->timerCount(), 0u);   // 退出清理已清空
+    // 未触发的定时器在退出时被丢弃 —— 必须可见。
+    // （未执行的"任务"有 droppedOnExitCount + Warn，定时器原先一条计数都没有 = 静默丢弃）
+    MZ_ASSERT_EQ(poller->droppedTimerOnExitCount(), 1u);
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +397,223 @@ MZ_TEST(timer_repeat_count) {
 
     MZ_ASSERT_EQ(poller->timerCount(), 0u);   // 结束后不留条目
     poller->shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 调用上下文维度（M2-2b 补）
+//
+// 为什么单列一组：上面 10 条用例全部是"从测试线程、一次性、不在回调里"投递的，
+// 而真实服务器里定时器是在**回调里、多生产者、退出过程中**投的。这一组按
+// "谁投 / 什么时候投"来测，正是 DESIGN_M2 §7.2 那张矩阵要补的那一维。
+// ---------------------------------------------------------------------------
+
+MZ_TEST(timer_concurrent_submit) {
+    // 多生产者并发投递。固定 4 线程：测试要可复现，不随机器核数变。
+    // 结构上 multimap 只被轮询线程碰，所以这里真正考验的是**任务队列在 N 生产者下
+    // 的完整性**（以及计数不会漂）
+    constexpr int kThreads = 4;
+    constexpr int kPerThread = 250;
+    constexpr int kTotal = kThreads * kPerThread;
+
+    auto poller = EventPoller::create("test-timer-concurrent");
+    std::atomic<int> fired{0};
+    std::atomic<int> rejected{0};
+    Semaphore done(0);
+    std::vector<std::thread> producers;
+
+    for (int t = 0; t < kThreads; ++t) {
+        producers.emplace_back([&poller, &fired, &rejected, &done]() {
+            for (int i = 0; i < kPerThread; ++i) {
+                auto task = poller->doDelayTask(10, [&fired, &done]() -> uint64_t {
+                    if (fired.fetch_add(1) + 1 == kTotal) {
+                        done.post();
+                    }
+                    return 0;
+                });
+                if (!task) {
+                    rejected.fetch_add(1);   // 工作线程里不断言，只记录
+                }
+            }
+        });
+    }
+    for (auto &producer : producers) {
+        producer.join();
+    }
+    done.wait();
+
+    MZ_ASSERT_EQ(rejected.load(), 0);
+    MZ_ASSERT_EQ(fired.load(), kTotal);
+    MZ_ASSERT_EQ(poller->timerCount(), 0u);
+    MZ_ASSERT_EQ(poller->rejectedTimerCount(), 0u);
+    MZ_ASSERT_EQ(poller->asyncRejectedCount(), 0u);
+    MZ_ASSERT_EQ(poller->pendingTaskCount(), 0u);
+    mzReport("timer_concurrent_submit: %d 线程 × %d 个 = %d 全部触发；单批最大 %zu / 非空批次数 %llu",
+             kThreads, kPerThread, kTotal, poller->delayBatchMax(),
+             static_cast<unsigned long long>(poller->delayBatchCount()));
+    poller->shutdown();
+}
+
+MZ_TEST(timer_same_deadline) {
+    // 同 deadline 的一批定时器：这里**只锁"不丢、不饿死"**，不锁顺序。
+    // 顺序不写成断言的原因：deadline 是 doDelayTask 内部按 now+delay 算的，
+    // 100 次投递只要跨了 1ms，插入序就与 deadline 序不一致；跨线程更是如此。
+    // （multimap 对等价键保证插入序，但"能造出等价键"这件事本身不可依赖）
+    constexpr int kDeadlineCount = 100;
+    auto poller = EventPoller::create("test-timer-same-deadline");
+    std::atomic<int> fired{0};
+    Semaphore done(0);
+
+    for (int i = 0; i < kDeadlineCount; ++i) {
+        auto task = poller->doDelayTask(50, [&fired, &done]() -> uint64_t {
+            if (fired.fetch_add(1) + 1 == kDeadlineCount) {
+                done.post();
+            }
+            return 0;
+        });
+        MZ_ASSERT_NOT_NULL(task.get());
+    }
+
+    done.wait();
+    MZ_ASSERT_EQ(fired.load(), kDeadlineCount);
+    MZ_ASSERT_EQ(poller->timerCount(), 0u);
+    mzReport("timer_same_deadline: %d 个 50ms 定时器 → 单批最大 %zu / 非空批次数 %llu",
+             kDeadlineCount, poller->delayBatchMax(),
+             static_cast<unsigned long long>(poller->delayBatchCount()));
+    poller->shutdown();
+}
+
+MZ_TEST(timer_cancel_after_fire) {
+    // 一次性定时器**已经触发**（已出堆）之后再 cancel —— 必须是安全的 no-op。
+    // 这是高频正常路径：空闲超时 → onIdle → shutdown → cancel 自己那个检查任务；
+    // 100 路客户端里每次超时都会走一遍
+    auto poller = EventPoller::create("test-timer-cancel-after-fire");
+    std::atomic<int> fired{0};
+    Semaphore fired_once(0);
+
+    auto task = poller->doDelayTask(10, [&fired, &fired_once]() -> uint64_t {
+        fired.fetch_add(1);
+        fired_once.post();
+        return 0;
+    });
+    MZ_ASSERT_NOT_NULL(task.get());
+
+    fired_once.wait();
+    MZ_ASSERT_EQ(poller->timerCount(), 0u);   // 已经出堆
+
+    task->cancel();   // 对已触发过的任务取消：handle 仍持有对象（shared_ptr），不得 UAF
+    sleepMs(50);
+    MZ_ASSERT_EQ(fired.load(), 1);            // 不会"复活"再触发一次
+    MZ_ASSERT_TRUE(task->isCanceled());
+    MZ_ASSERT_EQ(poller->timerCount(), 0u);   // 也不会留下条目
+    poller->shutdown();
+}
+
+MZ_TEST(timer_reentrant_submit) {
+    // 回调里再投定时器（重入投递）—— M3 的 HTTP keep-alive、协议层心跳都这么用。
+    // 安全性来自 processDelayTask 先 erase 再执行回调、且每轮重新取 begin()
+    constexpr int kChain = 5;
+    auto poller = EventPoller::create("test-timer-reentrant");
+    std::atomic<int> fired{0};
+    std::atomic<int> rejected{0};
+    Semaphore done(0);
+
+    std::function<void()> arm;   // 自引用：每一步在回调里再投下一步
+    arm = [&poller, &fired, &rejected, &done, &arm]() {
+        const int step = fired.fetch_add(1) + 1;
+        if (step >= kChain) {
+            done.post();
+            return;   // 链条结束
+        }
+        auto next = poller->doDelayTask(10, [&arm]() -> uint64_t {
+            arm();
+            return 0;
+        });
+        if (!next) {
+            rejected.fetch_add(1);   // 回调里不断言，只记录
+        }
+    };
+
+    auto first = poller->doDelayTask(10, [&arm]() -> uint64_t {
+        arm();
+        return 0;
+    });
+    MZ_ASSERT_NOT_NULL(first.get());
+
+    done.wait();
+    sleepMs(50);   // 链条若没真的结束，计数还会继续涨
+    MZ_ASSERT_EQ(fired.load(), kChain);
+    MZ_ASSERT_EQ(rejected.load(), 0);
+    MZ_ASSERT_EQ(poller->timerCount(), 0u);
+    poller->shutdown();
+}
+
+MZ_TEST(timer_reentrant_zero_delay) {
+    // 0 延时自投链：M2-2b 只**观测**，不限制（决策见 DESIGN_M2 §9）。
+    // 性质：新条目 deadline == now → 会被**同一个 processDelayTask 循环**处理完，
+    // 期间既不派发 epoll 事件、也不检查 _exit（所以自投链能拖住退出）。
+    // 这里不断言"必须在同一批"——那是性质不是契约，只把观测值打出来
+    constexpr int kSteps = 20;
+    auto poller = EventPoller::create("test-timer-zero-chain");
+    std::atomic<int> fired{0};
+    std::atomic<int> rejected{0};
+    Semaphore done(0);
+
+    std::function<void()> arm;
+    arm = [&poller, &fired, &rejected, &done, &arm]() {
+        const int step = fired.fetch_add(1) + 1;
+        if (step >= kSteps) {
+            done.post();
+            return;
+        }
+        auto next = poller->doDelayTask(0, [&arm]() -> uint64_t {
+            arm();
+            return 0;
+        });
+        if (!next) {
+            rejected.fetch_add(1);
+        }
+    };
+
+    auto first = poller->doDelayTask(0, [&arm]() -> uint64_t {
+        arm();
+        return 0;
+    });
+    MZ_ASSERT_NOT_NULL(first.get());
+
+    done.wait();
+    MZ_ASSERT_EQ(fired.load(), kSteps);
+    MZ_ASSERT_EQ(rejected.load(), 0);
+    MZ_ASSERT_EQ(poller->timerCount(), 0u);
+    mzReport("timer_reentrant_zero_delay: %d 步 0 延时自投链 → 单批最大 %zu / 非空批次数 %llu"
+             "（单批 ≈ 步数 说明这段时间内不派发 I/O）",
+             kSteps, poller->delayBatchMax(),
+             static_cast<unsigned long long>(poller->delayBatchCount()));
+    poller->shutdown();
+}
+
+MZ_TEST(timer_submit_after_shutdown) {
+    // 契约：poller 已退出 → doDelayTask 返回 nullptr + rejectedTimerCount()（与跨线程
+    // 路径语义统一）。
+    // **修前这条是红的**：轮询线程路径不检查 _exit，返回一个非空 handle，但它永远不会
+    // 触发，也没有任何计数/告警 —— 静默降级（AI_COLLAB §4.5）。
+    // 确定性造法：在轮询线程的 sync 任务里先 shutdown()（只置位 + 唤醒，不 join 自己），
+    // 再投定时器
+    auto poller = EventPoller::create("test-timer-after-exit");
+    std::atomic<int> fired{0};
+    std::atomic<bool> got_null{false};
+
+    poller->sync([&poller, &fired, &got_null]() {
+        poller->shutdown();
+        auto task = poller->doDelayTask(10, [&fired]() -> uint64_t {
+            fired.fetch_add(1);
+            return 0;
+        });
+        got_null.store(task == nullptr);   // 轮询线程里不断言，只记录
+    });
+
+    MZ_ASSERT_TRUE(got_null.load());
+    MZ_ASSERT_GT(poller->rejectedTimerCount(), 0u);
+    MZ_ASSERT_EQ(fired.load(), 0);   // 被拒的定时器绝不会触发
 }
 
 // ---------------------------------------------------------------------------

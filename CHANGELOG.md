@@ -45,7 +45,23 @@
 - 修复：`minDelayInLoop` 在超长延时（deadline 越过 int64 上界）时差值为负，被
   `clampTimeout` 当成"没有定时器"→ `epoll_wait` 永久等待 → 超长定时器**静默永不触发**；
   改为饱和到 `INT64_MAX`（边界用例 `timer_huge_delay_clamped` 修前为红）
-- 测试总数：**84 个用例 / 1909 条断言**（M1 的 61/779 + M2 的 23：poller 13 + timer 10）
+
+#### M2-2b 调用上下文补测（并发 / 重入 / 退出中）
+- 用例：`timer_concurrent_submit`（4 线程 × 250 并发投递）、`timer_same_deadline`（同 deadline
+  不丢不饿死，顺序不作契约）、`timer_cancel_after_fire`（已触发后再 cancel，高频路径）、
+  `timer_reentrant_submit`（回调里再投）、`timer_reentrant_zero_delay`（0 延时自投链，只观测）、
+  `timer_submit_after_shutdown`（退出过程中投递）
+- 修复：`doDelayTask` 在轮询线程内不检查退出，返回一个"永不触发"的非空 handle（静默降级）
+  → 与跨线程路径统一为 `nullptr` + `rejectedTimerCount()`（用例 `timer_submit_after_shutdown` 修前为红）
+- 修复：退出时静默丢弃未触发定时器 → `droppedTimerOnExitCount()` + Warn
+- 新增观测：`delayBatchMax()` / `delayBatchCount()`。实测：1000 个同刻到期 = 1 批 1000 个；
+  20 步 0 延时自投链 = 1 批 20 个（性质已量化，暂不限制，见 `DESIGN_M2` §8 R12 / §10 未决 8）
+- 修复（测试框架）：汇总行把"失败"打成**断言**数却与"通过"的**用例**数并列，出现
+  "用例 18 个（通过 16 / 失败 3）"这种自相矛盾的输出；现在两处都写明单位
+- 修复（真实竞态）：`timer_precision` 把 `Semaphore` 声明在循环里，上一轮的 `~Semaphore()`
+  与轮询线程仍在进行的 `post()` 并发 —— TSAN 严格组抓到（`pthread_cond_destroy` vs
+  `pthread_cond_broadcast`）；生存期提到 `poller->shutdown()` 之后，规矩记入 `TESTING.md` §8.4
+- 测试总数：**90 个用例 / 2034 条断言**（M1 的 61/779 + M2 的 29：poller 13 + timer 16）
 
 ### 说明
 - `v0.1.0` 尚未发布。按 `VERSIONING.md`，tag 只能打在**可独立构建且测试通过**的提交上。

@@ -254,6 +254,10 @@ public:
 | 线程 | `addEvent/modifyEvent/delEvent` 可从任意线程调（内部投递）；`async(may_sync=true)` 在同线程直接执行 |
 | `delEvent` 的 `complete_cb` | 参数是 `bool success`；**在 poller 线程上、删除完成后**调用（回调内不得再 delayed-delete 同一 fd） |
 | 定时器线程安全 | `doDelayTask` 可从任意线程调；`DelayTask::cancel()` 线程安全（`atomic`） |
+| `doDelayTask` 退出语义 | poller 已退出（`exiting()`）→ **一律 `nullptr` + `rejectedTimerCount()`**，与调用线程无关。修前只有跨线程路径检查，轮询线程内会返回永不触发的非空 handle（静默降级，M2-2b 统一） |
+| 同 deadline 的顺序 | `std::multimap` 对等价键保证插入序，但 deadline 由 `doDelayTask` 内部按 `now+delay` 算出 —— **"同一 deadline"本身不可依赖**（跨毫秒/跨线程都会变），因此顺序**不作为契约**，只保证不丢、不饿死（用例 `timer_same_deadline`） |
+| 退出时的未触发定时器 | 丢弃必须可见：`droppedTimerOnExitCount()` + Warn（只统计未被 cancel 的） |
+| 到期批次观测 | `delayBatchCount()`（非空批次数）/ `delayBatchMax()`（单批高水位）：观测同刻大量到期与 0 延时自投链（§4.3、§8 R12） |
 
 ### 3.6 `Session`（连接生命周期 + 收发）
 
@@ -409,8 +413,13 @@ bool async(Task task, bool may_sync) {
 
 ```cpp
 DelayTask::Ptr doDelayTask(uint64_t delay_ms, std::function<uint64_t()> task) {
+    if (_exit.load()) { ++_rejected_timer_count; return nullptr; }   // 已退出：明确拒绝
     auto ret = std::make_shared<DelayTask>(std::move(task));
     ret->setDeadline(getCurrentMillisecond() + delay_ms);
+    if (isCurrentThread()) {                                         // 同线程直插（保证时序）
+        _delay_task_map.emplace(ret->deadline(), ret);
+        return ret;
+    }
     async([this, ret] { _delay_task_map.emplace(ret->deadline(), ret); });
     return ret;
 }
@@ -420,6 +429,25 @@ DelayTask::Ptr doDelayTask(uint64_t delay_ms, std::function<uint64_t()> task) {
 **时钟**：全部用 `getCurrentMillisecond()`（单调时钟）。**绝不使用墙钟** —— NTP 校时会让定时器乱序。
 
 **溢出边界**：`epoll_wait` 的 timeout 是 `int` 毫秒 → 超过 `INT_MAX` 时 clamp；定时器本身用 `uint64_t`。
+`minDelayInLoop()` 的差值还要**饱和**到 `INT64_MAX`：越过 int64 上界时直接 `static_cast<int64_t>`
+会得到负数，被 `clampTimeout` 当成"没有定时器" → 永久等待 → 定时器静默永不触发
+（M2-2 修复，用例 `timer_huge_delay_clamped` 修前为红）。
+
+**到期批次与重入（M2-2b 观测，先不设限）**：`processDelayTask` 每轮把**所有已到期**的项处理完
+才返回，期间不派发 epoll 事件、也不检查 `_exit`。因此：
+- 一批同刻到期的定时器（100 路客户端的秒级校验、accept 突发后一批会话的检查任务）会连着跑完；
+- 回调里 `doDelayTask(0, …)` 会被**同一个循环**接着处理，自投链能一直占着循环。
+
+观测出口：`delayBatchMax()`（单批高水位）/ `delayBatchCount()`（非空批次数）。
+实测：1000 个同刻到期 = 1 批 1000 个；100 个同 deadline = 1 批 100 个；20 步 0 延时自投链 = 1 批 20 个。
+**先观测不限制**（决策见 §9）——限制每轮处理数会引入"积压时延迟一轮"的新行为，
+要有真实场景证明值得（§10 未决 8）。
+
+**退出语义**：`doDelayTask` 在**任何**线程上，只要 `exiting()` 为真就返回 `nullptr` +
+`rejectedTimerCount()`。修前只有跨线程路径检查 `_exit`，轮询线程内（回调里 / shutdown 之后）
+会返回一个永不触发的非空 handle —— 静默降级（M2-2b 修复，用例 `timer_submit_after_shutdown`）。
+退出时未触发的定时器会被丢弃，计数 `droppedTimerOnExitCount()` + Warn：
+"未执行的任务"有 `droppedOnExitCount`，定时器不能反而没有。
 
 ### 4.4 读路径：ET 必须读到 `EAGAIN`
 
@@ -517,6 +545,8 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | `TcpServer::totalRecvOverflow()` | TcpServer | 接收缓冲超限被断开 |
 | `TcpServer::totalAcceptError()` | TcpServer | `accept` 失败（EMFILE 等） |
 | `EventPoller::timerCount()` | EventPoller | 当前定时器数（观测泄漏/堆积） |
+| `EventPoller::droppedTimerOnExitCount()` | EventPoller | 退出时丢弃的**未触发**定时器数（静默丢弃也算失败） |
+| `EventPoller::delayBatchMax()` / `delayBatchCount()` | EventPoller | 单批处理定时器数高水位 / 非空批次数（同刻到期、0 延时自投链） |
 | `EventPoller::asyncRejectedCount()` | EventPoller | 任务队列满导致的投递被拒（背压信号） |
 | `EventPoller::droppedOnExitCount()` | EventPoller | 退出时丢弃的"已受理但未执行"任务 |
 
@@ -570,7 +600,7 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 
 ### 7.1 定时器分组（M2-2，实现文件 `tests/test_network_timer.cpp`）
 
-`ctest -R timer` 实际跑 **11 个**用例：下表 10 个 + M2-1 的两个冒烟用例
+`ctest -R timer` 实际跑 **18 个**用例：下表 16 个 + M2-1 的两个冒烟用例
 （`poller_timer_fires` / `poller_timer_repeat_and_cancel`）——因为分组过滤是**子串匹配**，
 用例名里含 `timer` 的都会被命中（无害，只是重复跑一遍）。
 
@@ -593,6 +623,12 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | `timer_cancel_race` | 200 次"投 1ms 定时器后立刻 `cancel()`" | 不崩；触发次数 ≤200；`timerCount()` 归 0（取出后先判 `isCanceled()`，风险 7） |
 | `timer_repeat_count` | 返回 20ms 的循环任务，第 5 次返回 0 | **恰好 5 次**（不是"跑 200ms 数次数 ±2"：本宿主 10ms 级抖动会让窗口计数 flaky）；`timerCount()` 归 0 |
 | `timer_exception_stops_repeat` | 第 2 次触发时抛异常 | 计数停在 2；异常后不再入堆 |
+| `timer_concurrent_submit` | 4 线程 × 250 个 `doDelayTask(10ms)`（**多生产者**） | 1000 个全部触发；`timerCount()` / `rejectedTimerCount()` / `asyncRejectedCount()` / `pendingTaskCount()` 全为 0 |
+| `timer_same_deadline` | 100 个 50ms 定时器（同刻到期） | 100 个全部触发、无丢失；**顺序刻意不写成断言**（见 §3.5"同 deadline 的顺序"） |
+| `timer_cancel_after_fire` | 一次性定时器**已触发**后再 `cancel()`（高频路径：超时 → onIdle → shutdown → cancel 自己） | 不崩、不复活（`fired==1`）、`isCanceled()` 为真、`timerCount()` 仍为 0 |
+| `timer_reentrant_submit` | **回调里**再投下一个（链长 5，每步 10ms） | 5 步全部执行、无拒投、`timerCount()` 归 0 |
+| `timer_reentrant_zero_delay` | 回调里 `doDelayTask(0, …)` 自投 20 步（**只观测**，不断言批量性质） | 20 步全部执行；打印 `delayBatchMax()`（实测 20 ⇒ 全在**同一个** `processDelayTask` 里跑完，期间不派发 I/O） |
+| `timer_submit_after_shutdown` | 轮询线程内先 `shutdown()` 再投定时器（**退出过程中**） | 必须返回 `nullptr` + `rejectedTimerCount()` 增长；被拒的定时器绝不触发（**修前为红**） |
 
 **两处刻意的设计偏离（相对 §7 初稿）**：
 1. `timer_order_by_deadline` 的档位间隔从 10ms 改为 **100ms**。每个 deadline 都是在
@@ -620,6 +656,25 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 
 **验证要求**（`AI_COLLAB.md` §3.4）：每条用例必须覆盖 正常 / 空 / 满 / 断开 / 超大输入中适用的分支；"修前必红"的用例（如 `ntimed_session_idle_timeout`）要附变异验证输出。
 
+### 7.2 用例推导矩阵（机制 × 上下文）
+
+**为什么加这张表**：M2-2 的初稿只按"定时器自身行为"列了 10 条用例，于是"谁投 / 在哪个线程 /
+什么时候投"这一整维漏了 4 条 —— 其中 1 条（退出过程中投递）落在一个真实缺陷上。
+所以"该测什么"不该由初稿列没列决定，而由下表推导：每个格子问一次
+"这段代码在这个上下文里还成立吗"。
+
+| 机制 \ 上下文 | 单生产者（测试线程） | 多生产者 / 跨线程 | 轮询线程内重入 | 退出过程中 |
+|---|---|---|---|---|
+| 投递 `doDelayTask` | ✔ 已有 | `timer_concurrent_submit` | `timer_reentrant_submit` | `timer_submit_after_shutdown` |
+| 到期执行 | ✔ 已有 | 同上（1000 个并发投递的到期） | `timer_reentrant_zero_delay`（只观测） | ✔ 已有（`timer_shutdown_cancels`） |
+| 取消 `cancel()` | ✔ 已有 | `timer_cancel_race`（跨线程取消 vs 到期） | `timer_cancel_after_fire` | ✔ 已有 |
+| 重复 / 循环 | ✔ 已有 | —（重投只发生在轮询线程） | ✔ 已有（回调里重投即循环） | — |
+| 异常 | ✔ 已有 | — | ✔ 已有（异常在回调里抛） | — |
+| 超大延时 / 溢出 | ✔ 已有 | — | — | — |
+| 同 deadline（同键） | `timer_same_deadline` | —（顺序本就不可依赖） | — | — |
+
+"—" 表示判定为**没有差异化代码路径、不需要单独覆盖**，不是"忘了写"；每格的理由见括注。
+
 ## 8. 风险清单
 
 | # | 风险 | 触发条件 | 应对 |
@@ -635,6 +690,7 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | 9 | 半开连接泄漏 fd | 对端断电/拔网线 | TCP KeepAlive（90s）+ 应用层检测；`ntimed_fd_recycle` 用例 |
 | 10 | TSAN 已知误报掩盖真竞争 | 网络测试用带超时的等待 | `ntimed` 分组 + 签名判定（`scripts/tsan.sh`）；根治靠 `apt install g++-12` |
 | 11 | **绝对精度门禁在虚拟化宿主上不可达** | 宿主 tick 量化唤醒延迟 **0~14ms 且与延时无关**（裸 `nanosleep` 10ms/100ms/1s 档实测 +6/+10/+13） | 门禁改为"**0 早触发** + 相对同进程裸基线增量 ≤5ms"（§7.1）；对拍取**最小值**以剔除随机噪声、保留系统性偏置；换裸机后可收紧回绝对 ±5ms（§10.7） |
+| 12 | **0 延时自投链 / 同刻大量到期会占住事件循环** | 回调里 `doDelayTask(0, …)`（被**同一个** `processDelayTask` 循环处理完，期间不派发 epoll 事件、也不检查 `_exit`）；或 100 路客户端的秒级校验同时到点 | **先观测、暂不限制**（§9 决策）：`delayBatchMax()` / `delayBatchCount()` 已能量化（实测 1000 个同刻到期 = 1 批 1000 个；20 步 0 延时自投链 = 1 批 20 个）。触发条件：线上单批远超客户端数 → 再加"每轮处理上限 + 让出循环"（§10 未决 8） |
 
 ## 9. 决策记录（为什么这么选 / 排除了什么）
 
@@ -655,6 +711,9 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | 超长延时的溢出处理 | `minDelayInLoop` 的差值**饱和**到 `INT64_MAX`，再交给 `clampTimeout` 截断 + 计数 + 告警 | 排除"直接 `static_cast<int64_t>(next - now)`"（deadline 越过 int64 上界 → 负数 → 被当成"没有定时器" → `epoll_wait` 永久等待 → 超长定时器静默永不触发，违反 §4.5）；排除"用 assert 拒绝超大延时"（业务错误不该 assert，违反 §4.4） |
 | 定时器测试的等待方式 | 只用无超时等待（`Semaphore::wait()` / `sleepMs()`），代价是坏实现会让用例挂到 ctest TIMEOUT | 排除 `wait_for` / `tryWait(ms)`（本环境 TSAN 对 `pthread_cond_clockwait` 有已知误报，会把 timer 组从严格组里踢出去） |
 | 计时门禁在 TSAN 下放宽 | 编译期判定 sanitizer，TSAN 构建容差 5ms→25ms（并在输出里打印"已放宽"） | 排除"用同一套容差"（TSAN 只插桩库代码、不插桩内核 `nanosleep`，差值里混进插桩开销 → 随机翻红，实测已红过一次）；排除"TSAN 下跳过计时断言"（静默降级，违反 §4）；排除"把计时用例从 TSAN 严格组里挪走"（同样会少掉并发覆盖） |
+| `doDelayTask` 的退出语义 | 已退出一律 `nullptr` + `rejectedTimerCount()`（**含轮询线程内**调用） | 排除"轮询线程内返回非空 handle"（永不触发且无告警 = 静默降级，§4.5）；排除"直接抛异常"（在关停路径上抛异常会把关停流程复杂化） |
+| 0 延时自投链 | **只观测**（`delayBatchMax` / `delayBatchCount` + 文档写明性质），不限制 | 排除"限制每轮处理上限"（引入"积压时延迟一轮"的新行为，需要真实场景证明值得）；排除"禁止 delay=0"（`0` 有合法语义：下个循环周期执行）；改判条件：线上单批远超客户端数 |
+| 同 deadline 的顺序 | 不写成契约（只保证不丢、不饿死） | 排除"承诺插入序"（deadline 是内部 `now+delay` 算出的，"同 deadline"从外部不可控；承诺了就要为它负责） |
 
 ## 10. 未决事项（待定，走到对应步骤再定）
 
@@ -667,3 +726,4 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | 5 | TSAN 误报根治（装 `g++-12` 或 clang） | 你有 sudo 密码时（需要你执行 `sudo apt install g++-12`） |
 | 6 | 定时器精度是否升格为 SPEC 的正式 NFR | 你决定（当前只写在 `ROADMAP.md` 的 M2 验收里；SPEC 的 `NFR-7` 是"代码质量"，与精度无关） |
 | 7 | 精度门禁是否在裸机/物理机上收紧回**绝对 ±5ms** | 有裸机环境时（本宿主 0~14ms 唤醒延迟是虚拟化造成的，不是代码问题） |
+| 8 | `processDelayTask` 是否加"每轮处理上限 + 让出事件循环" | 等 `delayBatchMax()` 在真实流量（M6 多客户端）里的数据；当前只观测 |
