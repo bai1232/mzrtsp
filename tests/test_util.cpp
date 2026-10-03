@@ -242,25 +242,33 @@ MZ_TEST(util_file_relative) {
     const std::string root = "/tmp/mzmedia_util_rel";
     (void) ::system(("rm -rf " + root).c_str());
     MZ_ASSERT_TRUE(createDirectory(root));
-    MZ_ASSERT_EQ(::chdir(root.c_str()), 0);
 
-    // 单级 / 多级相对路径
-    MZ_ASSERT_TRUE(createDirectory("logs"));
-    MZ_ASSERT_TRUE(isDir("logs"));
-    MZ_ASSERT_TRUE(createDirectory("logs/deep"));
-    MZ_ASSERT_TRUE(isDir("logs/deep"));
-    MZ_ASSERT_TRUE(createDirectory("logs/deep"));   // 幂等
+    // 本用例必须真的改工作目录，才测得到"相对路径"语义 —— 用 RAII 守卫保证退出时还原。
+    // 曾经收尾写 chdir("/")，把进程工作目录永久留在根目录：同一进程里后面所有依赖相对
+    // 路径的用例全部失效（8 个 ffmpeg 用例假红），而 ctest 每个分组是独立进程把它掩盖了。
+    {
+        const ::mztest::ScopedCwd cwd(root.c_str());
+        MZ_ASSERT_TRUE(cwd.ok);
+        if (!cwd.ok) {
+            return;   // 断言不中断执行，必须显式早退
+        }
 
-    // 关键断言：绝不能跑到根目录下创建
-    MZ_ASSERT_FALSE(isDir("/logs"));
+        // 单级 / 多级相对路径
+        MZ_ASSERT_TRUE(createDirectory("logs"));
+        MZ_ASSERT_TRUE(isDir("logs"));
+        MZ_ASSERT_TRUE(createDirectory("logs/deep"));
+        MZ_ASSERT_TRUE(isDir("logs/deep"));
+        MZ_ASSERT_TRUE(createDirectory("logs/deep"));   // 幂等
 
-    // saveFile 的相对路径也要走通
-    MZ_ASSERT_TRUE(saveFile("data/x.txt", "rel"));
-    MZ_ASSERT_TRUE(fileExists("data/x.txt"));
-    MZ_ASSERT_TRUE(isDir("data"));
+        // 关键断言：绝不能跑到根目录下创建
+        MZ_ASSERT_FALSE(isDir("/logs"));
 
-    // 还原工作目录，避免影响其它用例
-    MZ_ASSERT_EQ(::chdir("/"), 0);
+        // saveFile 的相对路径也要走通
+        MZ_ASSERT_TRUE(saveFile("data/x.txt", "rel"));
+        MZ_ASSERT_TRUE(fileExists("data/x.txt"));
+        MZ_ASSERT_TRUE(isDir("data"));
+    }   // ← 离开作用域自动还原工作目录（不需要手写 chdir）
+
     (void) ::system(("rm -rf " + root).c_str());
 }
 

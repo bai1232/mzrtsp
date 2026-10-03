@@ -159,6 +159,41 @@ inline std::string toStr(const char *value) {
 }
 
 // ---------------------------------------------------------------------------
+// 工作目录守卫（RAII）
+//   为什么必须有：::chdir() 改的是**进程级全局状态**，用例忘记还原会污染同一进程里
+//   后面所有用例。真踩过：`util_file_relative` / `logger_file_relative_path` 收尾写
+//   chdir("/") 而不是切回进入前的目录 → 8 个依赖相对路径的 ffmpeg 用例在"单进程全量跑"
+//   时假红；而 ctest 每个分组是独立进程，把这个问题掩盖了 4 个里程碑。
+//   用法：需要改目录的用例一律
+//       { ::mztest::ScopedCwd cwd("/tmp/x"); if (!cwd.ok) return; ... }
+//   离开作用域自动还原；框架还会在用例结束后做一次不变量检查（见 runAll）。
+// ---------------------------------------------------------------------------
+inline std::string currentCwd() {
+    char buf[4096];
+    if (::getcwd(buf, sizeof(buf)) == nullptr) {
+        return {};   // 取不到不算错，但不变量检查会退化为"跳过检查"
+    }
+    return std::string(buf);
+}
+
+struct ScopedCwd {
+    std::string original;
+    bool ok = false;   // 进入是否成功：失败必须能被调用方察觉，不静默继续
+
+    explicit ScopedCwd(const char *dir) {
+        original = currentCwd();
+        ok = (dir != nullptr) && (::chdir(dir) == 0);
+    }
+    ScopedCwd(const ScopedCwd &) = delete;
+    ScopedCwd &operator=(const ScopedCwd &) = delete;
+    ~ScopedCwd() {
+        if (!original.empty()) {
+            (void) ::chdir(original.c_str());
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
 // 失败上报
 // ---------------------------------------------------------------------------
 inline void reportFailure(const char *file, int line, const std::string &message) {
@@ -205,12 +240,33 @@ inline int runAll(const std::string &filter) {
 
         std::printf("%s[ RUN  ]%s %s\n", color(kYellow), color(kReset), c.name);
 
+        const std::string cwdBefore = currentCwd();
         try {
             c.fn();
         } catch (const std::exception &e) {
             reportFailure(c.file, c.line, std::string("用例抛出未捕获异常: ") + e.what());
         } catch (...) {
             reportFailure(c.file, c.line, "用例抛出未知类型异常");
+        }
+
+        // 不变量：用例不得把进程工作目录留在别处。
+        // 为什么放在框架里、而不是靠各用例自觉：工作目录是**跨用例的隐式全局状态**，
+        // 忘记还原时，报错会落在后面某个无辜的用例上（真踩过：8 个 ffmpeg 用例假红，
+        // 真正的凶手是 util/logger 的两个"相对路径"用例）。在框架里检出 → 责任者当场点名。
+        // 检出后**立刻还原**：一个污染源不该把后面几十个用例连带染红（雪崩会让定位变难）。
+        if (!cwdBefore.empty()) {
+            const std::string cwdAfter = currentCwd();
+            if (cwdAfter != cwdBefore) {
+                reportFailure(c.file, c.line,
+                              "用例结束时进程工作目录被改动了（用例之间因此不隔离）"
+                              "\n        用例开始: " + cwdBefore +
+                              "\n        用例结束: " + cwdAfter +
+                              "\n        修法: 用 ::mztest::ScopedCwd 包住 ::chdir（框架已还原并继续）");
+                if (::chdir(cwdBefore.c_str()) != 0) {
+                    std::fprintf(stderr, "%s    ! 框架还原工作目录失败，后续用例可能连带失败%s\n",
+                                 color(kRed), color(kReset));
+                }
+            }
         }
 
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(

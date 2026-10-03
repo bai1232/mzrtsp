@@ -63,17 +63,19 @@
 | 断言不中断 → 段错误 ✅ | 断言失败后继续执行，解引用空指针 → `ffmpeg (SEGFAULT)` | 自研框架的断言**不 abort**（设计如此，为了让一个用例暴露多个问题） | 断言失败后必须显式 `return` 早退 | 写进 `TESTING.md` 的用例编写规矩 | `CHANGELOG.md:170` |
 | **SPS 解析"过于自信"** ✅ | 0xff 填充被解析成"合法"的 16x16 | SPS 无校验和，随机字节可能凑出语法合法的结果；解析器想承诺语义合法性 | **契约澄清**：只承诺语法解析，`h264_util.h` 写明**调用方必须交叉校验**；用例改用"真解析不了"的数据（长串 0 / 截断 / 空指针） | 交叉校验：裸流提 SPS/PPS 解出 320x240，与 `Demuxer` 对同一份裸流的结果**逐项一致**（两套独立路径） | `DESIGN_M4.md:104`；`CHANGELOG.md:181`；用例 `ffmpeg_h264_sps_dimension_matches_demuxer` |
 
-### 2.4 🔴 本次新发现：测试之间不隔离（尚未修复，等你批）
+### 2.4 ✅ 测试之间不隔离（已修，2026-10-03）
 
 | 项 | 内容 |
 |---|---|
-| **现象** | 从仓库根跑**单进程全量** `./build/bin/mzmedia_unittest` → **171 用例中 8 个红**，全部是依赖样本相对路径的 ffmpeg 用例（`ffmpeg_demux_*` 6 个 + `ffmpeg_h264_extract_from_raw_sample` + `ffmpeg_h264_sps_dimension_matches_demuxer`） |
+| **现象** | 从仓库根跑**单进程全量** `./build/bin/mzmedia_unittest`：修前 **171 用例中 8 个红**（全是依赖样本相对路径的 ffmpeg 用例：`ffmpeg_demux_*` 6 个 + `ffmpeg_h264_extract_from_raw_sample` + `ffmpeg_h264_sps_dimension_matches_demuxer`）；修后这 8 个**全部转绿** |
 | **误导性** | 失败信息是"找不到样本 sample.h264（试过 3 个路径，请先跑 scripts/make_samples.sh）" → **把人指向错的因**：样本文件其实一直都在（`ls -l samples/` 四个文件俱在，重建前后大小完全相同） |
-| **根因** | `tests/test_util.cpp:263` 与 `tests/test_logger.cpp:408` 收尾用 `::chdir("/")`，**而不是切回进入前的目录** → 进程工作目录被永久改成 `/`，之后所有相对路径（`samples/`、`../samples/`、`../../samples/`）都以 `/` 为基准 |
+| **根因** | `util_file_relative` 与 `logger_file_relative_path` 收尾用 `::chdir("/")`，**而不是切回进入前的目录** → 进程工作目录被永久改成 `/`，之后所有相对路径（`samples/`、`../samples/`、`../../samples/`）都以 `/` 为基准。真凶 2 个用例，锅扣在 8 个无辜用例头上 |
 | **为什么一直没被发现** | `ctest` 的**每个分组是独立进程**，`util` / `logger` 与 `ffmpeg` 永不同进程 → 全绿；只有"单进程跑全部用例"这条路径才暴露 |
-| **为什么这次才抓到** | 此前引用全量结果时**只看了汇总行的"用例数"，没看"失败数"**（我的错，见 §5） |
-| **建议修法（未实施）** | 进入前 `getcwd()` 存下原目录，收尾 `chdir(原目录)` 还原；更彻底的做法是加一个 RAII 的 `ScopedCwd` 小工具，让"改工作目录"这件事无法忘记还原 |
-| **为什么没有顺手改** | 按 `AI_COLLAB.md` §3.5"不许改无关代码：要改别处，先说理由，等我同意"——本批交付物是文档，改测试另开一批 |
+| **为什么这次才抓到** | 此前引用全量结果时**只看了汇总行的"用例数"，没看"失败数"**（我的错，见 §5.3） |
+| **修法（已实施）** | ① `tests/test_main.h` 新增 `::mztest::ScopedCwd`（RAII 还原工作目录）；② **框架级不变量**：用例结束时工作目录被改动 ⇒ 当场点名该用例 + 立刻还原（不再让下一个用例背锅）；③ 两个真凶改用 `ScopedCwd`；④ 样本查找改为与工作目录无关（向上最多 8 层） |
+| **防回归** | `selftest_scoped_cwd_restores`（锁守卫本身）+ `ffmpeg_samples_found_from_nested_cwd`（**变异验证**：把搜索层数改成 2 即红，报错正是原始症状） |
+| **教训（可复用）** | ① 跨用例的隐式全局状态（cwd / 环境变量 / fd / 信号）一出事，**报错会落在无辜者身上**，所以这类不变量该由**框架**检，不该指望用例自觉；② `ctest` 每个分组独立进程＝**天然隔离**，也意味着它**看不见**用例之间的串味 |
+| **遗留（另案）** | 同一个全量跑里还剩 `timer_precision` 红：那是**计时门禁**在单进程上下文下的抖动（单独跑 6/6 绿，差 1ms）→ 规矩记入 `docs/TESTING.md` §2.2 |
 
 ---
 
@@ -188,7 +190,7 @@
 - `Session::shutdownAfterFlush()`（推迟到 M6，需同步 `DESIGN_M2.md` §3.6）
 - POST / body 不支持（一律 405）
 - 测试页播放器离线可用性（`DESIGN_M3.md` §9 未决 3）
-- 🔴 本批新发现：**测试之间不隔离**（§2.4）未修
+- `timer_precision` 的计时门禁在**单进程全量上下文**下会红（另案，§2.4 遗留；规矩见 `docs/TESTING.md` §2.2）
 - 文档债：`ARCHITECTURE.md` §1 分层图 / `src/mzmedia.h` 注释与 `DESIGN_M2.md` §2 矛盾（§10 未决 4）；SPEC 的 FR/NFR 条目在 ROADMAP/TESTING 里的引用不全
 - `TESTING.md` §8.6 的基线表（61 用例）尚未更新到 g++-12 之后的口径
 
@@ -203,9 +205,10 @@
 
 | 风险 | 触发条件 | 现状 |
 |---|---|---|
-| 单进程全量测试的**假绿/假红** | 用例间共享进程状态（cwd、fd、信号） | 已知 1 处（§2.4），未修 |
-| `ctest` 覆盖不到跨分组的相互影响 | 分组隔离太干净 | 每个分组独立进程 → 掩盖了 §2.4 |
+| 单进程全量测试的**假绿/假红** | 用例间共享进程状态（cwd、fd、环境变量、信号） | cwd 这一处已修、且框架会点名（§2.4）；其余共享状态尚无检出机制 |
+| `ctest` 覆盖不到用例之间的相互影响 | 分组隔离太干净 | 每个分组独立进程 → 曾把 §2.4 掩盖 4 个里程碑；现在保留"单进程全量跑"作**诊断手段**，不当作门禁 |
 | 长跑与并发下的资源回收 | 1 小时长跑 / 10 路并发 | 尚未做（`TESTING.md` §5/§6 有方案，未执行） |
+| 计时类用例在单进程上下文里失真 | 单进程跑全部用例 | 已知 `timer_precision`（§2.4 遗留）；规矩见 `TESTING.md` §2.2 |
 | FFmpeg 5.x API 漂移 | 换机器 | SPEC 锁 4.x；差异写在代码注释 |
 
 ---
@@ -220,14 +223,16 @@
 
 ```bash
 # 用例总数（注册数）
-grep -rho "MZ_TEST([A-Za-z0-9_]*)" tests/*.cpp | wc -l        # → 171
+grep -rho "MZ_TEST([A-Za-z0-9_]*)" tests/*.cpp | wc -l        # → 173
 
-# 单进程全量（注意：整行读汇总，当前有 8 个红，见 §2.4）
+# 单进程全量跑：查"用例之间是否串味"（**不是**计时门禁，见 docs/TESTING.md §2.2）
+#   修前：8 个 ffmpeg 用例假红；修后：8 个假红全部消失（仅剩 timer_precision，另案）
 ./build/bin/mzmedia_unittest
 
-# 分组跑（ctest 每分组独立进程）
-cd build && ctest --output-on-failure
+# 验收门禁：每个分组独立进程（= 天然隔离）
+cd build && ctest --output-on-failure                       # → 16/16
+cmake --build build-asan -j4 && cd build-asan && ctest      # → 16/16（ASAN）
 
 # 并发检查（自动优先 g++-12）
-./scripts/tsan.sh
+./scripts/tsan.sh                                           # → 全绿，0 报告（220 用例）
 ```

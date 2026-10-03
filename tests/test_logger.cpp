@@ -389,23 +389,33 @@ MZ_TEST(logger_file_relative_path) {
     const std::string root = "/tmp/mzmedia_logger_rel";
     (void) ::system(("rm -rf " + root).c_str());
     MZ_ASSERT_TRUE(createDirectory(root));
-    MZ_ASSERT_EQ(::chdir(root.c_str()), 0);
 
-    Logger &logger = Logger::Instance();
-    auto writer = std::make_shared<FileWriter>("logs/rel.log", 0, 0);
-    logger.add(writer);
-    logger.setLevel(LogLevel::Info);
+    // logger.h 的用法注释推荐的就是相对路径（FileWriter("logs/mzmedia.log")），所以本用例
+    // 必须真的改工作目录才测得到 —— 用 RAII 守卫保证退出时还原。
+    // 曾经收尾写 chdir("/")，污染同一进程里后面所有依赖相对路径的用例
+    // （见 `docs/RETROSPECTIVE.md` §2.4）。
+    {
+        const ::mztest::ScopedCwd cwd(root.c_str());
+        MZ_ASSERT_TRUE(cwd.ok);
+        if (!cwd.ok) {
+            return;   // 断言不中断执行，必须显式早退
+        }
 
-    InfoL << "relative-path-line";
-    logger.flush();
+        Logger &logger = Logger::Instance();
+        auto writer = std::make_shared<FileWriter>("logs/rel.log", 0, 0);
+        logger.add(writer);
+        logger.setLevel(LogLevel::Info);
 
-    MZ_ASSERT_TRUE(isDir("logs"));
-    MZ_ASSERT_TRUE(fileExists("logs/rel.log"));
-    std::string error;
-    const std::string content = loadFile("logs/rel.log", &error);
-    MZ_ASSERT_TRUE(content.find("relative-path-line") != std::string::npos);
+        InfoL << "relative-path-line";
+        logger.flush();
 
-    MZ_ASSERT_EQ(::chdir("/"), 0);
+        MZ_ASSERT_TRUE(isDir("logs"));
+        MZ_ASSERT_TRUE(fileExists("logs/rel.log"));
+        std::string error;
+        const std::string content = loadFile("logs/rel.log", &error);
+        MZ_ASSERT_TRUE(content.find("relative-path-line") != std::string::npos);
+    }   // ← 离开作用域自动还原工作目录
+
     (void) ::system(("rm -rf " + root).c_str());
 }
 

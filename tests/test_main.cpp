@@ -67,6 +67,30 @@ MZ_TEST(selftest_near_tolerance) {
     MZ_ASSERT_NEAR(1.0, 1.5, 0.5);
 }
 
+MZ_TEST(selftest_scoped_cwd_restores) {
+    // 锁定"工作目录守卫"本身：进入前记录、离开作用域必须回到原处。
+    // 为什么值得单测：这个守卫是"用例之间不隔离"的堵漏机制，它自己坏了必须立刻红。
+    const std::string before = ::mztest::currentCwd();
+    MZ_ASSERT_FALSE(before.empty());
+
+    const std::string target = "/tmp/mzmedia_scoped_cwd";
+    (void) ::system(("rm -rf " + target).c_str());
+    MZ_ASSERT_TRUE(mzmedia::createDirectory(target));
+
+    {
+        const ::mztest::ScopedCwd cwd(target.c_str());
+        MZ_ASSERT_TRUE(cwd.ok);
+        if (!cwd.ok) {
+            return;   // 断言不中断执行，必须显式早退
+        }
+        // 作用域内确实换了目录，否则这个守卫什么都没测到（假绿）
+        MZ_ASSERT_STR_EQ(::mztest::currentCwd(), target);
+    }
+
+    MZ_ASSERT_STR_EQ(::mztest::currentCwd(), before);
+    (void) ::system(("rm -rf " + target).c_str());
+}
+
 int main(int argc, char **argv) {
     // 诊断开关：MZ_TEST_LOG=1 时把库日志（InfoP/WarnP/ErrorP）打到控制台。
     // 为什么需要：Logger 默认**没有任何 writer**，调试失败用例时"库明明报了错却看不见"，

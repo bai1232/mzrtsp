@@ -31,15 +31,20 @@ using namespace mzmedia;
 
 namespace {
 
-/// 找样本：优先 $MZ_SAMPLES_DIR，其次 samples/（仓库根运行）、../samples/（build 目录运行）
+/// 找样本：**与当前工作目录无关**（顺序：$MZ_SAMPLES_DIR → 从当前目录向上最多 8 层）。
+/// 为什么向上搜索：用例的 cwd 可能是仓库根 / build / build/tests（ctest，深 2 级），
+/// 也可能被别的用例临时改到仓库内任意位置 —— 硬编码固定的相对层级是不稳的
+/// （真踩过，见 `docs/RETROSPECTIVE.md` §2.4）。层数故意给得宽松，不测边界值。
 std::string samplePath(const std::string &name) {
     std::vector<std::string> candidates;
     if (const char *env = ::getenv("MZ_SAMPLES_DIR"); env != nullptr) {
         candidates.push_back(std::string(env) + "/" + name);
     }
-    candidates.push_back("samples/" + name);
-    candidates.push_back("../samples/" + name);      // ctest 的 cwd 是 build/
-    candidates.push_back("../../samples/" + name);     // ctest 的 cwd 是 build/tests/
+    std::string prefix;
+    for (int depth = 0; depth < 8; ++depth) {
+        candidates.push_back(prefix + "samples/" + name);
+        prefix += "../";
+    }
     for (const auto &c : candidates) {
         if (FILE *f = ::fopen(c.c_str(), "rb"); f != nullptr) {
             ::fclose(f);
@@ -423,4 +428,28 @@ MZ_TEST(ffmpeg_h264_sps_unparsable_fails) {
     const uint8_t ok[] = {0x67, 0x42, 0x00, 0x1e, 0xab, 0x40, 0xb0, 0x4b};
     MZ_ASSERT_FALSE(parseSpsDimension(ok, sizeof(ok), nullptr, &h));
     MZ_ASSERT_FALSE(parseSpsDimension(ok, sizeof(ok), &w, nullptr));
+}
+
+MZ_TEST(ffmpeg_samples_found_from_nested_cwd) {
+    // 回归（`docs/RETROSPECTIVE.md` §2.4）：样本查找必须容忍"工作目录在仓库内更深的位置"。
+    // 修前只硬编码了 2 级相对路径（`samples/` / `../samples/` / `../../samples/`）；
+    // 本用例进到"样本目录下的第 2 层"，需要向上 3 级 —— 修前必红。
+    const std::string found = samplePath("sample.mp4");
+    MZ_ASSERT_FALSE(found.empty());
+    if (found.empty()) {
+        return;   // 断言不中断执行，必须显式早退
+    }
+    // 以"实际找到的路径"为基准，保证与从哪个目录启动无关（仓库根 / build / build/tests）
+    const std::string samplesDir = found.substr(0, found.size() - std::string("sample.mp4").size());
+    const std::string probe = samplesDir + "mz_cwd_probe/deep";
+    MZ_ASSERT_TRUE(createDirectory(probe));
+    {
+        const ::mztest::ScopedCwd cwd(probe.c_str());
+        MZ_ASSERT_TRUE(cwd.ok);
+        if (!cwd.ok) {
+            return;
+        }
+        MZ_ASSERT_FALSE(samplePath("sample.mp4").empty());
+    }
+    (void) ::system(("rm -rf " + probe).c_str());
 }
