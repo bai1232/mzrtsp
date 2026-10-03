@@ -1,16 +1,19 @@
 /*
- * FrameQueue 实现（M5-a 建立，M5-b 加锁成 SPSC）
+ * FrameQueue 实现（M5-a 建立，M5-b 加锁成 SPSC，本批改为只按字节限流）
  * ============================================================================
  * 核心是 push 的四态语义（见头文件）：
  *   Accepted / DroppedToMakeRoom / DroppedIncoming / RejectedNoSpace
- * 前三个都不需要调用方做额外动作；只有第四个（**不可丢**的包进不去）必须让调用方
- * 断开该订阅者 —— 否则它会一直收不到关键帧/音频，表现为"永久花屏 + 静音"，
- * 而且没有任何错误发生（最难查的那类问题）。
+ * 前三个都不需要调用方做额外动作；只有第四个（**视频关键帧**进不去）必须让调用方断开订阅者
+ * —— 否则后面全花屏，而且没有任何错误发生（最难查的那类问题）。
+ *
+ * 丢弃单位（FR-5.2 修订版）：从**队头**开始连续丢可丢包，直到放得下。
+ *   因为丢的是"最旧的一段"，一段里的音频与视频自然一起走 → A/V 不会错位。
+ *   注意不要写成"只丢视频非关键帧"：那会让视频跳一段而音频继续，音画越走越偏。
  *
  * 加锁要点：
  *   - 一把锁覆盖全部状态（队列 + 字节数 + 计数 + EOS），不拆细粒度：两个线程、O(1) 操作，
  *     拆开只会增加出错面；
- *   - **锁内不做任何回调**（本类没有回调）→ 不存在"持锁调外部代码"的死锁面；
+ *   - **锁内不做任何外部调用**（本类没有回调）→ 不存在"持锁调外部代码"的死锁面；
  *   - 取值接口返回**快照**而不是引用：返回 `const Stats&` 会在调用方读的时候被另一个线程改，
  *     那是数据竞争（也是"看着对、TSAN 才报"的典型）。
  * ============================================================================
@@ -27,14 +30,13 @@ namespace mzmedia {
 FrameQueue::FrameQueue() = default;
 
 bool FrameQueue::setLimits(const Limits &limits) {
-    if (limits.max_packets == 0 || limits.max_bytes == 0) {
-        WarnL << "FrameQueue::setLimits 被拒：上限不能为 0（0 不等于无界，有界性不可协商）"
-              << " max_packets=" << limits.max_packets << " max_bytes=" << limits.max_bytes;
+    if (limits.max_bytes == 0) {
+        WarnL << "FrameQueue::setLimits 被拒：上限不能为 0（0 不等于无界，有界性不可协商）";
         return false;
     }
-    if (limits.max_packets > kHardMaxPackets || limits.max_bytes > kHardMaxBytes) {
-        WarnL << "FrameQueue::setLimits 被拒：超过硬上限（max_packets<=" << kHardMaxPackets
-              << ", max_bytes<=" << kHardMaxBytes << "）";
+    if (limits.max_bytes > kHardMaxBytes) {
+        WarnL << "FrameQueue::setLimits 被拒：超过硬上限 " << kHardMaxBytes << "（传入 "
+              << limits.max_bytes << "）";
         return false;
     }
     std::lock_guard<std::mutex> lock(_mutex);
@@ -48,7 +50,7 @@ FrameQueue::Limits FrameQueue::limits() const {
 }
 
 bool FrameQueue::fits(size_t size) const {
-    return _queue.size() + 1 <= _limits.max_packets && _bytes + size <= _limits.max_bytes;
+    return _bytes + size <= _limits.max_bytes;
 }
 
 bool FrameQueue::dropOldestDroppable() {
@@ -56,7 +58,7 @@ bool FrameQueue::dropOldestDroppable() {
         if (*it && (*it)->droppable()) {
             _bytes -= (*it)->size();
             _queue.erase(it);
-            ++_stats.dropped_non_key;
+            ++_stats.dropped;
             return true;
         }
     }
@@ -93,6 +95,7 @@ FrameQueue::PushResult FrameQueue::push(MediaPacket::Ptr packet) {
         } else {
             bool dropped_old = false;
             bool made_room = true;
+            // 从队头连续丢可丢包（最旧的一段，音视频一起走）直到放得下
             while (!fits(size)) {
                 if (!dropOldestDroppable()) {
                     made_room = false;
@@ -101,7 +104,7 @@ FrameQueue::PushResult FrameQueue::push(MediaPacket::Ptr packet) {
                 dropped_old = true;
             }
             if (!made_room) {
-                // 腾不出空间：新包可丢 → 丢新包（正常降级）；新包不可丢 → 交给调用方
+                // 队里已经只有不可丢的包（视频关键帧）：新包可丢就丢新包，否则交给调用方
                 if (packet->droppable()) {
                     ++_stats.dropped_incoming;
                     result = PushResult::DroppedIncoming;
@@ -160,14 +163,14 @@ size_t FrameQueue::clear() {
     return count;
 }
 
-size_t FrameQueue::packets() const {
-    std::lock_guard<std::mutex> lock(_mutex);
-    return _queue.size();
-}
-
 size_t FrameQueue::bytes() const {
     std::lock_guard<std::mutex> lock(_mutex);
     return _bytes;
+}
+
+size_t FrameQueue::packets() const {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _queue.size();
 }
 
 bool FrameQueue::empty() const {

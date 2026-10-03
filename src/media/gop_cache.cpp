@@ -1,5 +1,5 @@
 /*
- * GopCache 实现（M5-a）
+ * GopCache 实现（M5-a 建立；本批上限改为推导值、可丢集合与 FrameQueue 统一）
  * ============================================================================
  * 策略要点（详见 gop_cache.h 文件头）：
  *   - 视频关键帧 = 唯一的 GOP 起点，到了就丢掉整个旧 GOP；
@@ -14,8 +14,13 @@
 
 namespace mzmedia {
 
+// 初值 = 码率上限 8 Mbps × 最大 GOP 时长 2 s = 2,000,000 B（推导见 MediaSource::Limits）
+namespace {
+constexpr size_t kDefaultMaxBytes = 2000000;
+} // namespace
+
 GopCache::GopCache(size_t max_bytes)
-    : _max_bytes(8u * 1024u * 1024u) {
+    : _max_bytes(kDefaultMaxBytes) {
     // 先站稳默认值（有界），再校验入参；非法则保持默认并记日志（绝不退化成无界）
     (void) setMaxBytes(max_bytes);
 }
@@ -34,7 +39,8 @@ bool GopCache::setMaxBytes(size_t bytes) {
 }
 
 bool GopCache::droppableInCache(const MediaPacket::Ptr &packet) {
-    // 缓存里只有"视频关键帧"不可丢：音频可丢（新订阅者晚几毫秒听到音频无妨）
+    // 与 FrameQueue 同一规则：**唯一不可丢的是视频关键帧**，音频在两边都可丢。
+    // （早期版本刻意让两边不同，本批统一 —— 同一个概念不搞两套规则。）
     return packet && !(packet->kind() == MediaKind::Video && packet->isKeyFrame());
 }
 

@@ -1,12 +1,12 @@
 /*
- * MediaSource / Subscriber 实现（M5-a 建立，M5-b 接通线程）
+ * MediaSource / Subscriber 实现（M5-a 建立，M5-b 接通线程；本批上限改为推导值 + 最小版统计）
  * ============================================================================
- * 分发循环本身很短，值得看的是四个"必须明确"的地方：
+ * 分发循环本身很短，值得看的是几个"必须明确"的地方：
  *   1) 订阅者用 weak_ptr 记录 → 消费者一释放就惰性注销（NFR-6，不需要通知机制）；
  *   2) 接入时灌 GOP 缓存，且**关键帧灌不进去就拒绝接入**（宁可拒接也不让对端花屏）；
- *   3) push 的失败路径只标记 broken()，**不在这里断连接** —— 断连接是连接层的事，
- *      媒体层只负责明确告知；
- *   4) 【M5-b】入队成功后只发一个**合并过的唤醒**（async），数据本身留在队列里。
+ *   3) push 的失败路径只标记 broken()，**不在这里断连接** —— 断连接是连接层的事；
+ *   4) 入队成功后只发一个**合并过的唤醒**（async），数据本身留在队列里；
+ *   5) 上限**由码率 × 时长推导**（`Limits::queueMaxBytes()/gopMaxBytes()`），不在这里拍字节数。
  * ============================================================================
  */
 
@@ -103,21 +103,30 @@ MediaSource::MediaSource()
     : MediaSource(Limits{}) {}
 
 MediaSource::MediaSource(const Limits &limits)
-    : _gop(limits.max_gop_bytes) {
+    : _gop(limits.gopMaxBytes()) {
     // 先站稳默认值（有界），再由 setLimits 校验入参；非法项保持默认并记日志
     _limits = Limits{};
     (void) setLimits(limits);
 }
 
 bool MediaSource::setLimits(const Limits &limits) {
-    // 复用各组件自己的校验（FrameQueue / GopCache），避免"同一套规则写两遍"然后漂移
-    FrameQueue queue_probe;
-    if (!queue_probe.setLimits(limits.queue)) {
+    // 校验的是"物理量"（码率 / 时长 / 人数），字节数是推导出来的结果
+    if (limits.max_bitrate_bps == 0) {
+        WarnL << "MediaSource::setLimits 被拒：max_bitrate_bps 不能为 0";
         return false;
     }
-    GopCache gop_probe(limits.max_gop_bytes);
-    if (gop_probe.maxBytes() != limits.max_gop_bytes) {
-        WarnL << "MediaSource::setLimits 被拒：max_gop_bytes 非法（" << limits.max_gop_bytes << "）";
+    if (limits.max_bitrate_bps > kHardMaxBitrateBps) {
+        WarnL << "MediaSource::setLimits 被拒：max_bitrate_bps 超过硬上限 " << kHardMaxBitrateBps;
+        return false;
+    }
+    if (limits.latency_budget_ms == 0 || limits.latency_budget_ms > kHardMaxLatencyMs) {
+        WarnL << "MediaSource::setLimits 被拒：latency_budget_ms 非法（" << limits.latency_budget_ms
+              << "，允许 1~" << kHardMaxLatencyMs << "）";
+        return false;
+    }
+    if (limits.max_gop_ms == 0 || limits.max_gop_ms > kHardMaxGopMs) {
+        WarnL << "MediaSource::setLimits 被拒：max_gop_ms 非法（" << limits.max_gop_ms << "，允许 1~"
+              << kHardMaxGopMs << "）";
         return false;
     }
     if (limits.max_subscribers == 0) {
@@ -128,9 +137,20 @@ bool MediaSource::setLimits(const Limits &limits) {
         WarnL << "MediaSource::setLimits 被拒：max_subscribers 超过硬上限 " << kHardMaxSubscribers;
         return false;
     }
+    // 推导出的字节数也要过各自组件的硬上限（复用它们的校验，避免两套规则漂移）
+    FrameQueue queue_probe;
+    if (!queue_probe.setLimits(FrameQueue::Limits{limits.queueMaxBytes()})) {
+        return false;
+    }
+    GopCache gop_probe(limits.gopMaxBytes());
+    if (gop_probe.maxBytes() != limits.gopMaxBytes()) {
+        WarnL << "MediaSource::setLimits 被拒：推导出的 max_gop_bytes 非法（" << limits.gopMaxBytes()
+              << "）";
+        return false;
+    }
 
     _limits = limits;
-    (void) _gop.setMaxBytes(limits.max_gop_bytes);
+    (void) _gop.setMaxBytes(limits.gopMaxBytes());
     return true;
 }
 
@@ -156,7 +176,8 @@ Subscriber::Ptr MediaSource::subscribe() {
         return nullptr;
     }
 
-    Subscriber::Ptr sub(new Subscriber(_next_id++, _limits.queue));
+    const FrameQueue::Limits queue_limits{_limits.queueMaxBytes()};
+    Subscriber::Ptr sub(new Subscriber(_next_id++, queue_limits));
 
     // 灌 GOP 缓存：保证消费者拿到的第一条是视频关键帧（否则首帧解不出 = 静默错误）
     const std::vector<MediaPacket::Ptr> seed = _gop.snapshot();
@@ -166,7 +187,7 @@ Subscriber::Ptr MediaSource::subscribe() {
             ++_total_seed_failed;
             ++_total_rejected;
             WarnL << "MediaSource::subscribe 失败：关键帧 " << seed.front()->size()
-                  << " 字节灌不进队列（上限 " << _limits.queue.max_bytes << "）→ 宁可不接";
+                  << " 字节灌不进队列（上限 " << queue_limits.max_bytes << "）→ 宁可不接";
             return nullptr;
         }
         for (size_t i = 1; i < seed.size(); ++i) {
@@ -271,6 +292,26 @@ MediaSource::PushStats MediaSource::pushPacket(MediaPacket::Ptr packet) {
         }
     }
     return stats;
+}
+
+std::string MediaSource::dumpStats() const {
+    // 最小版（FR-6.1）：一行、可 grep、可从任意线程调用。
+    // 完整 StatsCenter 与 /api/stats 接线见 M5-d（DESIGN_M5.md §8 未决 6）。
+    return "media_source{limits: bitrate=" + std::to_string(_limits.max_bitrate_bps) +
+           "bps latency=" + std::to_string(_limits.latency_budget_ms) +
+           "ms gop=" + std::to_string(_limits.max_gop_ms) +
+           "ms queue_bytes=" + std::to_string(_limits.queueMaxBytes()) +
+           " gop_bytes=" + std::to_string(_limits.gopMaxBytes()) +
+           " max_subs=" + std::to_string(_limits.max_subscribers) +
+           " out_budget=" + std::to_string(_limits.outputBitrateBudgetBps()) +
+           "bps | counters: delivered=" + std::to_string(_total_delivered.load()) +
+           " dropped=" + std::to_string(_total_dropped_to_make_room.load()) +
+           " dropped_incoming=" + std::to_string(_total_dropped_incoming.load()) +
+           " rejected=" + std::to_string(_total_rejected.load()) +
+           " subscribe=" + std::to_string(_total_subscribe.load()) +
+           " seed_failed=" + std::to_string(_total_seed_failed.load()) +
+           " auto_unsub=" + std::to_string(_total_auto_unsubscribe.load()) +
+           " broken=" + std::to_string(_total_broken.load()) + "}";
 }
 
 } // namespace mzmedia

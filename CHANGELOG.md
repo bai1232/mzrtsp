@@ -243,6 +243,26 @@
 - 批计划调整（已同步 `ROADMAP` / `DESIGN_M5` §1）：M5-c = `SourceManager` 懒启动/空闲释放 + 接 `Demuxer`；
   M5-d = 节流 FR-3.5 + 30s 写阻塞串通 + `/api/stats` 计数（FR-6.1）
 
+#### M5-b′ 规格变更落地（FR-5.1 / FR-5.2 修订 + 上限推导 + 统计最小版）
+- **FR-5.1 修订**：队列上限**只按字节**（删掉"64 帧"），值 = **码率上限 × 延迟额度**
+  （初值 8 Mbps × 2 s = 2,000,000 B）。帧数与字节数是同一件事的两种量纲，而真正的参数是时间：
+  4K 下 64 帧不到 1 秒（帧数上限先到、延迟失真），低码率下 64 帧可能几十秒（内存白占）
+- **FR-5.2 修订**：改为**音视频成对丢**（丢"队头最旧的一段"，音频与视频一起走），
+  **唯一不可丢的是视频关键帧**。原"音频一律不可丢"会导致拥塞时视频跳着走、音频连续放 → 音画错位
+- `GopCache` 上限同样改为**推导值** = 码率上限 × 最大 GOP 时长（初值 2MB），不再拍 8MB；
+  与 `FrameQueue` 的"可丢集合"**统一**（两处唯一不可丢的都是视频关键帧）
+- `MediaSource::Limits` 只收**物理量**：`max_bitrate_bps` / `latency_budget_ms` / `max_gop_ms` /
+  `max_subscribers`，推导入口只有 `queueMaxBytes()` / `gopMaxBytes()` 两处
+- **每源上限用"人数"不用"带宽"**：带宽是事后统计量、接连接时不可预判，当准入等于没有上限；
+  `outputBitrateBudgetBps()` 只进观测
+- **统计最小版（FR-6.1）**：计数器全部 `std::atomic`，新增 `dumpStats()` 一行文本，**任意线程可调**
+- `Subscriber` 头文件里给"**独立时间戳基准**"留了占位注释（签名 + M6 落点），不写死代码
+- 测试：`test_media.cpp` 增至 **14 用例**（新增 `media_source_dump_stats_minimal`；策略断言按修订版更新），
+  `ntimed_media` 6 个不变 → **全库 193 用例**
+- 已同步文档：`docs/SPEC.md`（FR-5.1/5.2）、`docs/ROADMAP.md`、`docs/TESTING.md`、`docs/DESIGN_M5.md`
+  （§1 批计划、§3 契约、§4.2/§4.5、§5 用例、§7 决策、§8 未决 2/3/4/6 关闭）
+- 遗留：**包数防呆硬顶未加**（只按字节后，极小包洪泛会放大记账外内存开销；见 `DESIGN_M5.md` §6 风险 11 / §8 未决 7）
+
 ### 说明
 - `v0.1.0` 尚未发布。按 `VERSIONING.md`，tag 只能打在**可独立构建且测试通过**的提交上。
 - M1（Core 层）已完成并推送；后续进入 M2（网络层：EventPoller / TcpServer / Session）。

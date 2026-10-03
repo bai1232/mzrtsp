@@ -48,8 +48,7 @@ MZ_TEST(ntimed_media_queue_spsc_no_loss) {
     // 加锁是否真的到位，只有并发跑才看得出来（TSAN 同时会检查数据竞争）
     FrameQueue queue;
     FrameQueue::Limits limits;
-    limits.max_packets = 200000;
-    limits.max_bytes = 64u * 1024u * 1024u;
+    limits.max_bytes = 64u * 1024u * 1024u; // 20,000 × 16 B = 320 KB，远小于上限
     MZ_ASSERT_TRUE(queue.setLimits(limits));
 
     const int kCount = 20000;
@@ -82,7 +81,7 @@ MZ_TEST(ntimed_media_queue_spsc_no_loss) {
     const auto stats = queue.stats();
     MZ_ASSERT_EQ(stats.pushed, static_cast<uint64_t>(kCount));
     MZ_ASSERT_EQ(stats.popped, static_cast<uint64_t>(kCount));
-    MZ_ASSERT_EQ(stats.dropped_non_key, 0u);
+    MZ_ASSERT_EQ(stats.dropped, 0u);
     MZ_ASSERT_EQ(queue.packets(), 0u);
 }
 
@@ -92,10 +91,11 @@ MZ_TEST(ntimed_media_queue_spsc_no_loss) {
 
 MZ_TEST(ntimed_media_notify_coalesced_and_drained_on_poller_thread) {
     auto poller = EventPoller::create("test-media-notify");
-    // 队列上限给足：本例要测的是"唤醒合并不丢数据"，不是丢帧策略（丢帧另有专门用例）
+    // 上限给足：本例要测的是"唤醒合并不丢数据"，不是丢帧策略（丢帧另有专门用例）
+    // 4 Mbps × 2 s = 1,000,000 B ≫ 100 帧 × 8 B
     MediaSource::Limits limits;
-    limits.queue.max_packets = 256;
-    limits.queue.max_bytes = 4u * 1024u * 1024u;
+    limits.max_bitrate_bps = 4000000;
+    limits.latency_budget_ms = 2000;
     auto source = std::make_shared<MediaSource>(limits);
     auto sub = source->subscribe();
     MZ_ASSERT_NOT_NULL(sub.get());

@@ -1,16 +1,23 @@
 /*
- * MediaSource / Subscriber：一源多消费者（M5-a 建立，M5-b 接通线程）
+ * MediaSource / Subscriber：一源多消费者（M5-a 建立，M5-b 接通线程，本批上限改为推导值）
  * ============================================================================
  * 形状来源：docs/DESIGN_M5.md §3.4；上位依据 ARCHITECTURE.md §3（线程模型）、§4（一源多消费者）、
- *           §5（背压）；需求：FR-5.1 / FR-5.2 / FR-5.3 / NFR-6
+ *           §5（背压）；需求：FR-5.1（**修订版**：队列上限 = 码率上限 × 延迟额度，只按字节）
+ *                FR-5.2（溢出丢最旧的一段，音视频成对）、FR-5.3、NFR-6、FR-6.1
  *
- * 【M5-b 的线程模型】——照 ARCHITECTURE.md §3 规则 2 的原文：
+ * 【上限怎么来的】不在这里拍字节数，而是从两个物理量推：
+ *     queueMaxBytes() = max_bitrate_bps × latency_budget_ms / 8000   （能容忍多少秒延迟）
+ *     gopMaxBytes()   = max_bitrate_bps × max_gop_ms        / 8000   （一个 GOP 有多大）
+ *   原因：字节数是**结果**，不是**参数**。写死字节数会在 4K（装不下 1 秒）与低码率
+ *   （浪费几十秒内存）两头都失准。
+ *
+ * 【线程模型】——照 ARCHITECTURE.md §3 规则 2 的原文：
  *   「源线程产出数据后，通过 `EventPoller::async()` 唤醒目标客户端所在线程投递」
  *   落到实现是**两件事分开**：
- *     · 数据通道 = 该订阅者的 `FrameQueue`（源线程 push；M5-a 的类在 M5-b 加了锁 → SPSC）；
+ *     · 数据通道 = 该订阅者的 `FrameQueue`（源线程 push；SPSC，内部一把锁）；
  *     · 唤醒通道 = `EventPoller::async()`，且**合并**：每订阅者最多一个未决唤醒。
- *   为什么不让"帧本体走 async"：真正的缓冲会变成 poller 的任务队列（上限 65536 条 ≈ 65536 帧），
- *   FR-5.1 的"64 帧/8MB"就管不住内存了，丢帧计数也会长期为 0。详见 DESIGN_M5.md §4.4。
+ *   为什么不让"帧本体走 async"：真正的缓冲会变成 poller 的任务队列（上限 65536 条），
+ *   队列上限就管不住内存了，丢帧计数也会长期为 0。详见 DESIGN_M5.md §4.4。
  *
  * 【零拷贝】一帧只 `create` 一次，`pushPacket` 把**同一个 MediaPacket** 放进 N 个订阅者的队列
  *   —— 只增加引用计数，不复制字节（用例直接断言"三个订阅者拿到的指针相同"）。
@@ -18,6 +25,9 @@
  * 【订阅者生命周期】源只持有 `weak_ptr`（ARCHITECTURE.md §4「引用计数即生命周期」）。
  *   消费者把 `shared_ptr` 一放，源在下次 push/subscriberCount 时**惰性注销**并计数 ——
  *   源不需要被通知，也不会因为消费者异常退出而残留队列（NFR-6）。
+ *
+ * 【观测】计数器全部是 `std::atomic`，`dumpStats()` 可以**从任意线程**（例如 HTTP 线程）
+ *   安全调用 —— FR-6.1 的最小版实现（完整 StatsCenter 与 `/api/stats` 接线见 M5-d）。
  * ============================================================================
  */
 
@@ -34,6 +44,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace mzmedia {
@@ -61,7 +72,7 @@ public:
 
     /**
      * 是否已经"没法正确播放"了
-     * @note 当**不可丢**的包（关键帧/音频）腾不出空间、或接入时灌不进关键帧，置位。
+     * @note 当**不可丢**的包（视频关键帧）腾不出空间、或接入时灌不进关键帧，置位。
      *       这是粘性标志：调用方看到它就该断开这个订阅者并 unsubscribe ——
      *       FR-5.2 的"断开"由连接层做，媒体层只负责**明确告知**，不静默继续送
      */
@@ -77,8 +88,7 @@ public:
      * 绑定消费者所在的 poller
      * @param poller 传 nullptr = 解绑（同步模式：消费者自己取队列，不产生任何跨线程唤醒）
      * @return true = 绑定成功；false = 入参为空（已解绑）
-     * @note 绑定后若队列里已有数据（例如接入时灌的 GOP），会**立刻补一次唤醒**，
-     *       否则那些数据要等到下一帧才被发现
+     * @note 绑定后若队列里已有数据（例如接入时灌的 GOP），会**立刻补一次唤醒**
      */
     bool bindPoller(const EventPoller::Ptr &poller);
 
@@ -115,13 +125,23 @@ public:
         return _notify_coalesced_count.load();
     }
 
+    // ---------------------------------------------------------------------
+    // 【占位，M5-d / M6 实现】订阅者的**独立时间戳基准**（ARCHITECTURE.md §4）
+    //   为什么必须存在：FLV 的 timestamp 要求从 0 开始递增，而各客户端接入时刻不同；
+    //   如果共用源的时间戳，后接入的客户端会看到巨大的初始时间戳 → 播放器异常。
+    //   现在不实现（还没有输出层可以用它），但**位置留在这里**，避免 M6 到处找地方塞：
+    //     int64_t timestampBaseMs() const;          // 该订阅者的时间戳偏移
+    //     void    setTimestampBaseMs(int64_t ms);
+    //   预计落点：M6 的 `FlvSender` 在首次拿到包时以"第一个包的 dts"作为基准写进去。
+    // ---------------------------------------------------------------------
+
 private:
     friend class MediaSource;
 
     Subscriber(Id id, const FrameQueue::Limits &limits)
         : _id(id) {
         // 上限合法性由 MediaSource::setLimits 统一把关；万一非法，setLimits 保持默认值
-        // （默认值是合法的 64 帧/8MB），不会退化成无界
+        // （默认值是合法的推导值），不会退化成无界
         (void) _queue.setLimits(limits);
     }
 
@@ -152,10 +172,25 @@ class MediaSource {
 public:
     using Ptr = std::shared_ptr<MediaSource>;
 
+    /// 上限**由物理量推导**，不再拍字节数（见文件头"上限怎么来的"）
     struct Limits {
-        FrameQueue::Limits queue;                        // 每个订阅者一份
-        size_t max_gop_bytes = 8u * 1024u * 1024u;       // GopCache 上限
-        size_t max_subscribers = 16;                     // 有界：0/无界不是选项
+        size_t max_bitrate_bps = 8u * 1000u * 1000u; // 单路码率上限：8 Mbps
+        uint32_t latency_budget_ms = 2000;           // 延迟额度：2 s → 队列上限 2,000,000 B
+        uint32_t max_gop_ms = 2000;                  // 最大 GOP 时长：2 s → GOP 缓存上限 2,000,000 B
+        size_t max_subscribers = 16;                 // **人数**是硬边界（0/无界不是选项）
+
+        /// 队列上限 = 码率上限 × 延迟额度
+        size_t queueMaxBytes() const {
+            return bytesFor(max_bitrate_bps, latency_budget_ms);
+        }
+        /// GOP 缓存上限 = 码率上限 × 最大 GOP 时长
+        size_t gopMaxBytes() const {
+            return bytesFor(max_bitrate_bps, max_gop_ms);
+        }
+        /// 该源"满订阅"时的输出带宽（**观测用**，不做准入判定 —— 见 DESIGN_M5.md §7）
+        uint64_t outputBitrateBudgetBps() const {
+            return static_cast<uint64_t>(max_bitrate_bps) * max_subscribers;
+        }
     };
 
     /// 一次 push 的结果（调用方据此判断"要不要断开某人"）
@@ -171,8 +206,8 @@ public:
     MediaSource();
     explicit MediaSource(const Limits &limits);
 
-    /// @return false = 上限非法（队列上限见 FrameQueue::setLimits、max_subscribers 为 0
-    ///         或超过硬上限、max_gop_bytes 同 GopCache::setMaxBytes），保持原值不变
+    /// @return false = 上限非法（码率/时长/人数为 0 或超硬上限，或推导出的字节数超硬上限），
+    ///         保持原值不变
     bool setLimits(const Limits &limits);
 
     Limits limits() const {
@@ -202,35 +237,46 @@ public:
         return _gop;
     }
 
+    /// 一行统计（FR-6.1 的最小版）；**可从任意线程调用**（计数器都是 atomic）
+    std::string dumpStats() const;
+
     // ---- 观测（FR-6.1 的素材；绝不用计数替代上限）----
     uint64_t totalDelivered() const {
-        return _total_delivered;
+        return _total_delivered.load();
     }
     uint64_t totalDropped() const {
-        return _total_dropped_to_make_room;
+        return _total_dropped_to_make_room.load();
     }
     uint64_t totalDroppedIncoming() const {
-        return _total_dropped_incoming;
+        return _total_dropped_incoming.load();
     }
     uint64_t totalRejected() const {
-        return _total_rejected;
+        return _total_rejected.load();
     }
     uint64_t totalSubscribe() const {
-        return _total_subscribe;
+        return _total_subscribe.load();
     }
     uint64_t totalSeedFailed() const {
-        return _total_seed_failed;
+        return _total_seed_failed.load();
     }
     uint64_t totalAutoUnsubscribe() const {
-        return _total_auto_unsubscribe;
+        return _total_auto_unsubscribe.load();
     }
     /// 因"不可丢的包进不去"被置为 broken 的订阅者数（累计）
     uint64_t totalBroken() const {
-        return _total_broken;
+        return _total_broken.load();
     }
 
 private:
     static constexpr size_t kHardMaxSubscribers = 4096;
+    static constexpr size_t kHardMaxBitrateBps = 100u * 1000u * 1000u; // 100 Mbps
+    static constexpr uint32_t kHardMaxLatencyMs = 10u * 1000u;         // 10 s
+    static constexpr uint32_t kHardMaxGopMs = 60u * 1000u;             // 60 s
+
+    /// 把"码率 × 时长"折成字节数（**推导上限的唯一入口**，避免各处拍数字）
+    static size_t bytesFor(size_t bitrate_bps, uint32_t ms) {
+        return static_cast<size_t>(static_cast<uint64_t>(bitrate_bps) * ms / 8000u);
+    }
 
     /// 清掉 shared_ptr 已释放的订阅者；@return 本次清理掉的个数
     size_t pruneExpired();
@@ -246,14 +292,14 @@ private:
     Subscriber::Id _next_id = 1;
     bool _ended = false;
 
-    uint64_t _total_delivered = 0;
-    uint64_t _total_dropped_to_make_room = 0;
-    uint64_t _total_dropped_incoming = 0;
-    uint64_t _total_rejected = 0;
-    uint64_t _total_subscribe = 0;
-    uint64_t _total_seed_failed = 0;
-    uint64_t _total_auto_unsubscribe = 0;
-    uint64_t _total_broken = 0;
+    std::atomic<uint64_t> _total_delivered{0};
+    std::atomic<uint64_t> _total_dropped_to_make_room{0};
+    std::atomic<uint64_t> _total_dropped_incoming{0};
+    std::atomic<uint64_t> _total_rejected{0};
+    std::atomic<uint64_t> _total_subscribe{0};
+    std::atomic<uint64_t> _total_seed_failed{0};
+    std::atomic<uint64_t> _total_auto_unsubscribe{0};
+    std::atomic<uint64_t> _total_broken{0};
 };
 
 } // namespace mzmedia

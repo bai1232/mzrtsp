@@ -81,13 +81,14 @@ public:
 
     /**
      * 是否允许被丢弃（拥塞时）
-     * @return 视频非关键帧 = true；视频关键帧、音频 = false
-     * @note 放在包上而不是"队列按 stream_index 猜"：这是包自身的性质，
-     *       策略散落在队列里迟早会漏一路流。音频一律不可丢 —— 丢音频 = 静音空洞，
-     *       比花屏更显眼（FR-5.2 说的"非关键帧"针对的是视频）
+     * @return **唯一不可丢的是视频关键帧**；音频与视频非关键帧都可丢
+     * @note FR-5.2（本批修订）：音频也参与丢弃 —— 但丢弃的单位是"队头最旧的一段"，
+     *       同一段的音频与视频一起走，所以不会出现"视频跳了、音频还在原地"的音画错位
+     *       （见 `docs/DESIGN_M5.md` §4.2）。比"永远保音频"更符合实时流的取舍：
+     *       宁可两端都断一下，也不要 A/V 长期错位。
      */
     bool droppable() const {
-        return _kind == MediaKind::Video && !_key_frame;
+        return !(_kind == MediaKind::Video && _key_frame);
     }
 
 private:

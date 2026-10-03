@@ -158,8 +158,8 @@ curl -s http://127.0.0.1:8080/api/stats | python3 -m json.tool
 | NFR-5 转码 ≥1.0x | `/api/stats` 的 `speed` 字段 |
 | NFR-6 资源回收 | 断开前后对比 `/api/stats` 与 `/proc/<pid>/fd`；单测 `media`：订阅者 `shared_ptr` 释放后由 `weak_ptr` **自动注销**、其队列被回收 |
 | ROADMAP M2 验收：定时器精度 | 单测 `timer` 分组（`tests/test_network_timer.cpp`，用例清单见 `DESIGN_M2.md` §7.1）：**0 早触发** + 相对宿主裸 `nanosleep` 基线增量 ≤5ms。**绝对 ±10ms 在本宿主实测不可达**（裸 `nanosleep` 自身的超出量就有 0~14ms，且与延时长短无关），原始数据见 `DESIGN_M2.md` §7.1 / §8 R11 |
-| FR-5.1 每客户端队列上限（64 帧 / 8MB，先到者为准） | 单测 `media` 分组（`tests/test_media.cpp`，清单见 `docs/DESIGN_M5.md` §5）：帧数上限与字节上限**各自**能触发；`setLimits(0)` 被拒（有界性不可协商） |
-| FR-5.2 慢客户端丢帧 | 单测 `media`：溢出只丢 `droppable()`（视频非关键帧），**音频与视频关键帧不丢**；关键帧腾不出空间 → `RejectedNoSpace`（调用方断开该订阅者）。集成：`tc` 限速或 `kill -STOP` 阻塞客户端，观察 `dropped` 计数与其他客户端 |
+| FR-5.1 每客户端队列上限（**只按字节**：码率上限 × 延迟额度） | 单测 `media` 分组（`tests/test_media.cpp`，清单见 `docs/DESIGN_M5.md` §5）：`setLimits(0)` / 超硬上限被拒；推导值 = `码率 × 时长 / 8000`（用例断言 8 Mbps × 2 s = 2,000,000）；上限不可绕过（`bytes() ≤ max_bytes`） |
+| FR-5.2 慢客户端丢帧 | 单测 `media`：溢出丢**最旧的一段**（音视频成对 —— 用例断言一次丢掉音频与视频各一包），**唯一不可丢的是视频关键帧**；腾不出空间 → `RejectedNoSpace`（调用方断开该订阅者）。集成：`tc` 限速或 `kill -STOP` 阻塞客户端，观察 `dropped` 计数与其他客户端 |
 | FR-5.3 隔离性 | 单测 `media`：一个订阅者（一直不取帧）持续溢出，其他订阅者的帧序列仍**逐帧一致**（每帧指针相同） |
 | FR-6.1 `/api/stats` | 单元层面：`MediaSource::totalDelivered / totalDropped / totalRejected / totalBroken` 与 `Subscriber::notify*` 已有计数（M5-a / M5-b）；集成层面（M5-d）：`curl -s /api/stats` 与压测前后对账 |
 | FR-4.4 连接上限 / 读空闲 / 写阻塞 | 单测：连接上限设为 1 时第 2 个连接被拒且 `totalRejected()` 增长；`recv_idle=50ms` + 连上不发数据的客户端 → 阈内断开且 `onError` 为超时；`send_blocked=50ms` + 只连不读的客户端 → 断开且 `bytesOut` 停止增长 |

@@ -1,12 +1,13 @@
 /*
- * 媒体分发层单元测试（M5-a，分组 `media`）
+ * 媒体分发层单元测试（M5-a 建立，M5-b 加线程，本批随 FR-5.1/5.2 修订更新策略断言）
  * ============================================================================
- * 契约来源：docs/DESIGN_M5.md §3 / §5；上位需求 FR-5.1 / FR-5.2 / FR-5.3 / NFR-6
+ * 契约来源：docs/DESIGN_M5.md §3 / §5；上位需求 FR-5.1（上限 = 码率 × 延迟额度，只按字节）、
+ *           FR-5.2（溢出丢最旧的一段，音视频成对）、FR-5.3、NFR-6、FR-6.1
  *
  * 覆盖维度（AI_COLLAB §3.4：正常 / 空 / 满 / 断开 / 超大）：
  *   正常  一进一出、FIFO、计数一致、3 个订阅者序列完全一致（且指针相同 = 零拷贝）
  *   空    队列空、GOP 缓存空、没有 GOP 起点时的包不缓存、空包/0 字节/非法流索引
- *   满    帧数上限与字节上限各自触发；丢的只能是可丢包（音频与关键帧绝不丢）
+ *   满    字节上限触发；丢的只能是可丢包（**唯一不可丢的是视频关键帧**），且"最旧的一段"整体丢
  *   断开  订阅者 shared_ptr 释放 → 自动注销；EOS 广播与幂等；clear() 回收
  *   超大  单包超过队列上限（可丢 → 丢新包；不可丢 → 报错由调用方断开）；
  *         关键帧灌不进队列 → 拒绝接入；GOP 超上限 → 收敛但保留关键帧
@@ -23,6 +24,7 @@
 #include "media/media_packet.h"
 #include "media/media_source.h"
 
+#include <string>
 #include <vector>
 
 using namespace mzmedia;
@@ -37,7 +39,7 @@ MediaPacket::Ptr video(int stream, bool key, size_t bytes, int64_t ms = 0) {
     return MediaPacket::create(MediaKind::Video, stream, payload, key, ms, ms);
 }
 
-/// 造一个音频包（音频没有关键帧概念，一律不可丢）
+/// 造一个音频包（音频没有关键帧概念 → 按 FR-5.2 修订版它**可丢**）
 MediaPacket::Ptr audio(int stream, size_t bytes, int64_t ms = 0) {
     auto payload = std::make_shared<const std::vector<uint8_t>>(bytes, 0x33);
     return MediaPacket::create(MediaKind::Audio, stream, payload, false, ms, ms);
@@ -80,7 +82,7 @@ MZ_TEST(media_packet_metadata_and_validation) {
     MZ_ASSERT_TRUE(key->isKeyFrame());
     MZ_ASSERT_EQ(key->size(), 100u);
     MZ_ASSERT_NOT_NULL(key->data());
-    MZ_ASSERT_FALSE(key->droppable());   // 视频关键帧不可丢
+    MZ_ASSERT_FALSE(key->droppable());   // 视频关键帧：唯一不可丢的
 
     auto non_key = video(0, false, 50, 40);
     MZ_ASSERT_NOT_NULL(non_key.get());
@@ -89,7 +91,8 @@ MZ_TEST(media_packet_metadata_and_validation) {
 
     auto audio_packet = audio(1, 30);
     MZ_ASSERT_NOT_NULL(audio_packet.get());
-    MZ_ASSERT_FALSE(audio_packet->droppable()); // 音频一律不可丢
+    // FR-5.2 修订：音频也**可丢**（丢的时候按"最旧的一段"整段丢，音视频成对，避免音画错位）
+    MZ_ASSERT_TRUE(audio_packet->droppable());
 
     // 零拷贝分发的基础：多个 Ptr 指向**同一个对象**、同一块数据
     MediaPacket::Ptr shared = key;
@@ -115,8 +118,8 @@ MZ_TEST(media_queue_fifo_and_accounting) {
     FrameQueue queue;
     MZ_ASSERT_EQ(queue.packets(), 0u);
     MZ_ASSERT_TRUE(queue.empty());
-    MZ_ASSERT_EQ(queue.limits().max_packets, 64u);       // FR-5.1 的初值
-    MZ_ASSERT_EQ(queue.limits().max_bytes, 8u * kMB);
+    // FR-5.1 修订：上限**只按字节**，且默认值是推导出来的（8 Mbps × 2 s）
+    MZ_ASSERT_EQ(queue.limits().max_bytes, 2000000u);
 
     auto p1 = video(0, true, 10, 1);
     auto p2 = video(0, false, 20, 2);
@@ -129,7 +132,7 @@ MZ_TEST(media_queue_fifo_and_accounting) {
 
     MediaPacket::Ptr out;
     MZ_ASSERT_EQ(queue.pop(&out), FrameQueue::PopResult::Packet);
-    MZ_ASSERT_TRUE(out == p1);                           // FIFO：先入先出
+    MZ_ASSERT_TRUE(out == p1); // FIFO：先入先出
     MZ_ASSERT_EQ(queue.bytes(), 50u);
     MZ_ASSERT_EQ(queue.pop(&out), FrameQueue::PopResult::Packet);
     MZ_ASSERT_TRUE(out == p2);
@@ -141,77 +144,64 @@ MZ_TEST(media_queue_fifo_and_accounting) {
 }
 
 MZ_TEST(media_queue_drops_only_droppable) {
+    // FR-5.2 修订：唯一不可丢的是**视频关键帧**；丢弃单位是"队头最旧的一段"（音视频成对）
     FrameQueue::Limits limits;
-    limits.max_packets = 4;
-    limits.max_bytes = 1u * kMB;
-
+    limits.max_bytes = 60; // 只放得下 6 个 10 字节的包
     FrameQueue queue;
     MZ_ASSERT_TRUE(queue.setLimits(limits));
 
     auto key = video(0, true, 10);
-    auto aud = audio(1, 10);
-    auto n1 = video(0, false, 10);
-    auto n2 = video(0, false, 10);
-    MZ_ASSERT_EQ(queue.push(key), FrameQueue::PushResult::Accepted);
-    MZ_ASSERT_EQ(queue.push(aud), FrameQueue::PushResult::Accepted);
-    MZ_ASSERT_EQ(queue.push(n1), FrameQueue::PushResult::Accepted);
-    MZ_ASSERT_EQ(queue.push(n2), FrameQueue::PushResult::Accepted);
-    MZ_ASSERT_EQ(queue.packets(), 4u);
+    auto a1 = audio(1, 10);
+    auto v1 = video(0, false, 10);
+    auto a2 = audio(1, 10);
+    auto v2 = video(0, false, 10);
+    auto a3 = audio(1, 10);
+    for (const auto &packet : {key, a1, v1, a2, v2, a3}) {
+        MZ_ASSERT_EQ(queue.push(packet), FrameQueue::PushResult::Accepted);
+    }
+    MZ_ASSERT_EQ(queue.bytes(), 60u);
+    MZ_ASSERT_EQ(queue.packets(), 6u);
 
-    // 满了：再来一个视频非关键帧 → 丢最旧的可丢包（n1）给它让位
-    auto n3 = video(0, false, 10);
-    MZ_ASSERT_EQ(queue.push(n3), FrameQueue::PushResult::DroppedToMakeRoom);
-    MZ_ASSERT_EQ(queue.packets(), 4u);
-    MZ_ASSERT_EQ(queue.stats().dropped_non_key, 1u);
+    // 来了一个 20 字节的包：要腾 20 字节 → 丢掉队头最旧的一段（a1 + v1，音频与视频各一）
+    auto big = video(0, false, 20);
+    MZ_ASSERT_EQ(queue.push(big), FrameQueue::PushResult::DroppedToMakeRoom);
+    MZ_ASSERT_EQ(queue.bytes(), 60u);
+    MZ_ASSERT_EQ(queue.stats().dropped, 2u); // 一次丢两个：音频 + 视频（成对，不是"只丢视频"）
 
     auto kept = drain(&queue);
-    MZ_ASSERT_EQ(kept.size(), 4u);
-    MZ_ASSERT_TRUE(contains(kept, key));    // 关键帧绝不丢
-    MZ_ASSERT_TRUE(contains(kept, aud));    // 音频绝不丢
-    MZ_ASSERT_FALSE(contains(kept, n1));    // 丢的是最旧的可丢包
-    MZ_ASSERT_TRUE(contains(kept, n2));
-    MZ_ASSERT_TRUE(contains(kept, n3));
+    MZ_ASSERT_TRUE(contains(kept, key)); // 关键帧绝不丢
+    MZ_ASSERT_FALSE(contains(kept, a1)); // 最旧的一段被整体丢掉
+    MZ_ASSERT_FALSE(contains(kept, v1));
+    MZ_ASSERT_TRUE(contains(kept, a2));
+    MZ_ASSERT_TRUE(contains(kept, v2));
+    MZ_ASSERT_TRUE(contains(kept, a3));
+    MZ_ASSERT_TRUE(contains(kept, big));
 
-    // 继续灌非关键帧：关键帧与音频必须一直在（丢掉它们 = 花屏 + 静音）
+    // 继续灌视频非关键帧：关键帧必须一直在（丢了它后面全花屏），字节数不超上限
     FrameQueue queue2;
     MZ_ASSERT_TRUE(queue2.setLimits(limits));
     MZ_ASSERT_EQ(queue2.push(key), FrameQueue::PushResult::Accepted);
-    MZ_ASSERT_EQ(queue2.push(aud), FrameQueue::PushResult::Accepted);
-    int accepted = 0;
-    int made_room = 0;
     for (int i = 0; i < 20; ++i) {
-        const auto result = queue2.push(video(0, false, 10, i));
-        if (result == FrameQueue::PushResult::Accepted) {
-            ++accepted;
-        } else if (result == FrameQueue::PushResult::DroppedToMakeRoom) {
-            ++made_room;
-        }
+        (void) queue2.push(video(0, false, 10, i));
     }
-    // 队列里已有 2 个（关键帧 + 音频），上限 4：头 2 个直接进，其余 18 个都得先丢一个旧包
-    MZ_ASSERT_EQ(accepted, 2);
-    MZ_ASSERT_EQ(made_room, 18);
-    MZ_ASSERT_EQ(queue2.packets(), 4u);
     auto kept2 = drain(&queue2);
     MZ_ASSERT_TRUE(contains(kept2, key));
-    MZ_ASSERT_TRUE(contains(kept2, aud));
-    MZ_ASSERT_LE(kept2.size(), 4u);
+    MZ_ASSERT_LE(queue2.bytes(), limits.max_bytes);
 }
 
-MZ_TEST(media_queue_limits_first_wins) {
-    // 字节上限先到（帧数上限给得很大）
+MZ_TEST(media_queue_byte_limit_only) {
+    // FR-5.1 修订：只有一个上限 —— 字节（原来的"64 帧"已删除）
     FrameQueue::Limits limits;
-    limits.max_packets = 1000;
     limits.max_bytes = 100;
-
     FrameQueue queue;
     MZ_ASSERT_TRUE(queue.setLimits(limits));
+
     MZ_ASSERT_EQ(queue.push(video(0, false, 40)), FrameQueue::PushResult::Accepted);
     MZ_ASSERT_EQ(queue.push(video(0, false, 40)), FrameQueue::PushResult::Accepted);
     MZ_ASSERT_EQ(queue.bytes(), 80u);
     // 80 + 40 > 100 → 丢掉最旧的可丢包
     MZ_ASSERT_EQ(queue.push(video(0, false, 40)), FrameQueue::PushResult::DroppedToMakeRoom);
     MZ_ASSERT_EQ(queue.bytes(), 80u);
-    MZ_ASSERT_EQ(queue.packets(), 2u);
     MZ_ASSERT_LE(queue.bytes(), queue.limits().max_bytes); // 上限是硬的
 
     // 单包就超过整个字节上限：可丢的丢新包（正常降级），不可丢的必须报错（调用方断开）
@@ -220,44 +210,32 @@ MZ_TEST(media_queue_limits_first_wins) {
     MZ_ASSERT_EQ(queue.bytes(), 80u); // 队列没被这两个包动过
     MZ_ASSERT_EQ(queue.stats().rejected_no_space, 1u);
     MZ_ASSERT_EQ(queue.stats().dropped_incoming, 1u);
-
-    // 帧数上限先到（字节上限给得很大）
-    FrameQueue::Limits limits2;
-    limits2.max_packets = 2;
-    limits2.max_bytes = 1u * kMB;
-    FrameQueue queue2;
-    MZ_ASSERT_TRUE(queue2.setLimits(limits2));
-    MZ_ASSERT_EQ(queue2.push(video(0, false, 1)), FrameQueue::PushResult::Accepted);
-    MZ_ASSERT_EQ(queue2.push(video(0, false, 1)), FrameQueue::PushResult::Accepted);
-    MZ_ASSERT_EQ(queue2.push(video(0, false, 1)), FrameQueue::PushResult::DroppedToMakeRoom);
-    MZ_ASSERT_EQ(queue2.packets(), 2u);
 }
 
 MZ_TEST(media_queue_keyframe_makes_room_or_rejects) {
     FrameQueue::Limits limits;
-    limits.max_packets = 2;
-    limits.max_bytes = 1u * kMB;
-
+    limits.max_bytes = 20;
     FrameQueue queue;
     MZ_ASSERT_TRUE(queue.setLimits(limits));
-    auto n1 = video(0, false, 10);
-    auto n2 = video(0, false, 10);
-    MZ_ASSERT_EQ(queue.push(n1), FrameQueue::PushResult::Accepted);
-    MZ_ASSERT_EQ(queue.push(n2), FrameQueue::PushResult::Accepted);
 
-    // 关键帧到来：丢掉可丢的旧包让它进去（关键帧绝不因为"队列满"而被丢）
+    auto n1 = video(0, false, 10);
+    auto aud = audio(1, 10);
+    MZ_ASSERT_EQ(queue.push(n1), FrameQueue::PushResult::Accepted);
+    MZ_ASSERT_EQ(queue.push(aud), FrameQueue::PushResult::Accepted);
+
+    // 关键帧到来：丢掉最旧的一段可丢包（音频也算可丢）让它进去
     auto key = video(0, true, 10);
     MZ_ASSERT_EQ(queue.push(key), FrameQueue::PushResult::DroppedToMakeRoom);
     auto kept = drain(&queue);
     MZ_ASSERT_EQ(kept.size(), 2u);
-    MZ_ASSERT_TRUE(contains(kept, n2));
+    MZ_ASSERT_TRUE(contains(kept, aud));
     MZ_ASSERT_TRUE(contains(kept, key));
 
-    // 队列里全是不可丢的包（关键帧 + 音频）→ 新关键帧也挤不进去：必须报错
+    // 队里只剩**不可丢**的包（全是视频关键帧）→ 再来关键帧也挤不进去：必须报错，不能静默丢
     FrameQueue queue2;
     MZ_ASSERT_TRUE(queue2.setLimits(limits));
     MZ_ASSERT_EQ(queue2.push(video(0, true, 10)), FrameQueue::PushResult::Accepted);
-    MZ_ASSERT_EQ(queue2.push(audio(1, 10)), FrameQueue::PushResult::Accepted);
+    MZ_ASSERT_EQ(queue2.push(video(0, true, 10)), FrameQueue::PushResult::Accepted);
     MZ_ASSERT_EQ(queue2.push(video(0, true, 10)), FrameQueue::PushResult::RejectedNoSpace);
     MZ_ASSERT_EQ(queue2.packets(), 2u);
     MZ_ASSERT_EQ(queue2.stats().rejected_no_space, 1u);
@@ -266,24 +244,19 @@ MZ_TEST(media_queue_keyframe_makes_room_or_rejects) {
 MZ_TEST(media_queue_rejects_invalid_limits_and_eos) {
     FrameQueue queue;
 
-    // 0 不等于无界：必须拒绝，且保持原值（不能变成"半套上限"）
-    FrameQueue::Limits zero_packets;
-    zero_packets.max_packets = 0;
-    MZ_ASSERT_FALSE(queue.setLimits(zero_packets));
-    FrameQueue::Limits zero_bytes;
-    zero_bytes.max_bytes = 0;
-    MZ_ASSERT_FALSE(queue.setLimits(zero_bytes));
+    // 0 不等于无界：必须拒绝，且保持原值
+    FrameQueue::Limits zero;
+    zero.max_bytes = 0;
+    MZ_ASSERT_FALSE(queue.setLimits(zero));
     FrameQueue::Limits too_huge;
     too_huge.max_bytes = 1024u * kMB; // 超过硬上限
     MZ_ASSERT_FALSE(queue.setLimits(too_huge));
-    MZ_ASSERT_EQ(queue.limits().max_packets, 64u);
-    MZ_ASSERT_EQ(queue.limits().max_bytes, 8u * kMB);
+    MZ_ASSERT_EQ(queue.limits().max_bytes, 2000000u); // 默认推导值仍然有效
 
     FrameQueue::Limits ok;
-    ok.max_packets = 2;
-    ok.max_bytes = 1u * kMB;
+    ok.max_bytes = 100;
     MZ_ASSERT_TRUE(queue.setLimits(ok));
-    MZ_ASSERT_EQ(queue.limits().max_packets, 2u);
+    MZ_ASSERT_EQ(queue.limits().max_bytes, 100u);
 
     // EOS：区分"暂时没有"与"不会再有"；标记幂等
     MediaPacket::Ptr out;
@@ -310,7 +283,7 @@ MZ_TEST(media_queue_rejects_invalid_limits_and_eos) {
 
 MZ_TEST(media_gop_cache_keeps_only_last_gop) {
     GopCache cache;
-    MZ_ASSERT_EQ(cache.maxBytes(), 8u * kMB);
+    MZ_ASSERT_EQ(cache.maxBytes(), 2000000u); // 推导值：8 Mbps × 2 s
     MZ_ASSERT_TRUE(cache.snapshot().empty());
 
     // 还没有关键帧：别的包不缓存（否则 snapshot() 的开头解不出来）
@@ -371,7 +344,7 @@ MZ_TEST(media_gop_cache_byte_limit_keeps_keyframe) {
     MZ_ASSERT_TRUE(contains(snapshot, n2));
     MZ_ASSERT_FALSE(contains(snapshot, n1));
 
-    // 缓存里音频**可丢**（与 FrameQueue 的有意差异，见 gop_cache.h 文件头）
+    // 缓存里音频可丢（与 FrameQueue **同一规则**：只有视频关键帧不可丢）
     MZ_ASSERT_EQ(cache.feed(audio(1, 50)), GopCache::FeedResult::Cached);
     MZ_ASSERT_LE(cache.bytes(), cache.maxBytes());
     auto snapshot2 = cache.snapshot();
@@ -399,6 +372,9 @@ MZ_TEST(media_source_fanout_identical) {
     }
     MZ_ASSERT_NE(s1->id(), s2->id());
     MZ_ASSERT_EQ(source.subscriberCount(), 3u);
+    // 上限是推导出来的：8 Mbps × 2 s
+    MZ_ASSERT_EQ(source.limits().queueMaxBytes(), 2000000u);
+    MZ_ASSERT_EQ(source.limits().gopMaxBytes(), 2000000u);
 
     std::vector<MediaPacket::Ptr> sent;
     sent.push_back(video(0, true, 100, 0));
@@ -435,9 +411,11 @@ MZ_TEST(media_source_slow_consumer_isolated) {
     // FR-5.3：任一客户端异常（不读数据）不得影响源与其他客户端
     MediaSource source;
     MediaSource::Limits limits;
-    limits.queue.max_packets = 8;
-    limits.queue.max_bytes = 1u * kMB;
+    // 故意给得极小：64 kbps × 10 ms = 80 字节（放得下 8 个 10 字节的包）
+    limits.max_bitrate_bps = 64000;
+    limits.latency_budget_ms = 10;
     MZ_ASSERT_TRUE(source.setLimits(limits));
+    MZ_ASSERT_EQ(source.limits().queueMaxBytes(), 80u);
 
     auto fast1 = source.subscribe();
     auto fast2 = source.subscribe();
@@ -461,11 +439,11 @@ MZ_TEST(media_source_slow_consumer_isolated) {
 
     MZ_ASSERT_EQ(f1.size(), static_cast<size_t>(kCount)); // 快的订阅者一个都不少
     MZ_ASSERT_EQ(f2.size(), static_cast<size_t>(kCount));
-    MZ_ASSERT_EQ(fast1->queue().stats().dropped_non_key, 0u);
-    MZ_ASSERT_EQ(fast2->queue().stats().dropped_non_key, 0u);
+    MZ_ASSERT_EQ(fast1->queue().stats().dropped, 0u);
+    MZ_ASSERT_EQ(fast2->queue().stats().dropped, 0u);
 
-    MZ_ASSERT_EQ(slow->queue().packets(), 8u);                    // 上限生效
-    MZ_ASSERT_EQ(slow->queue().stats().dropped_non_key, 22u);      // 30 - 8
+    MZ_ASSERT_EQ(slow->queue().packets(), 8u);         // 上限生效（80 字节 / 10）
+    MZ_ASSERT_EQ(slow->queue().stats().dropped, 22u);   // 30 - 8
     MZ_ASSERT_GT(source.totalDropped(), 0u);
     MZ_ASSERT_FALSE(slow->broken()); // 丢的是可丢包 → 不算"坏了"
 
@@ -508,8 +486,10 @@ MZ_TEST(media_source_new_subscriber_starts_at_keyframe) {
     // 关键帧比整个队列上限还大 → 拒绝接入（宁可不接，也不让对端从 GOP 中间开始）
     MediaSource tiny;
     MediaSource::Limits limits;
-    limits.queue.max_bytes = 50;
+    limits.max_bitrate_bps = 400000; // 400 kbps × 1 ms = 50 字节 < 关键帧的 100 字节
+    limits.latency_budget_ms = 1;
     MZ_ASSERT_TRUE(tiny.setLimits(limits));
+    MZ_ASSERT_EQ(tiny.limits().queueMaxBytes(), 50u);
     (void) tiny.pushPacket(video(0, true, 100, 0));
     auto bad = tiny.subscribe();
     MZ_ASSERT_NULL(bad.get());
@@ -523,11 +503,19 @@ MZ_TEST(media_source_subscriber_lifetime_and_limits) {
     limits.max_subscribers = 2;
     MZ_ASSERT_TRUE(source.setLimits(limits));
 
-    // max_subscribers = 0 被拒，且原值不变
+    // max_subscribers = 0 被拒，且原值不变（人数是硬边界）
     MediaSource::Limits zero_subs;
     zero_subs.max_subscribers = 0;
     MZ_ASSERT_FALSE(source.setLimits(zero_subs));
     MZ_ASSERT_EQ(source.limits().max_subscribers, 2u);
+    // 码率 / 时长也必须是正数（0 一律拒绝）
+    MediaSource::Limits zero_bitrate;
+    zero_bitrate.max_bitrate_bps = 0;
+    MZ_ASSERT_FALSE(source.setLimits(zero_bitrate));
+    MediaSource::Limits zero_budget;
+    zero_budget.latency_budget_ms = 0;
+    MZ_ASSERT_FALSE(source.setLimits(zero_budget));
+    MZ_ASSERT_EQ(source.limits().max_bitrate_bps, 8000000u);
 
     auto s1 = source.subscribe();
     auto s2 = source.subscribe();
@@ -569,8 +557,32 @@ MZ_TEST(media_source_subscriber_lifetime_and_limits) {
     MZ_ASSERT_FALSE(source.unsubscribe(id1)); // 早就自动注销了
 }
 
+MZ_TEST(media_source_dump_stats_minimal) {
+    // FR-6.1 的最小版（本批定）：几个 atomic 计数器 + 一行 dumpStats()，
+    // 可从**任意线程**调用（HTTP 线程将来直接把它塞进 /api/stats）
+    MediaSource source;
+    auto sub = source.subscribe();
+    MZ_ASSERT_NOT_NULL(sub.get());
+    if (!sub) {
+        return;
+    }
+    (void) source.pushPacket(video(0, true, 10, 0));
+    (void) source.pushPacket(video(0, false, 10, 1));
+
+    const std::string stats = source.dumpStats();
+    MZ_ASSERT_TRUE(stats.find("media_source{") == 0);                     // 一眼能认出是谁
+    MZ_ASSERT_TRUE(stats.find("delivered=2") != std::string::npos);       // 计数
+    MZ_ASSERT_TRUE(stats.find("queue_bytes=2000000") != std::string::npos); // 推导出的上限
+    MZ_ASSERT_TRUE(stats.find("gop_bytes=2000000") != std::string::npos);
+    MZ_ASSERT_TRUE(stats.find("out_budget=128000000bps") != std::string::npos); // 8Mbps × 16 路
+    MZ_ASSERT_TRUE(stats.find("rejected=0") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// Subscriber 的绑定语义（M5-b）
+// ---------------------------------------------------------------------------
+
 MZ_TEST(media_subscriber_bind_poller_and_callbacks) {
-    // M5-b 的绑定语义（单线程部分：不需要 poller 线程就能验证的形状）
     MediaSource source;
     auto sub = source.subscribe();
     MZ_ASSERT_NOT_NULL(sub.get());
