@@ -135,6 +135,17 @@
 - 实现中修正的两点：①处理器自建的响应漏了 CORS/Server 头 → 改为从 `makeResponse(200)` 起步；
   ②测试助手一次 `recv` 会把管线化的第二个响应一起读走 → 加 `carry`（客户端的"分帧"）
 
+#### M3-c chunked 流式 / Range / stats
+- `HttpResponse` 增加 chunked：`setSender`/`beginChunked`/`sendChunk`/`endChunked`；分块模式
+  **绝不发 `Content-Length`**，结束块显式发（处理器忘了由 `HttpSession` 兜底 + Warn）
+- `/stream` 演示路由（M6 的 FLV 就是这个形状）；`send()` 返回 0 视为成功（已入队）
+- 单区间 `Range`：`bytes=a-b` / `bytes=a-` → 206 + `Content-Range`；起点越界 → 416；
+  多区间 / 后缀 `-N` / 畸形 → 忽略回 200 + Warn
+- `/api/stats`：JSON（M3 的 requests/4xx/5xx/malformed + M2 的会话/accept/拒绝/空闲超时/
+  收超限/发超限/accept 错误）
+- 测试：`tests/test_http_server.cpp` 增至 **21 用例 / 193 断言**（chunked 2 + Range 4 + stats 1），
+  测试助手补 **chunked 解码**；脚本增至 **11 组**
+
 ### 说明
 - `v0.1.0` 尚未发布。按 `VERSIONING.md`，tag 只能打在**可独立构建且测试通过**的提交上。
 - M1（Core 层）已完成并推送；后续进入 M2（网络层：EventPoller / TcpServer / Session）。

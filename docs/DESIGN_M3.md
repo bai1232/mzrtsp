@@ -78,7 +78,7 @@ while (!rest.empty()) { st = parser.parse(rest); if (st != Complete) break; 处�
 |---|---|---|
 | **M3-a** | `HttpParser` + `tests/test_http_parser.cpp`（19 用例） | 正常/半包/粘包/超长/畸形/NUL 全部确定性通过；进 TSAN 严格组 |
 | **M3-b** ✅ | `HttpSession`（内部类，重写 `onRecv` 分帧）、`HttpResponse`、`HttpServer`（路由 + 错误码 + CORS + 观测）、`examples/http_server.cpp`、`tests/test_http_server.cpp`（14 用例）、`scripts/http_test.sh`（8 项） | **已完成**：curl 8 项全过（测试页 200 且 `Content-Length` 与正文一致、CORS、404、405+`Allow`、501、400、keep-alive 复用）；14 个连接级用例全绿 |
-| **M3-c** | chunked 流式、Range（206）、`/api/stats` | `curl -N` 流式不中断；`curl -r 0-9` 拿到 206 与 `Content-Range`；stats 各类计数可见 |
+| **M3-c** ✅ | `HttpResponse` chunked（`beginChunked`/`sendChunk`/`endChunked`）、`/stream` 演示路由、单区间 `Range`（206/416）、`/api/stats`（JSON） | **已完成**：`curl -N /stream` 收到 chunked 数据且无 `Content-Length`；`curl -r 0-9 /` 得 206 + `Content-Range`、越界 416；`/api/stats` 返回 JSON |
 
 ## 6. 测试计划
 
@@ -86,7 +86,7 @@ while (!rest.empty()) { st = parser.parse(rest); if (st != Complete) break; 处�
 |---|---|---|
 | `http` | `tests/test_http_parser.cpp` | 纯解析，单线程无等待 → **TSAN 严格组** |
 | `ntimed_http` ✅ | `tests/test_http_server.cpp`（14 用例） | 连接级（测试页/路由/404/405/400/414/431/501/keep-alive/管线化/CORS/异常 500/存活）→ 只用 socket 超时 + `sleepMs`，**进 TSAN 严格组** |
-| 脚本 | `scripts/http_test.sh` ✅（M3-b 8 项）/ M3-c 补 `-N` 与 `-r` | `curl` 端到端：测试页、CORS、404/405、501、400、keep-alive；M3-c 加流式与 Range |
+| 脚本 | `scripts/http_test.sh` ✅（11 组：测试页/CORS/路由/404/405/501/400/keep-alive + chunked `-N` + Range 206/416 + stats JSON） | `curl` 端到端：测试页、CORS、404/405、501、400、keep-alive；M3-c 加流式与 Range |
 
 ## 7. 风险清单
 
@@ -113,7 +113,11 @@ while (!rest.empty()) { st = parser.parse(rest); if (st != Complete) break; 处�
 | 路由配置时机 | **必须 `start()` 之前**；之后调用返回 false 且不生效（已记 Warn） | 排除"运行期动态加路由"（v0.1 不需要；还免掉"路由表被事件循环线程读时另一线程改"的并发问题） |
 | 响应基础头 | 由 `HttpServer::makeResponse()` 统一给（`Server`、CORS），处理器从它起步、可覆盖任意一项 | 排除"由处理器自己拼"——实现时真踩过：处理器自建的响应漏了 CORS，用例才抓到 |
 | 非 GET | 一律 405 + `Allow: GET` | 排除"假装支持 POST"（v0.1 不需要 body 处理，明确 405 比半支持好） |
-| 畸形请求 | 回 4xx + `Connection: close`，**不再解析后续字节** | 攻击面收敛；且响应里带上具体原因（`errorName()`）便于客户端自助定位 |
+| 畸形请求 | 回 4xx + `Connection: close`，**不再解析后续字节** | 攻击面收敛；响应里带上具体原因（`errorName()`）便于自助定位 |
+| chunked 头部 | `Transfer-Encoding: chunked` 且**绝不发 `Content-Length`**；结束块由 `endChunked()` 显式发（忘了则 Session 兜底 + Warn） | 长度在传输中才知道；少发结束块 = 客户端静默挂住，必须吵出来 |
+| chunked 发送出口 | 由 `HttpSession` 注入 `Sender`；`send()` 返回 0 视为成功（已入队） | 与 M2 队列/背压语义对齐；M6 的 FLV 同一形状 |
+| Range | 只支持 `bytes=a-b` / `bytes=a-`；多区间/后缀区间/畸形 → 忽略回 200 + Warn；起点越界 → 416 | 不做 multipart/byteranges，也不做半吊子 206 |
+| `/api/stats` | 不鉴权、不缓存 | SPEC 未要求；它是本机排障用的 |
 
 ## 9. 未决事项
 
@@ -123,4 +127,4 @@ while (!rest.empty()) { st = parser.parse(rest); if (st != Complete) break; 处�
 | 2 | 是否支持 POST / body（v0.1 只需要 GET） | M3-b 定：若支持，body 上限与 413 计数一起加 |
 | 3 | 测试页是否内联播放器（离线可用） | M3-b |
 | 4 | `/api/stats` 是否需要鉴权/只绑 127.0.0.1 | M3-c（默认不做鉴权，SPEC 未要求） |
-| 5 | `Session::shutdownAfterFlush()`（"发完再关"） | M3-c：chunked 结束时需要它；当前 `Connection: close` 依赖"对端关闭 → EOF → 延迟关闭排空队列"这条既有路径（M2-3b 已实现），故 M3-b 不阻塞 |
+| 5 | `Session::shutdownAfterFlush()`（"发完再关"） | **推迟到 M6**：chunked 结束时不需要关连接（keep-alive 正常）；真正需要它的是"FLV 流结束要主动关"，届时实现并同步 `DESIGN_M2 §3.6` |

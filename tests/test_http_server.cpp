@@ -131,28 +131,73 @@ bool readResponse(int fd, Response *out, int timeout_ms = 2000, std::string *car
     }
 
     const size_t body_start = head_end + 4;
-    while (getCurrentMillisecond() < deadline) {
-        const size_t have = out->raw.size() - body_start;
-        if (out->has_content_length && have >= out->declared_length) {
-            break;
-        }
-        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-        if (n <= 0) {
-            break;
-        }
-        out->raw.append(buf, static_cast<size_t>(n));
-    }
-    if (out->has_content_length) {
-        const size_t need = body_start + out->declared_length;
-        if (out->raw.size() > need) {
-            if (carry != nullptr) {
-                *carry = out->raw.substr(need);   // 多读的留给下一次
+    const bool is_chunked = out->get("transfer-encoding").find("chunked") != std::string::npos;
+    size_t consumed = body_start;
+
+    if (is_chunked) {
+        // 按块解码：<hex 长度>CRLF <数据>CRLF ... 0CRLFCRLF
+        std::string decoded;
+        size_t pos = body_start;
+        for (;;) {
+            size_t eol = out->raw.find("\r\n", pos);
+            while (eol == std::string::npos && getCurrentMillisecond() < deadline) {
+                const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+                if (n <= 0) {
+                    break;
+                }
+                out->raw.append(buf, static_cast<size_t>(n));
+                eol = out->raw.find("\r\n", pos);
             }
-            out->raw.resize(need);
+            if (eol == std::string::npos) {
+                break;   // 超时或对端断开
+            }
+            const size_t chunk_len =
+                static_cast<size_t>(std::strtoul(out->raw.substr(pos, eol - pos).c_str(), nullptr, 16));
+            if (chunk_len == 0) {
+                consumed = eol + 4;   // "0\r\n\r\n"
+                break;
+            }
+            const size_t need = eol + 2 + chunk_len + 2;
+            while (out->raw.size() < need && getCurrentMillisecond() < deadline) {
+                const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+                if (n <= 0) {
+                    break;
+                }
+                out->raw.append(buf, static_cast<size_t>(n));
+            }
+            if (out->raw.size() < need) {
+                break;
+            }
+            decoded.append(out->raw, eol + 2, chunk_len);
+            pos = need;
+        }
+        out->body = decoded;
+    } else {
+        while (getCurrentMillisecond() < deadline) {
+            const size_t have = out->raw.size() - body_start;
+            if (out->has_content_length && have >= out->declared_length) {
+                break;
+            }
+            const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) {
+                break;
+            }
+            out->raw.append(buf, static_cast<size_t>(n));
+        }
+        if (out->has_content_length) {
+            consumed = body_start + out->declared_length;
+        } else {
+            consumed = out->raw.size();
+        }
+        if (out->raw.size() >= body_start) {
+            out->body = out->raw.substr(body_start, consumed > body_start ? consumed - body_start : 0);
         }
     }
-    if (out->raw.size() >= body_start) {
-        out->body = out->raw.substr(body_start);
+    if (out->raw.size() > consumed) {
+        if (carry != nullptr) {
+            *carry = out->raw.substr(consumed);   // 多读的（管线化的下一个响应）留给下一次
+        }
+        out->raw.resize(consumed);
     }
     return true;
 }
@@ -464,4 +509,153 @@ MZ_TEST(ntimed_http_server_survives_malformed) {
     MZ_ASSERT_EQ(resp.status, 200);
     MZ_ASSERT_EQ(fx.server->totalRequests(), 2u);
     ::close(good);
+}
+
+
+// ---------------------------------------------------------------------------
+// M3-c：chunked 流式 / Range / stats
+// ---------------------------------------------------------------------------
+
+MZ_TEST(ntimed_http_chunked_stream) {
+    ServerFixture fx;
+    MZ_ASSERT_TRUE(fx.setup());
+    const int cli = connectTo(fx.server->port());
+    MZ_ASSERT_GT(cli, 0);
+    MZ_ASSERT_TRUE(sendAll(cli, "GET /stream HTTP/1.1\r\n\r\n"));
+
+    Response resp;
+    std::string carry;
+    MZ_ASSERT_TRUE(readResponse(cli, &resp, 2000, &carry));
+    MZ_ASSERT_EQ(resp.status, 200);
+    // ★ 分块模式的两条硬性约定：必须声明 chunked、**不能**有 Content-Length
+    MZ_ASSERT_TRUE(resp.get("transfer-encoding").find("chunked") != std::string::npos);
+    MZ_ASSERT_FALSE(resp.has("content-length"));
+    MZ_ASSERT_STR_EQ(resp.body, std::string("chunk-1\nchunk-2\nchunk-3\n"));
+    ::close(cli);
+}
+
+MZ_TEST(ntimed_http_chunked_keeps_connection_usable) {
+    ServerFixture fx;
+    MZ_ASSERT_TRUE(fx.setup());
+    const int cli = connectTo(fx.server->port());
+    MZ_ASSERT_GT(cli, 0);
+    // 分块响应之后，同一条连接上还能正常发下一个请求（分帧没有把连接搞坏）
+    MZ_ASSERT_TRUE(sendAll(cli, "GET /stream HTTP/1.1\r\n\r\n"));
+    Response resp;
+    std::string carry;
+    MZ_ASSERT_TRUE(readResponse(cli, &resp, 2000, &carry));
+    MZ_ASSERT_EQ(resp.status, 200);
+
+    MZ_ASSERT_TRUE(sendAll(cli, "GET /nope HTTP/1.1\r\n\r\n"));
+    MZ_ASSERT_TRUE(readResponse(cli, &resp, 2000, &carry));
+    MZ_ASSERT_EQ(resp.status, 404);
+    MZ_ASSERT_EQ(fx.server->totalRequests(), 2u);
+    MZ_ASSERT_EQ(fx.server->tcp().totalAccepted(), 1u);   // 同一条连接
+    ::close(cli);
+}
+
+MZ_TEST(ntimed_http_range_single) {
+    ServerFixture fx;
+    MZ_ASSERT_TRUE(fx.setup());
+    const int cli = connectTo(fx.server->port());
+    MZ_ASSERT_GT(cli, 0);
+
+    // 先拿全量，作为切片比较的基准（不在用例里重复页面内容）
+    MZ_ASSERT_TRUE(sendAll(cli, "GET / HTTP/1.1\r\n\r\n"));
+    Response full;
+    std::string carry;
+    MZ_ASSERT_TRUE(readResponse(cli, &full, 2000, &carry));
+    MZ_ASSERT_EQ(full.status, 200);
+    MZ_ASSERT_STR_EQ(full.get("accept-ranges"), std::string("bytes"));
+    const size_t total = full.body.size();
+
+    MZ_ASSERT_TRUE(sendAll(cli, "GET / HTTP/1.1\r\nRange: bytes=0-9\r\n\r\n"));
+    Response part;
+    MZ_ASSERT_TRUE(readResponse(cli, &part, 2000, &carry));
+    MZ_ASSERT_EQ(part.status, 206);
+    MZ_ASSERT_EQ(part.body.size(), 10u);
+    MZ_ASSERT_STR_EQ(part.body, full.body.substr(0, 10));
+    MZ_ASSERT_STR_EQ(part.get("content-range"),
+                     std::string("bytes 0-9/") + std::to_string(total));
+    MZ_ASSERT_EQ(part.declared_length, part.body.size());   // 206 的 Content-Length 也要自洽
+    ::close(cli);
+}
+
+MZ_TEST(ntimed_http_range_open_ended) {
+    ServerFixture fx;
+    MZ_ASSERT_TRUE(fx.setup());
+    const int cli = connectTo(fx.server->port());
+    MZ_ASSERT_GT(cli, 0);
+    MZ_ASSERT_TRUE(sendAll(cli, "GET / HTTP/1.1\r\n\r\n"));
+    Response full;
+    std::string carry;
+    MZ_ASSERT_TRUE(readResponse(cli, &full, 2000, &carry));
+
+    // bytes=5- ：从 5 到末尾
+    MZ_ASSERT_TRUE(sendAll(cli, "GET / HTTP/1.1\r\nRange: bytes=5-\r\n\r\n"));
+    Response part;
+    MZ_ASSERT_TRUE(readResponse(cli, &part, 2000, &carry));
+    MZ_ASSERT_EQ(part.status, 206);
+    MZ_ASSERT_STR_EQ(part.body, full.body.substr(5));
+    ::close(cli);
+}
+
+MZ_TEST(ntimed_http_range_out_of_range_416) {
+    ServerFixture fx;
+    MZ_ASSERT_TRUE(fx.setup());
+    const int cli = connectTo(fx.server->port());
+    MZ_ASSERT_GT(cli, 0);
+    MZ_ASSERT_TRUE(sendAll(cli, "GET / HTTP/1.1\r\nRange: bytes=999999-\r\n\r\n"));
+    Response resp;
+    MZ_ASSERT_TRUE(readResponse(cli, &resp));
+    MZ_ASSERT_EQ(resp.status, 416);
+    MZ_ASSERT_TRUE(resp.get("content-range").find("bytes */") == 0);   // 格式：bytes */总长
+    MZ_ASSERT_EQ(fx.server->total4xx(), 1u);
+    ::close(cli);
+}
+
+MZ_TEST(ntimed_http_range_ignored_cases) {
+    ServerFixture fx;
+    MZ_ASSERT_TRUE(fx.setup());
+    const int cli = connectTo(fx.server->port());
+    MZ_ASSERT_GT(cli, 0);
+    MZ_ASSERT_TRUE(sendAll(cli, "GET / HTTP/1.1\r\n\r\n"));
+    Response full;
+    std::string carry;
+    MZ_ASSERT_TRUE(readResponse(cli, &full, 2000, &carry));
+
+    // 三种"不支持但合法/畸形"的 Range：一律忽略 → 200 全量（绝不给半吊子 206）
+    const char *ranges[] = {"bytes=0-1,3-4", "bytes=abc", "bytes=-5"};
+    for (const char *r : ranges) {
+        MZ_ASSERT_TRUE(sendAll(cli, std::string("GET / HTTP/1.1\r\nRange: ") + r + "\r\n\r\n"));
+        Response resp;
+        MZ_ASSERT_TRUE(readResponse(cli, &resp, 2000, &carry));
+        MZ_ASSERT_EQ(resp.status, 200);
+        MZ_ASSERT_EQ(resp.body.size(), full.body.size());
+    }
+    ::close(cli);
+}
+
+MZ_TEST(ntimed_http_api_stats) {
+    ServerFixture fx;
+    MZ_ASSERT_TRUE(fx.setup());
+    const int cli = connectTo(fx.server->port());
+    MZ_ASSERT_GT(cli, 0);
+
+    MZ_ASSERT_TRUE(sendAll(cli, "GET /nope HTTP/1.1\r\n\r\n"));   // 先制造一次 404
+    Response resp;
+    std::string carry;
+    MZ_ASSERT_TRUE(readResponse(cli, &resp, 2000, &carry));
+    MZ_ASSERT_EQ(resp.status, 404);
+
+    MZ_ASSERT_TRUE(sendAll(cli, "GET /api/stats HTTP/1.1\r\n\r\n"));
+    MZ_ASSERT_TRUE(readResponse(cli, &resp, 2000, &carry));
+    MZ_ASSERT_EQ(resp.status, 200);
+    MZ_ASSERT_TRUE(resp.get("content-type").find("application/json") != std::string::npos);
+    // 统计里必须能看到刚才那次 404（requests 计数在本次请求之前结算 → 1）
+    MZ_ASSERT_TRUE(resp.body.find("\"requests\":1") != std::string::npos);
+    MZ_ASSERT_TRUE(resp.body.find("\"4xx\":1") != std::string::npos);
+    MZ_ASSERT_TRUE(resp.body.find("\"sessions\":") != std::string::npos);
+    MZ_ASSERT_TRUE(resp.body.find("\"accepted\":") != std::string::npos);
+    ::close(cli);
 }

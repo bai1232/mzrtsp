@@ -10,7 +10,11 @@
 
 #include "http/http_response.h"
 
+#include "core/logger.h"
+
 #include <cstdio>
+#include <cstring>
+#include <utility>
 
 namespace mzmedia {
 
@@ -91,9 +95,9 @@ const std::string *HttpResponse::header(const std::string &name) const {
     return nullptr;
 }
 
-std::string HttpResponse::serialize() const {
+std::string HttpResponse::serializeHead() const {
     std::string out;
-    out.reserve(256 + _body.size());
+    out.reserve(256);
 
     char line[64] = {0};
     std::snprintf(line, sizeof(line), "HTTP/1.1 %d %s\r\n", _status, reasonPhrase(_status));
@@ -105,7 +109,12 @@ std::string HttpResponse::serialize() const {
         out += kv.second;
         out += "\r\n";
     }
-    if (!hasHeader("Content-Length")) {
+    if (_chunked) {
+        // 分块模式：**不能**有 Content-Length（长度在传输中才知道）
+        if (!hasHeader("Transfer-Encoding")) {
+            out += "Transfer-Encoding: chunked\r\n";
+        }
+    } else if (!hasHeader("Content-Length")) {
         std::snprintf(line, sizeof(line), "Content-Length: %zu\r\n", _body.size());
         out += line;
     }
@@ -113,8 +122,75 @@ std::string HttpResponse::serialize() const {
         out += "Connection: close\r\n";
     }
     out += "\r\n";
-    out += _body;
     return out;
+}
+
+std::string HttpResponse::serialize() const {
+    if (_chunked) {
+        return serializeHead();   // 分块模式下 body 由 sendChunk 负责（避免重复发送）
+    }
+    return serializeHead() + _body;
+}
+
+bool HttpResponse::setSender(Sender sender) {
+    if (!sender) {
+        ErrorP("HttpResponse::setSender 收到空的发送出口：拒绝（否则 beginChunked 无处可写）");
+        return false;
+    }
+    _sender = std::move(sender);
+    return true;
+}
+
+bool HttpResponse::beginChunked() {
+    if (_chunked) {
+        return true;
+    }
+    if (!_sender) {
+        ErrorP("HttpResponse::beginChunked 未注入发送出口（HttpSession 应调用 setSender）");
+        return false;
+    }
+    _chunked = true;
+    const std::string head = serializeHead();
+    return _sender(head.data(), head.size());
+}
+
+bool HttpResponse::sendChunk(const char *data, size_t len) {
+    if (!_chunked) {
+        ErrorP("HttpResponse::sendChunk 在非 chunked 模式下调用：拒绝");
+        return false;
+    }
+    if (data == nullptr || len == 0) {
+        return true;   // 空块：合法且无副作用（发 0 长度块等于结束，必须由 endChunked 显式做）
+    }
+    if (!_sender) {
+        return false;
+    }
+    char hex[32] = {0};
+    std::snprintf(hex, sizeof(hex), "%zx\r\n", len);
+    // 三段分开写：不复制大块数据（M6 的 FLV 块可能很大）
+    return _sender(hex, std::strlen(hex)) && _sender(data, len) && _sender("\r\n", 2);
+}
+
+bool HttpResponse::endChunked() {
+    if (!_chunked) {
+        return false;
+    }
+    if (_chunked_ended) {
+        return true;   // 幂等
+    }
+    if (!_sender) {
+        return false;
+    }
+    _chunked_ended = true;
+    return _sender("0\r\n\r\n", 5);
+}
+
+bool HttpResponse::chunked() const {
+    return _chunked;
+}
+
+bool HttpResponse::chunkedEnded() const {
+    return _chunked_ended;
 }
 
 const char *HttpResponse::reasonPhrase(int code) {

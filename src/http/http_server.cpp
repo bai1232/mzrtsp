@@ -18,6 +18,8 @@
 
 #include "core/logger.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <string>
 #include <utility>
@@ -41,6 +43,67 @@ const char *kTestPage =
     "</ul>\n"
     "</body>\n"
     "</html>\n";
+
+/**
+ * 单区间 Range（M3-c）：只支持 `bytes=a-b` / `bytes=a-`
+ * - 多区间（multipart/byteranges）、后缀区间 `-N`、畸形语法 → **忽略 Range 回 200** + Warn
+ *   （刻意的取舍：半吊子 206 比"明确不支持"更危险，见 DESIGN_M3 §8）
+ * - 起点越界 → 416
+ * @return true = 已按 206/416 处理；false = 按 200 全量返回
+ */
+bool serveStaticWithRange(const HttpParser &req, HttpResponse &resp, const std::string &body,
+                          const std::string &mime) {
+    resp.setContentType(mime);
+    resp.setHeader("Accept-Ranges", "bytes");
+
+    const std::string *range = req.header("Range");
+    if (range == nullptr || range->empty()) {
+        resp.setBody(body);
+        return false;
+    }
+    const std::string r = *range;
+    const auto ignore = [&](const char *why) {
+        WarnP("HttpServer: 忽略 Range（%s）: %s", why, r.c_str());
+        resp.setBody(body);
+        return false;
+    };
+    if (r.find(',') != std::string::npos) {
+        return ignore("不支持多区间");
+    }
+    if (r.compare(0, 6, "bytes=") != 0) {
+        return ignore("语法不认识");
+    }
+    const std::string spec = r.substr(6);
+    const size_t dash = spec.find('-');
+    if (dash == std::string::npos) {
+        return ignore("缺 '-'");
+    }
+    const std::string a_str = spec.substr(0, dash);
+    const std::string b_str = spec.substr(dash + 1);
+    if (a_str.empty() || a_str.find_first_not_of("0123456789") != std::string::npos) {
+        return ignore("起点非法（不支持后缀区间）");
+    }
+    if (!b_str.empty() && b_str.find_first_not_of("0123456789") != std::string::npos) {
+        return ignore("终点非法");
+    }
+    const long long total = static_cast<long long>(body.size());
+    const long long a = std::atoll(a_str.c_str());
+    long long b = b_str.empty() ? total - 1 : std::atoll(b_str.c_str());
+    if (a < 0 || a >= total || b < a) {
+        resp.setStatus(416);
+        resp.setHeader("Content-Range", "bytes */" + std::to_string(body.size()));
+        resp.setBody("416 Range Not Satisfiable\n");
+        return true;
+    }
+    if (b >= total) {
+        b = total - 1;   // 终点越界：按规范裁剪到末尾
+    }
+    resp.setStatus(206);
+    resp.setHeader("Content-Range", "bytes " + std::to_string(a) + "-" + std::to_string(b) + "/" +
+                                        std::to_string(body.size()));
+    resp.setBody(body.substr(static_cast<size_t>(a), static_cast<size_t>(b - a + 1)));
+    return true;
+}
 
 /// 解析错误 → HTTP 状态码（让客户端能自助定位；具体原因见响应 body）
 int statusForParseError(HttpParser::Error err) {
@@ -100,6 +163,11 @@ private:
             resp.setHeader("Allow", "GET");
             resp.setBody("405 Method Not Allowed（v0.1 只支持 GET）\n");
         } else if (HttpHandler handler = _owner->findHandler(_parser.path())) {
+            // 注入发送出口：处理器可以走 chunked 流式（M3-c 演示 / M6 的 FLV）
+            resp.setSender([this](const char *data, size_t len) {
+                // send() 返回 0 = 已入队未写出（**不是失败**）；只有 -1 才算失败
+                return send(data, len) >= 0;
+            });
             try {
                 handler(_parser, resp);
             } catch (const std::exception &e) {
@@ -117,6 +185,16 @@ private:
         }
 
         resp.setKeepAlive(_parser.keepAlive());
+        if (resp.chunked()) {
+            // 处理器自己把头和块发出去了：这里只兜底收尾
+            // （忘了发结束块会让客户端一直等 —— 那是"静默的挂住"，必须吵出来）
+            if (!resp.chunkedEnded()) {
+                WarnP("HttpServer: chunked 处理器未调用 endChunked()，这里补上");
+                resp.endChunked();
+            }
+            _owner->onRequestHandled(resp.status());
+            return;
+        }
         _owner->onRequestHandled(resp.status());
 
         const std::string wire = resp.serialize();
@@ -155,9 +233,48 @@ bool HttpServer::start(uint16_t port, const std::string &bind_ip) {
     }
     // 默认路由：只在用户没占用该路径时安装（可预期）
     if (!findHandler("/")) {
-        setRoute("/", [](const HttpParser &, HttpResponse &resp) {
-            resp.setContentType("text/html; charset=utf-8");
-            resp.setBody(kTestPage);
+        setRoute("/", [](const HttpParser &req, HttpResponse &resp) {
+            serveStaticWithRange(req, resp, kTestPage, "text/html; charset=utf-8");
+        });
+    }
+    if (!findHandler("/api/stats")) {
+        setRoute("/api/stats", [this](const HttpParser &, HttpResponse &resp) {
+            TcpServer &t = *_tcp;
+            char buf[640] = {0};
+            std::snprintf(buf, sizeof(buf),
+                          "{\"requests\":%llu,\"4xx\":%llu,\"5xx\":%llu,\"malformed\":%llu,"
+                          "\"sessions\":%zu,\"accepted\":%llu,\"rejected\":%llu,\"idleTimeout\":%llu,"
+                          "\"recvOverflow\":%llu,\"sendOverflow\":%llu,\"acceptError\":%llu}\n",
+                          static_cast<unsigned long long>(_total_requests.load()),
+                          static_cast<unsigned long long>(_total_4xx.load()),
+                          static_cast<unsigned long long>(_total_5xx.load()),
+                          static_cast<unsigned long long>(_total_malformed.load()),
+                          t.sessionCount(),
+                          static_cast<unsigned long long>(t.totalAccepted()),
+                          static_cast<unsigned long long>(t.totalRejected()),
+                          static_cast<unsigned long long>(t.totalIdleTimeout()),
+                          static_cast<unsigned long long>(t.totalRecvOverflow()),
+                          static_cast<unsigned long long>(t.totalSendOverflow()),
+                          static_cast<unsigned long long>(t.totalAcceptError()));
+            resp.setContentType("application/json; charset=utf-8");
+            resp.setBody(buf);
+        });
+    }
+    if (!findHandler("/stream")) {
+        setRoute("/stream", [](const HttpParser &, HttpResponse &resp) {
+            // chunked 流式演示：头先发、数据分块发 —— M6 的 FLV 就是这个形状
+            if (!resp.beginChunked()) {
+                resp.setStatus(500);
+                resp.setBody("500 beginChunked 失败\n");
+                return;
+            }
+            for (int i = 1; i <= 3; ++i) {
+                const std::string chunk = "chunk-" + std::to_string(i) + "\n";
+                if (!resp.sendChunk(chunk.data(), chunk.size())) {
+                    return;   // 发送失败：连接已坏，交给 Session 的 onError/关闭路径
+                }
+            }
+            resp.endChunked();
         });
     }
     if (!findHandler("/live/x.flv")) {

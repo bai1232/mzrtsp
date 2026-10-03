@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -41,11 +42,33 @@ public:
     /// 状态码对应的 reason phrase（未知码返回 "Unknown"）
     static const char *reasonPhrase(int code);
 
+    // ------------------------------------------------------------------
+    // chunked 流式（M3-c）：给 M6 的 FLV 用
+    // ------------------------------------------------------------------
+
+    /// 发送出口（由 HttpSession 注入：把字节写进 Session）。返回 false = sender 为空
+    using Sender = std::function<bool(const char *data, size_t len)>;
+    bool setSender(Sender sender);
+
+    /// 进入 chunked 模式并立刻发状态行 + 头（`Transfer-Encoding: chunked`，**不发** Content-Length）
+    bool beginChunked();
+    /// 发一块（len == 0 视为空操作返回 true；未进入 chunked 模式返回 false）
+    bool sendChunk(const char *data, size_t len);
+    /// 发结束块 `0\r\n\r\n`（幂等）
+    bool endChunked();
+    bool chunked() const;
+    bool chunkedEnded() const;
+
 private:
+    /// 只序列化状态行 + 头（chunked 与非 chunked 共用）
+    std::string serializeHead() const;
     int _status;
     bool _keep_alive = true;
     std::vector<std::pair<std::string, std::string>> _headers;
     std::string _body;
+    Sender _sender;
+    bool _chunked = false;
+    bool _chunked_ended = false;
 };
 
 } // namespace mzmedia

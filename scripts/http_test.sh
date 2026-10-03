@@ -114,13 +114,39 @@ out=$(curl -s -o /dev/null -w '%{http_code} ' "$BASE/" --next -s -o /dev/null -w
 echo "  两次请求的状态码：$out"
 [ "$out" = "200 200" ]; check "一条连接上两次请求都成功" $?
 
+echo "== 9) chunked 流式（curl -N） =="
+code=$(curl -s -N -o "$BODY" -D "$HDRS" -w '%{http_code}' --max-time 5 "$BASE/stream")
+echo "  GET /stream → $code"
+grep -qi '^transfer-encoding: *chunked' "$HDRS"; check "声明 Transfer-Encoding: chunked" $?
+if grep -qi '^content-length:' "$HDRS"; then cl=1; else cl=0; fi
+[ "$cl" -eq 0 ]; check "chunked 响应没有 Content-Length" $?
+grep -q 'chunk-3' "$BODY"; check "curl -N 收到全部块数据" $?
+
+echo "== 10) Range（单区间 206 / 越界 416） =="
+code=$(curl -s -o "$BODY" -D "$HDRS" -w '%{http_code}' -r 0-9 "$BASE/")
+size=$(stat -c%s "$BODY")
+echo "  Range: bytes=0-9 → $code, 长度 $size"
+[ "$code" = "206" ]; check "Range 返回 206" $?
+[ "$size" = "10" ]; check "只返回请求的 10 字节" $?
+grep -qi '^content-range: *bytes 0-9/' "$HDRS"; check "带 Content-Range: bytes 0-9/总长" $?
+code=$(curl -s -o /dev/null -w '%{http_code}' -r 999999- "$BASE/")
+echo "  Range: bytes=999999- → $code"
+[ "$code" = "416" ]; check "越界 Range 返回 416" $?
+
+echo "== 11) /api/stats =="
+code=$(curl -s -o "$BODY" -w '%{http_code}' "$BASE/api/stats")
+echo "  GET /api/stats → $code"
+[ "$code" = "200" ]; check "/api/stats 返回 200" $?
+if grep -q '"requests":' "$BODY" && grep -q '"sessions":' "$BODY" && grep -q '"sendOverflow":' "$BODY"; then ok=0; else ok=1; fi
+[ "$ok" -eq 0 ]; check "stats 是 JSON 且含 requests/sessions/sendOverflow" $?
+
 echo "== 服务器统计（来自日志） =="
 grep '统计：' "$LOGFILE" | tail -1 || true
 rm -f "$BODY" "$HDRS"
 
 echo "------------------------------------------------------------------------"
 if [ "$fails" -eq 0 ]; then
-    echo "结论：M3-b 验收全部通过"
+    echo "结论：M3 验收全部通过（M3-b + M3-c）"
 else
     echo "结论：$fails 项失败（日志：$LOGFILE）"
 fi
