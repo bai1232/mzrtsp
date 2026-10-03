@@ -104,6 +104,7 @@ ffplay -f flv http://127.0.0.1:8080/live/sample.flv
 | [docs/DESIGN_M2.md](docs/DESIGN_M2.md) | **网络层设计（M2）**：组件接口形状、机制、分批计划、风险清单、决策记录 |
 | [docs/DESIGN_M3.md](docs/DESIGN_M3.md) | **HTTP 层设计（M3）**：解析器契约与上限、分帧/keep-alive/chunked/Range、决策记录 |
 | [docs/DESIGN_M4.md](docs/DESIGN_M4.md) | **FFmpeg 封装设计（M4）**：AvPtr RAII、时间基换算与单调守卫、Demuxer 上限与观测、决策记录 |
+| [docs/DESIGN_M5.md](docs/DESIGN_M5.md) | **媒体分发设计（M5）**：MediaPacket 零拷贝、FrameQueue 上限与丢帧策略、GopCache 接入保证、MediaSource 订阅者生命周期 |
 | [docs/AV_BASICS.md](docs/AV_BASICS.md) | **音视频基础（本项目需要的 20%）**：容器/编码、I-P-B、pts/dts、time_base、SPS/PPS；每条概念配可自己跑的命令 |
 | [docs/RETROSPECTIVE.md](docs/RETROSPECTIVE.md) | **复盘总结**：技术坑库（现象→根因→修复→防回归用例）、测量工具误判、决策与代价、AI 协作复盘、简历素材 |
 | [docs/VERSIONING.md](docs/VERSIONING.md) | **版本与发布强制要求**（每版必推 Git、必打 tag、可回滚） |

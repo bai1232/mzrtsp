@@ -104,6 +104,11 @@ set(MZMEDIA_SOURCES
         # M4-b CodecMatrix + H264 工具
         src/ffmpeg/codec_matrix.cpp
         src/ffmpeg/h264_util.cpp
+        # M5-a 媒体分发（MediaPacket / FrameQueue / GopCache / MediaSource）
+        src/media/media_packet.cpp
+        src/media/frame_queue.cpp
+        src/media/gop_cache.cpp
+        src/media/media_source.cpp
         )
 
 # 骨架阶段（第 1 批）没有任何源文件，此时不能创建 STATIC 库目标

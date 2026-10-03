@@ -35,6 +35,8 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_http_server.cpp
         # ---- M4-a FFmpeg 封装 ----
         ${CMAKE_CURRENT_SOURCE_DIR}/test_ffmpeg.cpp
+        # ---- M5-a 媒体分发 ----
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_media.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS
@@ -73,6 +75,9 @@ set(MZMEDIA_TEST_GROUPS
         # ---- M4-a FFmpeg 封装 ----
         # 纯函数式 demux（无并发、无等待），进严格组。
         ffmpeg
+        # ---- M5-a 媒体分发 ----
+        # 单线程纯策略（无内部线程、无等待）→ 进 TSAN 严格组。
+        media
         )
 
 add_executable(mzmedia_unittest ${MZMEDIA_TEST_SOURCES})

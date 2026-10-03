@@ -205,6 +205,26 @@
 - 遗留（另案，不改代码）：`timer_precision` 的计时门禁在**单进程全量上下文**下会红
   （单独跑 6/6 绿；差 1ms）→ 计时结论以分组门禁为准，规矩记入 `docs/TESTING.md` §2.2
 
+#### M5-a 媒体分发（MediaPacket / FrameQueue / GopCache / MediaSource）
+- 新增 `src/media/`：`MediaPacket`（**不可变**编码包，零拷贝分发的载体）、`FrameQueue`（每订阅者
+  一个的有界队列，FR-5.1）、`GopCache`（最近 1 个 GOP，供中途接入）、`MediaSource` + `Subscriber`
+  （一源多消费者、`weak_ptr` 自动注销，NFR-6）
+- **单线程契约**（本批刻意不引入线程）：策略与线程正交，用例才能确定性覆盖；跨线程投递留 M5-b
+- 关键策略：**音频与视频关键帧绝不丢**（`MediaPacket::droppable()`）；`push` 返回**四态**
+  （`Accepted` / `DroppedToMakeRoom` / `DroppedIncoming` / `RejectedNoSpace`）——"丢掉新包"与
+  "不可丢的包进不去"分开，后者置位 `Subscriber::broken()` 由连接层断开（FR-5.2）
+- 上限不可绕过：`setLimits(0)` 或超过硬上限一律被拒**且保持原值**（FR-5.1 + AI_COLLAB §4.6）
+- 新接入订阅者灌 GOP 缓存，**保证第一条是视频关键帧**；关键帧比队列上限还大 → **拒绝接入**
+  （宁可拒接，也不让对端从 GOP 中间开始花屏）
+- 测试：`tests/test_media.cpp` **12 用例 / 340 断言**（新分组 `media`，单线程 → 进 TSAN 严格组）；
+  覆盖 正常/空/满/断开/超大 五维（清单见 `docs/DESIGN_M5.md` §5）
+- 变异验证（改坏即红）：① 让音频变成可丢 → 3 个用例红；② 不灌 GOP 缓存 → 接入用例红
+- 文档：新增 `docs/DESIGN_M5.md`；`docs/ROADMAP.md` 的 M5 行与 `docs/TESTING.md` §7 补齐
+  **FR-5.1 / FR-5.2 / FR-5.3 / NFR-6** 的编号引用（三方对齐机检通过）
+- 测试总数：**185 用例**（此前 173）
+- 实测修正（另案，只改文档）：`timer_precision` 在**并行** `ctest -j4` 下会红（4 个测试进程抢 CPU），
+  串行/单跑绿 → 计时门禁规矩改为"**串行、无干扰**下取结论"，见 `docs/TESTING.md` §2.2
+
 ### 说明
 - `v0.1.0` 尚未发布。按 `VERSIONING.md`，tag 只能打在**可独立构建且测试通过**的提交上。
 - M1（Core 层）已完成并推送；后续进入 M2（网络层：EventPoller / TcpServer / Session）。

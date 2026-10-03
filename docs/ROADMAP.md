@@ -12,7 +12,7 @@
 | **M2** Network | `PipeWrap`、`EventPoller`（epoll ET/LT、跨线程 `async`）、`Timer`、`Socket`、`Buffer`、`TcpServer`、`Session`、**连接空闲检测与心跳钩子（FR-4.4：读空闲 60s / 写阻塞 30s）+ TCP KeepAlive** | 可用的 TCP 服务端 | `echo` 示例用 `nc` 回显 100MB 无错；定时器精度：**0 早触发** + 相对宿主裸 `nanosleep` 基线的增量 ≤5ms（绝对 ±10ms 门禁在本宿主实测不可达，数据见 `docs/DESIGN_M2.md` §7.1 / §8 R11）；**空闲超时按 FR-4.4 触发，断开后 fd 回落（NFR-6）** |
 | **M3** Http | `HttpParser`、`HttpServer`、`HttpConnection`、chunked、CORS、Range、内置测试页 | 可访问的 HTTP 服务 | `curl` 取到测试页；chunked 响应可被 `curl -N` 流式接收 |
 | **M4** FFmpeg 封装 | `AvPtr` 系列（RAII）、`Demuxer`、`CodecMatrix`、时间基换算 | 能解封装 MP4/H264 | 单测：从样本 MP4 解出正确的流参数；裸流能提取 SPS/PPS 并报出分辨率 |
-| **M5** Media | `MediaSource`、`SourceManager`、`Subscriber`、`FrameQueue`、`GopCache`、节流 | 一源多消费者分发 | 单测：3 个订阅者收到完全一致的帧序列；慢订阅者丢帧但关键帧不丢 |
+| **M5** Media | `MediaPacket`、`FrameQueue`、`GopCache`、`Subscriber`、`MediaSource`（**M5-a**，设计见 `docs/DESIGN_M5.md`）；`SourceManager` + 源线程驱动 + 跨线程投递（**M5-b**）；节流 FR-3.5 + 30s 写阻塞串通 + 丢帧计数进 `/api/stats`（**M5-c**） | 一源多消费者分发 | 单测（分组 `media`，清单见 `docs/DESIGN_M5.md` §5）：3 个订阅者收到**完全一致**的帧序列（每帧指针相同 = 零拷贝）；慢订阅者丢帧但**关键帧与音频不丢**（**FR-5.2**：溢出优先丢非关键帧并累加计数，关键帧腾不出空间则断开该订阅者）；每个订阅者队列上限 **64 帧或 8MB（先到者为准，FR-5.1）**，`0`/无界被拒；任一订阅者异常不影响源与其他订阅者（**FR-5.3**）；订阅者释放后自动注销、队列 100% 回收（**NFR-6**） |
 | **M6** Output | `FlvSender`、FLV 封装（AVC sequence header、AAC sequence header、per-client 时间戳基准） | **能播了** | **`ffplay` 出画面、有声音**；10 路并发各自播放 5 分钟无异常 |
 | **M7** 收尾 | 集成验收、`scripts/` 验证脚本、文档补齐、性能数据采集 | 可发布版本 | 全部 SC/NFR 验收通过；`v0.1.0` 打 tag 并推送 |
 

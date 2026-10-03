@@ -60,15 +60,22 @@ MZ_TEST(timestamp_rational_conversion) {
 | 分组跑（`ctest`）/ `scripts/tsan.sh` | **验收门禁**（每个分组独立进程，天然隔离） |
 | 单进程跑全部（`./build/bin/mzmedia_unittest`） | **诊断手段**：查"用例之间是否串味" |
 
-计时类用例在单进程上下文里会受宿主调度影响。实测 `timer_precision`：
+计时类用例在单进程上下文里会受宿主调度影响。实测 `timer_precision`（判据是
+`min(库) ≤ min(裸) + 5ms`，只差 1ms 就会翻面）：
 
-- 单独跑（`./build/bin/mzmedia_unittest timer_precision`）连跑 6 次全绿；`ctest -R '^timer$'` 3.5s 稳过
-- 单进程全量跑时见过红：修前 3 次全量跑里出现过 1 次"8 个 ffmpeg 假红之外的额外 1 红"（当时未定位），
-  修后 2 次都是它；红时两组最小值只差 1ms（`min(库)=7~8ms` vs `min(裸)=1~2ms + 5ms`）
+| 跑法 | 实测结果 |
+|---|---|
+| 单独跑该分组（`ctest -R '^timer$'`） | 连续 3 次**全绿**（3.5s） |
+| **并行**跑全部分组（`ctest -j4`） | **红**（4 个测试进程抢 CPU） |
+| 单进程跑全部用例 | 见过红（本轮 2 次红、1 次绿） |
 
-【推论】判为宿主/上下文抖动，**未做对照实验**（依据：① 单独跑与分组跑均绿；② 本节 §8 R11 已实测本宿主唤醒延迟 0~14ms 且与延时长短无关）。
-**计时结论一律以分组门禁为准**，不要把单进程全量跑的计时结果当精度指标。
-（该门禁本身的余量问题另案处理，见 `docs/DESIGN_M2.md` §8 R11。）
+**规矩**：计时结论只在**串行、无干扰**下取 —— 用 `ctest --output-on-failure`（不带 `-j`，与
+`VERSIONING.md` 发版清单一致），或单跑该分组。**不要**用 `ctest -j4` / 单进程全量跑的结果当精度指标。
+
+【推论】红的根因判为宿主调度/CPU 争用，**未做对照实验**（依据：① 同一二进制单跑绿、并行红；
+② 本节 §8 R11 已实测本宿主唤醒延迟 0~14ms 且与延时长短无关；③ 该门禁比较的是**两个独立噪声
+分布的最小值**，+5ms 余量本身就偏紧）。
+（该门禁的余量问题另案处理，见 `docs/DESIGN_M2.md` §8 R11。）
 
 ## 3. 集成测试（ffprobe 校验，可自动化）
 
@@ -147,9 +154,11 @@ curl -s http://127.0.0.1:8080/api/stats | python3 -m json.tool
 | NFR-1 首帧 <1s | 浏览器 Performance 面板 / 日志打点（请求到首字节） |
 | NFR-4 remux CPU <5% | `top -H -p $(pgrep mzmedia)` 观察单路负载 |
 | NFR-5 转码 ≥1.0x | `/api/stats` 的 `speed` 字段 |
-| NFR-6 资源回收 | 断开前后对比 `/api/stats` 与 `/proc/<pid>/fd` |
+| NFR-6 资源回收 | 断开前后对比 `/api/stats` 与 `/proc/<pid>/fd`；单测 `media`：订阅者 `shared_ptr` 释放后由 `weak_ptr` **自动注销**、其队列被回收 |
 | ROADMAP M2 验收：定时器精度 | 单测 `timer` 分组（`tests/test_network_timer.cpp`，用例清单见 `DESIGN_M2.md` §7.1）：**0 早触发** + 相对宿主裸 `nanosleep` 基线增量 ≤5ms。**绝对 ±10ms 在本宿主实测不可达**（裸 `nanosleep` 自身的超出量就有 0~14ms，且与延时长短无关），原始数据见 `DESIGN_M2.md` §7.1 / §8 R11 |
-| FR-5.2 慢客户端丢帧 | `tc` 限速或 `kill -STOP` 阻塞客户端，观察 `dropped` 计数与其他客户端 |
+| FR-5.1 每客户端队列上限（64 帧 / 8MB，先到者为准） | 单测 `media` 分组（`tests/test_media.cpp`，清单见 `docs/DESIGN_M5.md` §5）：帧数上限与字节上限**各自**能触发；`setLimits(0)` 被拒（有界性不可协商） |
+| FR-5.2 慢客户端丢帧 | 单测 `media`：溢出只丢 `droppable()`（视频非关键帧），**音频与视频关键帧不丢**；关键帧腾不出空间 → `RejectedNoSpace`（调用方断开该订阅者）。集成：`tc` 限速或 `kill -STOP` 阻塞客户端，观察 `dropped` 计数与其他客户端 |
+| FR-5.3 隔离性 | 单测 `media`：一个订阅者（一直不取帧）持续溢出，其他订阅者的帧序列仍**逐帧一致**（每帧指针相同） |
 | FR-4.4 连接上限 / 读空闲 / 写阻塞 | 单测：连接上限设为 1 时第 2 个连接被拒且 `totalRejected()` 增长；`recv_idle=50ms` + 连上不发数据的客户端 → 阈内断开且 `onError` 为超时；`send_blocked=50ms` + 只连不读的客户端 → 断开且 `bytesOut` 停止增长 |
 | 各 codec 组合 | `CODEC_MATRIX.md` 每个组合一条 ffprobe 用例 |
 

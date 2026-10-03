@@ -66,3 +66,9 @@
 #include "ffmpeg/codec_matrix.h"
 #include "ffmpeg/h264_util.h"
 #include "ffmpeg/demuxer.h"
+
+// M5 媒体分发（已接入）
+#include "media/media_packet.h"
+#include "media/frame_queue.h"
+#include "media/gop_cache.h"
+#include "media/media_source.h"
