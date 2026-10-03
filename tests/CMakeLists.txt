@@ -33,6 +33,8 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_http_parser.cpp
         # ---- M3-b HTTP 服务端 ----
         ${CMAKE_CURRENT_SOURCE_DIR}/test_http_server.cpp
+        # ---- M4-a FFmpeg 封装 ----
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_ffmpeg.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS
@@ -68,6 +70,9 @@ set(MZMEDIA_TEST_GROUPS
         # ---- M3-b HTTP 服务端 ----
         # 只用 socket 超时 + sleepMs 轮询（不用 cv 超时接口）→ 无已知误报机制，进严格组。
         ntimed_http
+        # ---- M4-a FFmpeg 封装 ----
+        # 纯函数式 demux（无并发、无等待），进严格组。
+        ffmpeg
         )
 
 add_executable(mzmedia_unittest ${MZMEDIA_TEST_SOURCES})

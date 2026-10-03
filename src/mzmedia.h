@@ -60,3 +60,7 @@
 #include "http/http_parser.h"
 #include "http/http_response.h"
 #include "http/http_server.h"
+
+// M4 FFmpeg 封装（已接入）
+#include "ffmpeg/time_base.h"
+#include "ffmpeg/demuxer.h"

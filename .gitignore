@@ -38,3 +38,6 @@ media/*.mp4
 # 系统
 .DS_Store
 Thumbs.db
+
+# M4 的测试样本由 scripts/make_samples.sh 现场生成，不入库
+/samples/

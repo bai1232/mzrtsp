@@ -152,6 +152,23 @@
 - `scripts/tsan.sh`：自动优先 `g++-12`、换编译器时自动清理 `build-tsan`、未装时打印提示；
   FP 分组逻辑保留以兼容 GCC 11 环境
 
+#### M4-a FFmpeg 封装（AvPtr / time_base / Demuxer）
+- 新增 `src/ffmpeg/av_ptr.h`：`AvPtr<T, void(*)(T**)>` RAII（format/codec ctx、packet、frame、dict）；
+  工厂失败返回 nullptr + ErrorP（不抛不静默）；open 失败时显式 `avformat_free_context`（否则每次失败漏一个 ctx）
+- 新增 `src/ffmpeg/time_base.h`（**不依赖 FFmpeg**）：整数换算 + `__int128` 溢出判定（失败返回 false，
+  不截断）；`MonotonicGuard` 把时间戳回退钳住并**计数**（播放器把 dts 回退当跳帧）
+- 新增 `src/ffmpeg/demuxer.h/.cpp`：`open` → 报流信息（codec/宽高/采样率/时基/帧率）→ `readPacket`；
+  `ReadResult{Packet,Eof,Error}`（EOF 与错误必须分开）；四条硬约束：`max_streams`（超限拒绝打开）、
+  `max_packet_size`（超限拒绝 + 计数）、open/read 超时（**interrupt_callback** 真正中断）、
+  时间戳换算/缺失与回退全部计数
+- 新增 `scripts/make_samples.sh`：用本机 ffmpeg **现场生成**样本（mp4 / h264 裸流 / 随机字节），
+  不入库（`.gitignore` 加 `/samples/`）
+- CMake：M4 起 **FFmpeg 为必需依赖**（缺 libav* 直接 FATAL_ERROR 报错，不悄悄少编模块）
+- 测试：`tests/test_ffmpeg.cpp` **11 用例 / 1024 断言**（新分组 `ffmpeg`，进 TSAN 严格组）；
+  覆盖 正常/空/满/断开/超大 五维（清单见提交说明）
+- 实现中修的两个自测问题：① ctest 的 cwd 是 `build/tests/`，样本候选路径少一级；
+  ② 框架断言**不中断执行**，断言失败后解引用空指针 → 段错误（改为显式 `return` 早退）
+
 ### 说明
 - `v0.1.0` 尚未发布。按 `VERSIONING.md`，tag 只能打在**可独立构建且测试通过**的提交上。
 - M1（Core 层）已完成并推送；后续进入 M2（网络层：EventPoller / TcpServer / Session）。

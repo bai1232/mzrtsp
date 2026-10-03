@@ -99,13 +99,30 @@ set(MZMEDIA_SOURCES
         # M3-b HTTP 服务端
         src/http/http_response.cpp
         src/http/http_server.cpp
+        # M4-a FFmpeg 封装
+        src/ffmpeg/demuxer.cpp
         )
 
 # 骨架阶段（第 1 批）没有任何源文件，此时不能创建 STATIC 库目标
 # （CMake 不允许无源文件的 add_library），因此做存在性判断。
+# ---- FFmpeg（M4 起**必需**；SPEC §7 锁定 4.x）----
+# 缺库必须**明确报错**，而不是"悄悄少编一个模块"（那种假成功最难查）
+find_path(AVFORMAT_INCLUDE_DIR libavformat/avformat.h)
+find_library(AVFORMAT_LIB avformat)
+find_library(AVCODEC_LIB avcodec)
+find_library(AVUTIL_LIB avutil)
+if(NOT AVFORMAT_INCLUDE_DIR OR NOT AVFORMAT_LIB OR NOT AVCODEC_LIB OR NOT AVUTIL_LIB)
+    message(FATAL_ERROR
+            "M4 起需要 FFmpeg 开发库：libavformat / libavcodec / libavutil。\n"
+            "Ubuntu: sudo apt install -y libavformat-dev libavcodec-dev libavutil-dev")
+endif()
+
 if(MZMEDIA_SOURCES)
     add_library(mzmedia STATIC ${MZMEDIA_SOURCES})
     add_library(mzmedia::mzmedia ALIAS mzmedia)
+    # FFmpeg 是**公开**依赖：使用方（examples/tests）会看到 libav* 的类型
+    target_include_directories(mzmedia PUBLIC ${AVFORMAT_INCLUDE_DIR})
+    target_link_libraries(mzmedia PUBLIC ${AVFORMAT_LIB} ${AVCODEC_LIB} ${AVUTIL_LIB})
 
     target_include_directories(mzmedia
             PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>

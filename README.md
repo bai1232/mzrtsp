@@ -103,6 +103,7 @@ ffplay -f flv http://127.0.0.1:8080/live/sample.flv
 | [docs/TESTING.md](docs/TESTING.md) | 验收与测试方法（ffprobe 校验、并发、1 小时长跑） |
 | [docs/DESIGN_M2.md](docs/DESIGN_M2.md) | **网络层设计（M2）**：组件接口形状、机制、分批计划、风险清单、决策记录 |
 | [docs/DESIGN_M3.md](docs/DESIGN_M3.md) | **HTTP 层设计（M3）**：解析器契约与上限、分帧/keep-alive/chunked/Range、决策记录 |
+| [docs/DESIGN_M4.md](docs/DESIGN_M4.md) | **FFmpeg 封装设计（M4）**：AvPtr RAII、时间基换算与单调守卫、Demuxer 上限与观测、决策记录 |
 | [docs/VERSIONING.md](docs/VERSIONING.md) | **版本与发布强制要求**（每版必推 Git、必打 tag、可回滚） |
 | [docs/GIT_WORKFLOW.md](docs/GIT_WORKFLOW.md) | 分支模型与提交规范 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更记录 |
