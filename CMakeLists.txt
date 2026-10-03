@@ -94,6 +94,8 @@ set(MZMEDIA_SOURCES
         # M2-3b 会话与服务器
         src/network/session.cpp
         src/network/tcp_server.cpp
+        # M3-a HTTP 解析
+        src/http/http_parser.cpp
         )
 
 # 骨架阶段（第 1 批）没有任何源文件，此时不能创建 STATIC 库目标

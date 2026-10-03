@@ -55,3 +55,6 @@
 #include "network/socket.h"
 #include "network/session.h"
 #include "network/tcp_server.h"
+
+// M3 HTTP 层（已接入）
+#include "http/http_parser.h"

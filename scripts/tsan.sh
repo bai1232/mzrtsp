@@ -43,7 +43,7 @@ BUILD="$ROOT/build-tsan"
 
 # 注意：变量名刻意不叫 GROUPS —— bash 把 $GROUPS 保留为"当前用户所属组 ID 数组"，
 # 赋值会被忽略，$GROUPS 会展开成 gid（例如 1000），导致循环只跑一次且组名是数字。
-STRICT_GROUPS="selftest util logger queue pool semaphore core poller timer buffer"
+STRICT_GROUPS="selftest util logger queue pool semaphore core poller timer buffer http"
 FP_GROUPS="qtimed ptimed ntimed"
 
 if [ "${1:-}" != "--no-build" ]; then

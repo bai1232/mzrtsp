@@ -29,6 +29,8 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_network_buffer.cpp
         # ---- M2-3b 会话与服务器 ----
         ${CMAKE_CURRENT_SOURCE_DIR}/test_network_session.cpp
+        # ---- M3-a HTTP 解析 ----
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_http_parser.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS
@@ -58,6 +60,9 @@ set(MZMEDIA_TEST_GROUPS
         # ---- M2-3b 会话与服务器 ----
         # 带时间维度（等连接建立 / 等超时发生）：按 §6 约定单独命名，和严格组分开跑 TSAN。
         ntimed
+        # ---- M3-a HTTP 解析 ----
+        # 纯内存解析、单线程、无等待 → 进 TSAN 严格组。
+        http
         )
 
 add_executable(mzmedia_unittest ${MZMEDIA_TEST_SOURCES})
