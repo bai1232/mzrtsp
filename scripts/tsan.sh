@@ -41,6 +41,22 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="$ROOT/build-tsan"
 
+# ---------------------------------------------------------------------------
+# 编译器选择：**优先 g++-12**
+#   GCC 11 的 libtsan 对 std::condition_variable 的超时接口（pthread_cond_clockwait）
+#   没有拦截器 → "double lock / data race" 误报（见头部第 2 条），而且**间歇出现**
+#   （负载不同就会复现），会让门禁时不时变红。
+#   装上 g++-12 后本脚本会自动改用它，误报从根上消失（不需要改分组）。
+#   换编译器时必须清理构建目录（CMakeCache 记着旧编译器，直接重配会报错）。
+# ---------------------------------------------------------------------------
+CXX_BIN="$(command -v g++-12 2> /dev/null || true)"
+DESIRED_CXX="${CXX_BIN:-$(command -v g++ 2> /dev/null || echo g++)}"
+MARKER="$BUILD/.compiler"
+if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" != "$DESIRED_CXX" ]; then
+    echo "== 编译器从 $(cat "$MARKER") 换成 $DESIRED_CXX：清理 $BUILD 后重新配置 =="
+    rm -rf "$BUILD"
+fi
+
 # 注意：变量名刻意不叫 GROUPS —— bash 把 $GROUPS 保留为"当前用户所属组 ID 数组"，
 # 赋值会被忽略，$GROUPS 会展开成 gid（例如 1000），导致循环只跑一次且组名是数字。
 STRICT_GROUPS="selftest util logger queue pool semaphore core poller timer buffer http ntimed_http"
@@ -48,8 +64,10 @@ FP_GROUPS="qtimed ptimed ntimed"
 
 if [ "${1:-}" != "--no-build" ]; then
     echo "== 配置并编译 TSAN 构建 =="
-    cmake -B "$BUILD" -DMZMEDIA_ENABLE_TSAN=ON -DCMAKE_BUILD_TYPE=Debug "$ROOT" > /dev/null || exit 1
+    cmake -B "$BUILD" -DMZMEDIA_ENABLE_TSAN=ON -DCMAKE_BUILD_TYPE=Debug \
+        ${CXX_BIN:+-DCMAKE_CXX_COMPILER="$CXX_BIN"} "$ROOT" > /dev/null || exit 1
     cmake --build "$BUILD" -j"$(nproc)" > /dev/null || exit 1
+    mkdir -p "$BUILD" && printf '%s' "$DESIRED_CXX" > "$MARKER"
 fi
 
 if [ ! -x "$BUILD/bin/mzmedia_unittest" ]; then
@@ -116,6 +134,12 @@ check_group() {
         known_fp=$((known_fp + reports))
     fi
 }
+
+if [ -z "$CXX_BIN" ]; then
+    echo "提示：未装 g++-12（当前用 $DESIRED_CXX）。GCC 11 的 libtsan 会对'带超时的等待'产生"
+    echo "      间歇误报（semaphore/qtimed/ptimed 组）。执行 sudo apt install -y g++-12 后重跑"
+    echo "      本脚本即会从根上消除（脚本会自动改用它）。"
+fi
 
 echo "== 严格组（不含超时等待，必须 0 报告）=="
 for group in $STRICT_GROUPS; do
