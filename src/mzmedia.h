@@ -58,3 +58,5 @@
 
 // M3 HTTP 层（已接入）
 #include "http/http_parser.h"
+#include "http/http_response.h"
+#include "http/http_server.h"

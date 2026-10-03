@@ -117,6 +117,24 @@
 - 文档：新增 `docs/DESIGN_M3.md`（范围/分层/解析器契约与上限/机制/分批/风险/决策/未决）
 - 测试总数：**130 个用例**（M1 61 + M2 49 + M3-a 19）
 
+#### M3-b HTTP 服务端（HttpSession / 路由 / 错误码 / CORS）
+- 新增 `src/http/http_response.h/.cpp`：响应构造 + 序列化（纯函数，可单测）；自动补
+  `Content-Length`（头与实际不一致是最难查的一类问题）；只在要关闭时发 `Connection: close`
+- 新增 `src/http/http_server.h/.cpp`：`HttpServer` = `TcpServer` + 路由 + 错误语义 + CORS + 观测；
+  内部 `HttpSession`（重写 `onRecv`：`HttpParser` 分帧 → 路由 → 序列化 → `Session::send`，
+  循环 `reset()` 支持粘包/管线化）
+- 错误语义：400（畸形）/414（行或 URI 超长）/431（头部超限）/404（无路由）/405（非 GET，
+  带 `Allow: GET`）/500（handler 抛异常，**异常不穿透事件循环**）/501（媒体路由，M6 实现）
+- CORS：所有响应带 `Access-Control-Allow-Origin: *`（FR-4.3）；基础头由 `makeResponse()`
+  统一给，处理器可覆盖
+- 新增 `examples/http_server.cpp`（可运行示例 + curl 验收载体）、`scripts/http_test.sh`（8 项）
+- 测试：`tests/test_http_server.cpp` **14 个用例 / 118 断言**，进 TSAN 严格组（新增分组
+  `ntimed_http`）；覆盖 正常/空/满/断开/超大 五维（清单见提交说明）
+- 验收：`./scripts/http_test.sh` **8/8 全过**（测试页 200 且 Content-Length 一致、CORS、
+  自定义路由、404、405+Allow、501、400、keep-alive 复用两次请求）
+- 实现中修正的两点：①处理器自建的响应漏了 CORS/Server 头 → 改为从 `makeResponse(200)` 起步；
+  ②测试助手一次 `recv` 会把管线化的第二个响应一起读走 → 加 `carry`（客户端的"分帧"）
+
 ### 说明
 - `v0.1.0` 尚未发布。按 `VERSIONING.md`，tag 只能打在**可独立构建且测试通过**的提交上。
 - M1（Core 层）已完成并推送；后续进入 M2（网络层：EventPoller / TcpServer / Session）。

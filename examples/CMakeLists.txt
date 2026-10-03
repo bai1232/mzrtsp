@@ -16,3 +16,7 @@ target_link_libraries(core_demo PRIVATE mzmedia)
 # M2 起：网络层可运行示例（同时是 FR-4.4 / NFR-2 的验收工具，配 scripts/echo_test.sh）
 add_executable(echo_server echo_server.cpp)
 target_link_libraries(echo_server PRIVATE mzmedia)
+
+# M3 起：HTTP 服务示例（ROADMAP 的 "curl 取到测试页" 验收靠它，配 scripts/http_test.sh）
+add_executable(http_server http_server.cpp)
+target_link_libraries(http_server PRIVATE mzmedia)

@@ -96,6 +96,9 @@ set(MZMEDIA_SOURCES
         src/network/tcp_server.cpp
         # M3-a HTTP 解析
         src/http/http_parser.cpp
+        # M3-b HTTP 服务端
+        src/http/http_response.cpp
+        src/http/http_server.cpp
         )
 
 # 骨架阶段（第 1 批）没有任何源文件，此时不能创建 STATIC 库目标
