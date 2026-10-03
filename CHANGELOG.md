@@ -169,6 +169,19 @@
 - 实现中修的两个自测问题：① ctest 的 cwd 是 `build/tests/`，样本候选路径少一级；
   ② 框架断言**不中断执行**，断言失败后解引用空指针 → 段错误（改为显式 `return` 早退）
 
+#### M4-b CodecMatrix + H264 SPS/PPS
+- 新增 `src/ffmpeg/codec_matrix.h/.cpp`：`decideOutput(video, audio, output) → Remux/Transcode/Unsupported`。
+  H264+AAC→FLV = Remux；**HEVC→FLV = Unsupported**（播放端不支持，SPEC 已冻结）；MPEG2/MP3 → Transcode；
+  未知输出格式 → Unsupported + ErrorP（**绝不默认 Remux**：假成功最贵）
+- 新增 `src/ffmpeg/h264_util.h/.cpp`：Annex-B 起始码切分（不做 emulation 反转义）、SPS/PPS 提取
+  （缺任一 → 明确失败）、SPS 分辨率解析（exp-Golomb 全整数，处理 high profile 的 scaling list 与
+  frame_cropping，带合理上界 16384）
+- **M4 的第二条验收达成**：裸流样本提取出 SPS(22B)+PPS(4B) 并解析出 320x240，与 `Demuxer` 对同一份
+  裸流的结果逐项一致（两套独立路径交叉校验）
+- 契约澄清（写进头文件）：SPS 无校验和，随机字节可能凑出"语法合法"的结果 → 解析器只承诺语法解析，
+  **调用方必须交叉校验**；实测 0xff 填充会被解析成 16x16，故用例改用"真解析不了"的数据（长串 0/截断/空指针）
+- 测试：`tests/test_ffmpeg.cpp` 增至 **19 用例 / 1060 断言**（M4-a 11 + M4-b 8）
+
 ### 说明
 - `v0.1.0` 尚未发布。按 `VERSIONING.md`，tag 只能打在**可独立构建且测试通过**的提交上。
 - M1（Core 层）已完成并推送；后续进入 M2（网络层：EventPoller / TcpServer / Session）。

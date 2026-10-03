@@ -16,7 +16,9 @@
 #include "test_main.h"
 
 #include "core/util.h"
+#include "ffmpeg/codec_matrix.h"
 #include "ffmpeg/demuxer.h"
+#include "ffmpeg/h264_util.h"
 #include "ffmpeg/time_base.h"
 
 #include <cstdio>
@@ -47,6 +49,22 @@ std::string samplePath(const std::string &name) {
     std::printf("    [ INFO ] 找不到样本 %s（试过 %zu 个路径，请先跑 scripts/make_samples.sh）\n",
                 name.c_str(), candidates.size());
     return {};
+}
+
+/// 读整个文件（用例内部用，失败返回空串）
+std::string readWholeFile(const std::string &path) {
+    FILE *f = ::fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        return {};
+    }
+    std::string out;
+    char buf[8192];
+    size_t n = 0;
+    while ((n = ::fread(buf, 1, sizeof(buf), f)) > 0) {
+        out.append(buf, n);
+    }
+    ::fclose(f);
+    return out;
 }
 
 } // namespace
@@ -273,4 +291,136 @@ MZ_TEST(ffmpeg_demux_max_packet_size_limit_rejects) {
                  static_cast<int>(Demuxer::ReadResult::Error));
     MZ_ASSERT_EQ(demuxer.rejectedPackets(), 1u);
     MZ_ASSERT_TRUE(demuxer.lastError().find("上限") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// M4-b：CodecMatrix 判定 + H264 SPS/PPS
+// ---------------------------------------------------------------------------
+
+MZ_TEST(ffmpeg_codec_matrix_flv_h264_aac_is_remux) {
+    // 正常：MP4/H264 + AAC → FLV 可以只转封装
+    MZ_ASSERT_EQ(static_cast<int>(decideOutput(AV_CODEC_ID_H264, AV_CODEC_ID_AAC, "flv")),
+                 static_cast<int>(CopyOrTranscode::Remux));
+    MZ_ASSERT_STR_EQ(copyOrTranscodeName(CopyOrTranscode::Remux), std::string("remux"));
+}
+
+MZ_TEST(ffmpeg_codec_matrix_video_only_and_audio_only) {
+    // 边界：只有视频 / 只有音频都合法
+    MZ_ASSERT_EQ(static_cast<int>(decideOutput(AV_CODEC_ID_H264, AV_CODEC_ID_NONE, "flv")),
+                 static_cast<int>(CopyOrTranscode::Remux));
+    MZ_ASSERT_EQ(static_cast<int>(decideOutput(AV_CODEC_ID_NONE, AV_CODEC_ID_AAC, "flv")),
+                 static_cast<int>(CopyOrTranscode::Remux));
+}
+
+MZ_TEST(ffmpeg_codec_matrix_unsupported_and_transcode) {
+    // HEVC → FLV：明确不支持（不是"能转码"）
+    MZ_ASSERT_EQ(static_cast<int>(decideOutput(AV_CODEC_ID_HEVC, AV_CODEC_ID_AAC, "flv")),
+                 static_cast<int>(CopyOrTranscode::Unsupported));
+    // 未知输出格式：明确不支持（不当作 flv 处理）
+    MZ_ASSERT_EQ(static_cast<int>(decideOutput(AV_CODEC_ID_H264, AV_CODEC_ID_AAC, "hls")),
+                 static_cast<int>(CopyOrTranscode::Unsupported));
+    // MPEG2 视频 / MP3 音频 → 需要转码（v0.2）
+    MZ_ASSERT_EQ(static_cast<int>(decideOutput(AV_CODEC_ID_MPEG2VIDEO, AV_CODEC_ID_AAC, "flv")),
+                 static_cast<int>(CopyOrTranscode::Transcode));
+    MZ_ASSERT_EQ(static_cast<int>(decideOutput(AV_CODEC_ID_H264, AV_CODEC_ID_MP3, "flv")),
+                 static_cast<int>(CopyOrTranscode::Transcode));
+}
+
+MZ_TEST(ffmpeg_h264_split_annexb_nals) {
+    // 手工构造 Annex-B：4 字节起始码 + SPS(0x67) + 3 字节起始码 + PPS(0x68) + IDR(0x65)
+    const uint8_t data[] = {0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1e,
+                            0, 0, 1, 0x68, 0xce, 0x3c, 0x80,
+                            0, 0, 1, 0x65, 0x88, 0x84};
+    std::vector<H264Nal> nals;
+    MZ_ASSERT_EQ(splitAnnexBNals(data, sizeof(data), &nals), 3u);
+    MZ_ASSERT_EQ(nals[0].type, 7u);
+    MZ_ASSERT_EQ(nals[1].type, 8u);
+    MZ_ASSERT_EQ(nals[2].type, 5u);
+    MZ_ASSERT_EQ(nals[0].size, 4u);   // 0x67 0x42 0x00 0x1e
+
+    // 没有起始码 → 0 个（不猜）
+    const uint8_t none[] = {0x67, 0x42, 0x00, 0x1e};
+    MZ_ASSERT_EQ(splitAnnexBNals(none, sizeof(none), &nals), 0u);
+    MZ_ASSERT_EQ(splitAnnexBNals(nullptr, 0, &nals), 0u);
+}
+
+MZ_TEST(ffmpeg_h264_extract_requires_both_sps_and_pps) {
+    // 只有 SPS、没有 PPS → 必须失败（调用方不能假设 PPS 存在）
+    const uint8_t only_sps[] = {0, 0, 1, 0x67, 0x42, 0x00, 0x1e};
+    std::vector<uint8_t> sps;
+    std::vector<uint8_t> pps;
+    MZ_ASSERT_FALSE(extractSpsPps(only_sps, sizeof(only_sps), &sps, &pps));
+    MZ_ASSERT_FALSE(extractSpsPps(nullptr, 0, &sps, &pps));
+}
+
+MZ_TEST(ffmpeg_h264_extract_from_raw_sample) {
+    const std::string path = samplePath("sample.h264");
+    MZ_ASSERT_FALSE(path.empty());
+    const std::string raw = readWholeFile(path);
+    MZ_ASSERT_GT(raw.size(), 0u);
+    if (raw.empty()) {
+        return;
+    }
+    std::vector<uint8_t> sps;
+    std::vector<uint8_t> pps;
+    MZ_ASSERT_TRUE(extractSpsPps(reinterpret_cast<const uint8_t *>(raw.data()), raw.size(), &sps, &pps));
+    MZ_ASSERT_GT(sps.size(), 0u);
+    MZ_ASSERT_GT(pps.size(), 0u);
+    MZ_ASSERT_EQ(static_cast<int>(sps[0] & 0x1F), 7);   // NAL header 必须真的是 SPS
+    MZ_ASSERT_EQ(static_cast<int>(pps[0] & 0x1F), 8);
+    std::printf("    [ INFO ] 裸流提取：SPS %zu 字节 / PPS %zu 字节\n", sps.size(), pps.size());
+}
+
+MZ_TEST(ffmpeg_h264_sps_dimension_matches_demuxer) {
+    // ★ M4 的验收之一：裸流提 SPS/PPS 并**报出分辨率**，且与解封装得到的一致
+    const std::string path = samplePath("sample.h264");
+    MZ_ASSERT_FALSE(path.empty());
+    const std::string raw = readWholeFile(path);
+    if (raw.empty()) {
+        MZ_FAIL("裸流样本为空");
+        return;
+    }
+    std::vector<uint8_t> sps;
+    std::vector<uint8_t> pps;
+    if (!extractSpsPps(reinterpret_cast<const uint8_t *>(raw.data()), raw.size(), &sps, &pps)) {
+        MZ_FAIL("SPS/PPS 提取失败");
+        return;
+    }
+    int width = 0;
+    int height = 0;
+    MZ_ASSERT_TRUE(parseSpsDimension(sps.data(), sps.size(), &width, &height));
+    MZ_ASSERT_EQ(width, 320);
+    MZ_ASSERT_EQ(height, 240);
+
+    // 交叉验证：解封装同一份裸流得到的分辨率必须一致（两套独立路径互相印证）
+    Demuxer demuxer;
+    if (!demuxer.open(path)) {
+        MZ_FAIL("打不开裸流样本");
+        return;
+    }
+    const StreamInfo *video = demuxer.firstVideo();
+    MZ_ASSERT_NOT_NULL(video);
+    if (video == nullptr) {
+        return;
+    }
+    MZ_ASSERT_EQ(video->width, width);
+    MZ_ASSERT_EQ(video->height, height);
+}
+
+MZ_TEST(ffmpeg_h264_sps_unparsable_fails) {
+    // 畸形：解析不了的数据必须失败（不返回假分辨率）
+    // 注意：SPS 没有校验和 —— "0xff 填充"这类字节可能凑出语法合法结果（16x16），
+    //       那种情况靠调用方**交叉校验**（见 ffmpeg_h264_sps_dimension_matches_demuxer）。
+    //       这里用"真解析不了"的数据：长串 0（exp-Golomb 前导零越界）、截断、空指针。
+    const uint8_t zeros[] = {0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    int w = 0;
+    int h = 0;
+    MZ_ASSERT_FALSE(parseSpsDimension(zeros, sizeof(zeros), &w, &h));
+    MZ_ASSERT_FALSE(parseSpsDimension(nullptr, 0, &w, &h));
+    const uint8_t too_short[] = {0x67, 0x42};
+    MZ_ASSERT_FALSE(parseSpsDimension(too_short, sizeof(too_short), &w, &h));
+    // 空指针输出也要挡住
+    const uint8_t ok[] = {0x67, 0x42, 0x00, 0x1e, 0xab, 0x40, 0xb0, 0x4b};
+    MZ_ASSERT_FALSE(parseSpsDimension(ok, sizeof(ok), nullptr, &h));
+    MZ_ASSERT_FALSE(parseSpsDimension(ok, sizeof(ok), &w, nullptr));
 }

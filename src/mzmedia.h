@@ -63,4 +63,6 @@
 
 // M4 FFmpeg 封装（已接入）
 #include "ffmpeg/time_base.h"
+#include "ffmpeg/codec_matrix.h"
+#include "ffmpeg/h264_util.h"
 #include "ffmpeg/demuxer.h"

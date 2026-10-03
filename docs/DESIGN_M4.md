@@ -66,13 +66,13 @@ bool packetTimestampsMs(int64_t *pts, int64_t *dts);   // 已换算 + 已钳制
 | 批次 | 内容 | 验收 |
 |---|---|---|
 | **M4-a** ✅ | `AvPtr` + `time_base` + `Demuxer` + `scripts/make_samples.sh` + `tests/test_ffmpeg.cpp`（11 用例） | 样本 MP4 解出 h264 320x240@25fps + aac；读完 138 包到 Eof；时间戳单调；上限用例红/绿可控 |
-| **M4-b** | `CodecMatrix`（Remux/Transcode/Unsupported）+ **SPS/PPS 提取与分辨率上报** | H264 裸流能提 SPS/PPS 并报分辨率；HEVC → 明确 Unsupported（不假成功） |
+| **M4-b** ✅ | `CodecMatrix`（`src/ffmpeg/codec_matrix.h/.cpp`）+ `h264_util`（Annex-B 切分 / SPS+PPS 提取 / SPS 分辨率解析） | **已完成**：裸流样本提取出 SPS(22B)+PPS(4B) 并解析出 **320x240**，与 `Demuxer` 对同一份裸流的结果**逐项一致**（两套独立路径互相印证）；HEVC→FLV、未知输出格式 → 明确 `Unsupported`；MPEG2/MP3 → `Transcode` |
 
 ## 5. 测试计划
 
 | 分组 | 位置 | 说明 |
 |---|---|---|
-| `ffmpeg` ✅ | `tests/test_ffmpeg.cpp`（11 用例） | 纯函数 + 真样本；无并发无等待 → **TSAN 严格组** |
+| `ffmpeg` ✅ | `tests/test_ffmpeg.cpp`（**19 用例**：M4-a 11 + M4-b 8） | 纯函数 + 真样本；无并发无等待 → **TSAN 严格组** |
 | 样本 | `scripts/make_samples.sh` ✅ | `sample.mp4` / `sample.h264` / `garbage.bin`，**现场生成不入库**（`.gitignore` 已加 `/samples/`） |
 
 用例覆盖：正常（打开报流参数、读完到 Eof、时间戳单调）、空（未打开就读必须是 **Error 而不是 Eof**）、
@@ -99,6 +99,10 @@ bool packetTimestampsMs(int64_t *pts, int64_t *dts);   // 已换算 + 已钳制
 | 时间戳换算 | 整数 + `__int128` 溢出判定 | 排除浮点（长片会漂）；排除"截断到 int64"（错值比失败更糟） |
 | 单调性 | 守卫钳制 + 计数 | 排除"直接透传"（播放器会跳帧）；排除"静默丢弃回退包"（丢数据不可见） |
 | 样本 | 本机 ffmpeg 现场生成 | 排除"下载样本入库"（体积 + 网络依赖 + 版权） |
+| CodecMatrix 的"不知道" | 一律 `Unsupported`（+ErrorP），绝不默认 Remux | 假成功最贵：对 HEVC 照 remux 的结果是浏览器一片黑，排查成本极高 |
+| HEVC → FLV | `Unsupported`（不是 Transcode） | 播放端（flv.js/MSE）不支持 HEVC，"转码"也解决不了 → 这是契约层面的不做 |
+| SPS 解析的契约 | 只承诺**语法解析**；`h264_util.h` 明确写"SPS 无校验和，随机字节可能凑出语法合法结果，**调用方必须交叉校验**" | 让解析器去"猜合法性"是不可靠的（实测 0xff 填充会解析成 16x16）；交叉校验（vs Demuxer）才是真防线 |
+| Annex-B 切分 | 只按起始码切分，**不做** emulation prevention 反转义 | 反转义是解码器的职责；FLV 只需要"把 SPS/PPS 原样去掉起始码" |
 
 ## 8. 未决事项
 
@@ -106,5 +110,5 @@ bool packetTimestampsMs(int64_t *pts, int64_t *dts);   // 已换算 + 已钳制
 |---|---|---|
 | 1 | 超时初值（open/read 各 5s）是否合适 | M5 接真实输入后按 `lastError()` 观察 |
 | 2 | `max_packet_size` 8MB 是否够（4K 关键帧可能更大） | M5/M6 实测 |
-| 3 | SPS/PPS 提取放在 `Demuxer` 还是独立的 `H264Util` | M4-b 定（倾向独立，便于单测） |
+| 3 | ~~SPS/PPS 提取放哪~~ | **已定（M4-b）**：独立的 `h264_util`（便于单测：不需要解码器、手造字节即可测） |
 | 4 | 是否支持"只读指定流"（`av_read_frame` 目前返回所有流） | M5 按需要 |

@@ -101,6 +101,9 @@ set(MZMEDIA_SOURCES
         src/http/http_server.cpp
         # M4-a FFmpeg 封装
         src/ffmpeg/demuxer.cpp
+        # M4-b CodecMatrix + H264 工具
+        src/ffmpeg/codec_matrix.cpp
+        src/ffmpeg/h264_util.cpp
         )
 
 # 骨架阶段（第 1 批）没有任何源文件，此时不能创建 STATIC 库目标
