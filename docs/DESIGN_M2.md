@@ -748,7 +748,7 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | 7 | 定时器与 `cancel` 竞态 | 到期瞬间取消 | 取出后先判 `isCanceled()`；`timer_cancel_race` 用例 |
 | 8 | **空闲检测误杀正常客户端** | `recv_idle` 小于客户端心跳周期 | 保守初值（60s）+ `totalIdleTimeout()` 计数暴露；协议层可重写 `onIdle()` 改为发心跳 |
 | 9 | 半开连接泄漏 fd | 对端断电/拔网线 | TCP KeepAlive（90s）+ 应用层检测；`ntimed_fd_recycle` 用例 |
-| 10 | TSAN 已知误报掩盖真竞争 | 网络测试用带超时的等待 | `ntimed` 分组 + 签名判定（`scripts/tsan.sh`）；根治靠 `apt install g++-12` |
+| 10 | TSAN 已知误报掩盖真竞争 | 网络测试用带超时的等待 | `ntimed` 分组 + 签名判定（`scripts/tsan.sh`）；**已根治（2026-10-03）**：装 `g++-12` 后实测全部组 0 报告 |
 | 11 | **绝对精度门禁在虚拟化宿主上不可达** | 宿主 tick 量化唤醒延迟 **0~14ms 且与延时无关**（裸 `nanosleep` 10ms/100ms/1s 档实测 +6/+10/+13） | 门禁改为"**0 早触发** + 相对同进程裸基线增量 ≤5ms"（§7.1）；对拍取**最小值**以剔除随机噪声、保留系统性偏置；换裸机后可收紧回绝对 ±5ms（§10.7） |
 | 12 | **0 延时自投链 / 同刻大量到期会占住事件循环** | 回调里 `doDelayTask(0, …)`（被**同一个** `processDelayTask` 循环处理完，期间不派发 epoll 事件、也不检查 `_exit`）；或 100 路客户端的秒级校验同时到点 | **先观测、暂不限制**（§9 决策）：`delayBatchMax()` / `delayBatchCount()` 已能量化（实测 1000 个同刻到期 = 1 批 1000 个；20 步 0 延时自投链 = 1 批 20 个）。触发条件：线上单批远超客户端数 → 再加"每轮处理上限 + 让出循环"（§10 未决 8） |
 | 13 | **大流量回显块级乱序（> 8MB）—— 已修复（M2-3b），保留此条作踩坑记录** | `Session::send` 在**发送队列非空**时仍直接 `write` socket：socket 是 FIFO，新块插到旧块前面 → 块级乱序（字节数不变、内容错位）。实测首个错位量 k ≈ 队列尾巴大小（4224 / 25536 / 750272） | 修复：**仅 `_send_queue->empty()` 时才直写**，否则整段入队（FIFO 保序）。判据换成**确定性用例** `ntimed_send_order_with_backlog`（8KB 发送缓冲 + 连续两块：修前首个 `'B'` 在 16KB 处、修后在 1MB 边界）。教训：两次错误结论都来自**测量工具本身**（异步日志未落盘 →"插队=0"假象；探针把 reader 线程建在发送之后 → 7.5MB 就 send-overflow） |
@@ -797,7 +797,7 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | 2 | 心跳阈值校准（60s → ？） | M2-3 拿到 `totalIdleTimeout()` 数据后 |
 | 3 | 接收缓冲上限校准（1MB → ？） | 同上（看 `totalRecvOverflow()`） |
 | 4 | `docs/ARCHITECTURE.md` §1 分层图 / `src/mzmedia.h` 注释的同步修正 | 下一批文档改动时一并做（本文件 §2 是修正后版本） |
-| 5 | TSAN 误报根治（装 `g++-12` 或 clang） | 你有 sudo 密码时（需要你执行 `sudo apt install g++-12`） |
+| 5 | ~~TSAN 误报根治~~ | **已完成（2026-10-03）**：装 `g++-12` 12.3.0 后实测全部组 0 报告；`scripts/tsan.sh` 自动优先使用 `g++-12` |
 | 6 | 定时器精度是否升格为 SPEC 的正式 NFR | 你决定（当前只写在 `ROADMAP.md` 的 M2 验收里；SPEC 的 `NFR-7` 是"代码质量"，与精度无关） |
 | 7 | 精度门禁是否在裸机/物理机上收紧回**绝对 ±5ms** | 有裸机环境时（本宿主 0~14ms 唤醒延迟是虚拟化造成的，不是代码问题） |
 | 8 | `processDelayTask` 是否加"每轮处理上限 + 让出事件循环" | 等 `delayBatchMax()` 在真实流量（M6 多客户端）里的数据；当前只观测 |

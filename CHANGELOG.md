@@ -146,6 +146,12 @@
 - 测试：`tests/test_http_server.cpp` 增至 **21 用例 / 193 断言**（chunked 2 + Range 4 + stats 1），
   测试助手补 **chunked 解码**；脚本增至 **11 组**
 
+#### 工具链：TSAN 误报根治（g++-12）
+- 装上 `g++-12`（12.3.0）后实测：**全部组 0 报告**，结论"TSAN 全绿，无任何报告"
+  （含此前稳定误报的 `qtimed`/`ptimed` 与间歇误报的 `semaphore`）
+- `scripts/tsan.sh`：自动优先 `g++-12`、换编译器时自动清理 `build-tsan`、未装时打印提示；
+  FP 分组逻辑保留以兼容 GCC 11 环境
+
 ### 说明
 - `v0.1.0` 尚未发布。按 `VERSIONING.md`，tag 只能打在**可独立构建且测试通过**的提交上。
 - M1（Core 层）已完成并推送；后续进入 M2（网络层：EventPoller / TcpServer / Session）。

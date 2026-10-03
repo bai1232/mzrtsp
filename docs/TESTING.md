@@ -137,7 +137,12 @@ FATAL: ThreadSanitizer: unexpected memory mapping 0x...
 `setarch -R` 关闭该进程的地址随机化（不需要 root）；也可临时降熵
 `sudo sysctl vm.mmap_rnd_bits=28`。
 
-### 8.2 已知误报：带超时的等待（重要）
+### 8.2 已知误报：带超时的等待（**已在 GCC 11 环境下根治**）
+
+> **【2026-10-03 更新】已根治**：装上 `g++-12`（12.3.0）后本机实测**全部组 0 报告**
+> （含此前稳定误报的 `qtimed`/`ptimed`，以及间歇误报的 `semaphore`）。`scripts/tsan.sh`
+> 会自动优先使用 `g++-12`。下面记录的是 **GCC 11 环境下的现象与判据**，保留用于兼容
+> 没装 `g++-12` 的机器（那种机器上本组会间歇性报 `double lock` / `data race`）。
 
 glibc 2.35 把 `std::condition_variable` 的超时接口（`wait_for` / `wait_until`）
 实现为 `pthread_cond_clockwait`，而 **GCC 11 的 libtsan 没有该拦截器**：

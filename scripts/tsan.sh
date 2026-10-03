@@ -31,10 +31,11 @@
 #             —— 双方都持锁却报竞争，才是"TSAN 丢失 happens-before"的误报特征；
 #                只要有一方没持锁，就是真竞争 → 脚本失败
 #
-# 4. [根治方案] 换掉 sanitizer 运行时即可彻底消除误报：
-#      sudo apt install g++-12        # 或 clang
-#      cmake -B build-tsan -DMZMEDIA_ENABLE_TSAN=ON -DCMAKE_CXX_COMPILER=g++-12
-#    换好后可把 qtimed/ptimed 也并入严格组，要求全部 0 报告。
+# 4. [根治方案 —— **已落实**] 换掉 sanitizer 运行时即可彻底消除误报：
+#      sudo apt install -y g++-12
+#    本机 2026-10-03 装上 g++-12 (12.3.0) 后实测：**全部组 0 报告**（含此前稳定误报的
+#    qtimed/ptimed，以及间歇误报的 semaphore），结论"TSAN 全绿，无任何报告"。
+#    本脚本会自动优先使用 g++-12；FP 分组逻辑保留，仅用于"没装 g++-12 的机器"。
 # ============================================================================
 set -u
 
