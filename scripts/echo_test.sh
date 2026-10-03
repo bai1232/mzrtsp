@@ -20,7 +20,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/build/bin/echo_server"
 SIZE_MB="${SIZE_MB:-100}"
-PORT="${PORT:-19000}"
+PORT="${PORT:-$((19000 + RANDOM % 2000))}"   # 随机端口：连跑多轮时不会撞上一轮还没释放的端口
 CONCURRENCY=8
 LOGFILE="/tmp/mz_echo_server_$$.log"
 SRC="/tmp/mz_echo_src_$$.bin"
@@ -35,7 +35,11 @@ if ! command -v nc > /dev/null 2>&1; then
 fi
 
 cleanup() {
-    [ -n "${SRV_PID:-}" ] && kill "$SRV_PID" 2> /dev/null
+    if [ -n "${SRV_PID:-}" ]; then
+        # SIGINT：走 onSignal → 优雅 shutdown → atexit flush 日志（否则日志可能还没落盘就被读）
+        kill -INT "$SRV_PID" 2> /dev/null
+        wait "$SRV_PID" 2> /dev/null   # 等它真的退出，否则下一轮会 bind 到同一端口失败
+    fi
     rm -f "$SRC"
 }
 trap cleanup EXIT

@@ -302,23 +302,32 @@ public:
     void setOnError(onErrorCB cb);
     void setOnManager(onManagerCB cb);
 
-    /// 线程安全：非 poller 线程会经 sync() 投递到 poller 线程执行
-    /// @return 立即写出的字节数；数据未写完时余下进发送队列（不是失败）
-    virtual ssize_t send(const void *data, size_t len);
-    virtual ssize_t send(const std::string &data);
+    // ---- 以下为 M2-3b 实现后的形状（权威契约以 src/network/session.h 为准）----
+    /// 线程安全（非 poller 线程内部 sync 投递）
+    /// @return **本次立即写出的字节数**；0 = 没直写出去（socket 满 **或队列非空**），
+    ///         数据已入队、由 EPOLLOUT 续写 —— **0 不是失败**；-1 = 已关闭/出错
+    ssize_t send(const void *data, size_t len);
+    ssize_t send(const std::string &data);
 
-    /// 主动关闭（线程安全）；幂等
-    void shutdown();
+    /// 主动关闭（线程安全、幂等）
+    /// @return true = 本次真的发起关闭；false = 之前已经关过（不是错误）
+    bool shutdown(const SockException &err = SockException());
+    bool isShutdown() const;
+    const SockException &lastError() const;   // 关闭原因（只在 poller 线程读）
 
-    // ---- FR-4.4：空闲检测 ----
+    // ---- FR-4.4：空闲检测（配置类 setter 统一返回 bool）----
+    /// @return false = 被拒或 start() 之后调用（值未生效，已记日志）
     /// 0 = 关闭该方向检测。默认值由 TcpServer::setSessionTimeout 注入
-    void setRecvIdleTimeout(uint32_t ms);
-    void setSendBlockedTimeout(uint32_t ms);
+    bool setRecvIdleTimeout(uint32_t ms);
+    bool setSendBlockedTimeout(uint32_t ms);
     uint32_t recvIdleTimeout() const;
     uint32_t sendBlockedTimeout() const;
 
-    /// 接收缓冲上限（安全网，不是协议上限）：超限 → onError + 计数 + 关闭
-    void setMaxRecvBuffer(size_t bytes);          // 默认 1 MB（初值，待实测校准）
+    /// 接收上限（安全网，不是协议上限）：**单次 onRecv 交付上限**；
+    /// 单事件最多交付 `kMaxReadsPerEvent`（64）块，超出 → RecvOverflow 断开 + 计数
+    bool setMaxRecvBuffer(size_t bytes);          // 默认 1 MB（初值）；0 被拒
+    /// 发送队列上限：超限 → SendOverflow 断开 + 计数（字节级防线，区别于 30s 的时间级防线）
+    bool setMaxSendBuffer(size_t bytes);          // 默认 8 MB（初值）；0 被拒
 
     // ---- 观测 ----
     const EventPoller::Ptr &poller() const;
@@ -357,19 +366,21 @@ public:
     using SessionCreator = std::function<Session::Ptr(const Socket::Ptr &)>;
 
     explicit TcpServer(const EventPoller::Ptr &poller = nullptr);   // 空 = 从 Pool 取
-    ~TcpServer();
+    ~TcpServer();                                     // 析构调用 shutdown()（析构即排水）
 
     /// @param port 0 = 由内核分配（随后用 port() 读回，测试友好）
-    /// @return bind/listen 是否成功（失败已记日志，不抛异常）
+    /// @return true = 已开始监听；false = 失败（**已记日志，不抛异常**）
+    ///         四种明确失败：未设 session creator / poller 不可用 / bind-listen 失败 / 重复 start
     bool start(uint16_t port, const std::string &bind_ip = "0.0.0.0");
-    void shutdown();                                     // 幂等
+    /// @return true = 本次真的执行了关停；false = 之前已经关过（幂等）
+    bool shutdown();
 
-    // 配置（必须在 start() 之前）
-    void setSessionCreator(SessionCreator creator);
-    void setBacklog(int backlog);                        // 默认 1024
-    void setMaxSessionCount(size_t max);                 // 默认 0 = 不限（FR-4.4 的"连接上限"）
-    void setSessionTimeout(uint32_t recv_idle_ms, uint32_t send_blocked_ms);   // FR-4.4
-    void setReusePort(bool enable);
+    // 配置（必须 start() 之前；**全部返回 bool**：false = 被拒/太晚，值未生效）
+    bool setSessionCreator(SessionCreator creator);      // 空工厂被拒
+    bool setBacklog(int backlog);                        // 默认 1024
+    bool setMaxSessionCount(size_t max);                 // 默认 64（FR-4.4）；**0 被拒**（不是"不限"）
+    bool setSessionTimeout(uint32_t recv_idle_ms, uint32_t send_blocked_ms);   // FR-4.4
+    bool setReusePort(bool enable);
 
     // 观测
     uint16_t port() const;
@@ -378,12 +389,15 @@ public:
     uint64_t totalAccepted() const;
     uint64_t totalRejected() const;      // FR-4.4：因连接数上限被拒
     uint64_t totalIdleTimeout() const;   // FR-4.4：因空闲/写阻塞超时被断开
-    uint64_t totalRecvOverflow() const;  // 接收缓冲超限被断开
+    uint64_t totalRecvOverflow() const;  // 单事件接收量超限被断开
+    uint64_t totalSendOverflow() const;  // 发送队列超限被断开（字节级防线）
     uint64_t totalAcceptError() const;   // accept 失败（如 EMFILE）
     const EventPoller::Ptr &poller() const;
 
-    void setOnSessionClose(std::function<void(const Session::Ptr &)> cb);
-    void forEachSession(const std::function<void(const Session::Ptr &)> &cb) const;
+    /// @return 被替换掉的上一个回调
+    SessionCloseCB setOnSessionClose(SessionCloseCB cb);
+    /// @return 遍历到的会话数（可从任意线程调用，内部 sync）
+    size_t forEachSession(const std::function<void(const Session::Ptr &)> &cb) const;
 };
 ```
 
@@ -768,6 +782,12 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | `TcpServer` 连接上限默认（M2-3b） | 默认 **64**（FR-4.4），传 0 **被拒** | 排除"0 = 不限"：有界性不可协商（与 `EventPoller::setMaxPendingTasks(0)` 同一处理） |
 | `Session` 发送队列上限（M2-3b） | `setMaxSendBuffer`（默认 8MB）+ `totalSendOverflow()` | 排除"只靠 30s 写阻塞兜底"：时间兜底限制不了**字节数**，只连不读的对端能把内存涨到 OOM |
 | `TcpServer` 未设 session creator（M2-3b） | `start()` 明确失败（ErrorP + false） | 排除"接受连接然后丢数据"：那是最难查的一类问题 |
+| `close(fd)` 的时机（M2-3b） | 只在 `delEvent` 的 `complete_cb` 里关；投递不进去才就地关 | 排除"delEvent 后立刻 close"（poller 是延迟删除，fd 号会被内核复用给新连接 → 新连接 `addEvent` 被判重复注册，整片连接失败——真踩过）；排除"不关、等析构"（poller 退出清理会丢弃 `complete_cb`，此时靠 `Socket::~Socket` 兜底） |
+| 发送顺序（M2-3b 修复） | **仅当发送队列为空时才直写 socket**，队列非空整段入队（FIFO 保序） | 排除"能塞就塞"：新块会插到队列旧块前面 → **块级乱序**（字节数不变、内容错位）；确定性用例 `ntimed_send_order_with_backlog` 锁住 |
+| 收发流控（M2-3b） | 发送队列 ≥ `maxSendBuffer/2` 停止收数据，< `/4` 恢复（`modifyEvent` 重挂 EPOLLIN） | 排除"只靠上限兜底"（一个读事件最多 64MB，会把 8MB 队列顶爆）；排除"收满就断"（正常批量传输会被误杀） |
+| EOF / 空闲超时的关闭（M2-3b） | 若发送队列非空则**延迟关闭**，最多推迟 `kMaxCloseDefer = 3` 个检查周期，排不完照断 | 排除"立刻断"（丢掉已排队数据 = 静默丢数据）；排除"无限等"（慢客户端能把连接永远挂着） |
+| 接收上限的两级语义（M2-3b） | 每块 ≤ `maxRecvBuffer`（1MB）、每事件最多 `kMaxReadsPerEvent`（64）块 | 排除"一次事件读到上限就断"——8MB 的正常回显会被误判成攻击（这个坑真踩过） |
+| 尽量不用 `void` 的落地口径（M2-3b） | 配置 setter 返回"是否生效"；操作返回"实际完成量 / 状态是否改变"；注册回调返回上一个；只有"被调用的钩子"保留 void | 排除"全部强行加返回值"（钩子没有接收方语义，硬加只会让实现纠结返回什么） |
 
 ## 10. 未决事项（待定，走到对应步骤再定）
 
@@ -781,4 +801,4 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | 6 | 定时器精度是否升格为 SPEC 的正式 NFR | 你决定（当前只写在 `ROADMAP.md` 的 M2 验收里；SPEC 的 `NFR-7` 是"代码质量"，与精度无关） |
 | 7 | 精度门禁是否在裸机/物理机上收紧回**绝对 ±5ms** | 有裸机环境时（本宿主 0~14ms 唤醒延迟是虚拟化造成的，不是代码问题） |
 | 8 | `processDelayTask` 是否加"每轮处理上限 + 让出事件循环" | 等 `delayBatchMax()` 在真实流量（M6 多客户端）里的数据；当前只观测 |
-| 9 | **大流量回显（> 8MB）内容损坏的根因** | 下一步用"带接收线程的进程内探针"在 16/32MB 复现（外部客户端已能稳定复现：`SIZE_MB=100 ./scripts/echo_test.sh`）；已排除项见 §8 R13 |
+| 9 | ~~大流量回显（> 8MB）内容损坏的根因~~ | **已解决（M2-3b）**：`Session::send` 在发送队列非空时仍直写 socket → 块级乱序；修法与判据见 §9 决策记录、§8 R13 |
