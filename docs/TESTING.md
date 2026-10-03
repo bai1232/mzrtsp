@@ -65,17 +65,19 @@ MZ_TEST(timestamp_rational_conversion) {
 
 | 跑法 | 实测结果 |
 |---|---|
-| 单独跑该分组（`ctest -R '^timer$'`） | 连续 3 次**全绿**（3.5s） |
+| 单独跑该分组（`ctest -R '^timer$'`） | 连续 3 次**全绿**（3.5s）；ASAN 构建下同样 3/3 绿 |
 | **并行**跑全部分组（`ctest -j4`） | **红**（4 个测试进程抢 CPU） |
-| 单进程跑全部用例 | 见过红（本轮 2 次红、1 次绿） |
+| 单进程跑全部用例 | 见过红（2 次红、多次绿） |
+| **ASAN 构建**下串行 `ctest` | 红过 1 次（随后该组单独跑 3/3 绿 → 同一间歇性） |
 
 **规矩**：计时结论只在**串行、无干扰**下取 —— 用 `ctest --output-on-failure`（不带 `-j`，与
 `VERSIONING.md` 发版清单一致），或单跑该分组。**不要**用 `ctest -j4` / 单进程全量跑的结果当精度指标。
 
-【推论】红的根因判为宿主调度/CPU 争用，**未做对照实验**（依据：① 同一二进制单跑绿、并行红；
-② 本节 §8 R11 已实测本宿主唤醒延迟 0~14ms 且与延时长短无关；③ 该门禁比较的是**两个独立噪声
-分布的最小值**，+5ms 余量本身就偏紧）。
-（该门禁的余量问题另案处理，见 `docs/DESIGN_M2.md` §8 R11。）
+【推论】红的根因判为宿主调度/CPU 争用与 sanitizer 插桩开销，**未做对照实验**（依据：① 同一二进制
+单跑绿、并行红；② 本节 §8 R11 已实测本宿主唤醒延迟 0~14ms 且与延时长短无关；③ 该门禁比较的是
+**两个独立噪声分布的最小值**，+5ms 余量本身就偏紧）。
+**另案（待批）**：`DESIGN_M2.md` §9 已有先例把它在 **TSAN** 下放宽到 25ms；ASAN 也需要同样的处理
+（或改成与"同相位裸基线"对拍），否则发版清单里的 ASAN 一栏会随机翻红。见 `docs/DESIGN_M2.md` §8 R11。
 
 ## 3. 集成测试（ffprobe 校验，可自动化）
 
@@ -159,6 +161,7 @@ curl -s http://127.0.0.1:8080/api/stats | python3 -m json.tool
 | FR-5.1 每客户端队列上限（64 帧 / 8MB，先到者为准） | 单测 `media` 分组（`tests/test_media.cpp`，清单见 `docs/DESIGN_M5.md` §5）：帧数上限与字节上限**各自**能触发；`setLimits(0)` 被拒（有界性不可协商） |
 | FR-5.2 慢客户端丢帧 | 单测 `media`：溢出只丢 `droppable()`（视频非关键帧），**音频与视频关键帧不丢**；关键帧腾不出空间 → `RejectedNoSpace`（调用方断开该订阅者）。集成：`tc` 限速或 `kill -STOP` 阻塞客户端，观察 `dropped` 计数与其他客户端 |
 | FR-5.3 隔离性 | 单测 `media`：一个订阅者（一直不取帧）持续溢出，其他订阅者的帧序列仍**逐帧一致**（每帧指针相同） |
+| FR-6.1 `/api/stats` | 单元层面：`MediaSource::totalDelivered / totalDropped / totalRejected / totalBroken` 与 `Subscriber::notify*` 已有计数（M5-a / M5-b）；集成层面（M5-d）：`curl -s /api/stats` 与压测前后对账 |
 | FR-4.4 连接上限 / 读空闲 / 写阻塞 | 单测：连接上限设为 1 时第 2 个连接被拒且 `totalRejected()` 增长；`recv_idle=50ms` + 连上不发数据的客户端 → 阈内断开且 `onError` 为超时；`send_blocked=50ms` + 只连不读的客户端 → 断开且 `bytesOut` 停止增长 |
 | 各 codec 组合 | `CODEC_MATRIX.md` 每个组合一条 ffprobe 用例 |
 

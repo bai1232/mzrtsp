@@ -1,17 +1,22 @@
 /*
- * FrameQueue：每个订阅者一个的**有界**包队列（M5-a）
+ * FrameQueue：每个订阅者一个的**有界**包队列（M5-a 建立，M5-b 变线程安全）
  * ============================================================================
  * 形状来源：docs/DESIGN_M5.md §3.2；上位需求 FR-5.1（64 帧 / 8MB，先到者为准）
  *                                          FR-5.2（溢出优先丢非关键帧并计数）
  *
- * 线程契约：不加锁、不可重入。约定 push 只由源线程调用，pop 只由该订阅者所属线程
- * 调用（M5-b 用 EventPoller::async 投递保证）—— 本类自己不做同步。
+ * 线程契约（M5-b 起，**已变更**）：
+ *   - **SPSC**：单生产者 = 源线程（只调 push），单消费者 = 该订阅者所属的消费者线程（只调 pop）；
+ *   - 内部用**一把互斥锁**保护，所以两种操作不必在同一线程；但**不承诺**多生产者/多消费者；
+ *   - 所有取值接口（packets/bytes/stats/...）返回**快照**，可在任意线程调用；
+ *   - 锁内不调用任何回调（本类没有回调），不存在重入问题。
+ *   为什么改成线程安全：M5-b 选定「数据通道 = 队列，唤醒 = async」（DESIGN_M5.md §4.4）。
+ *   若改成"帧本体走 async"，真正的缓冲会变成 poller 的任务队列（65536 条），
+ *   FR-5.1 的 64 帧/8MB 计量就失真了、丢帧计数会长期为 0。
  *
- * 三条硬要求：
+ * 三条硬要求（不变）：
  *   1) 上限**不可绕过**：setLimits(0) 必须被拒（AI_COLLAB §4.6：0/无界不是选项）；
  *   2) 丢弃**必须分类计数**：丢的是"可丢包"还是"关键帧腾不出空间"，调用方动作不同；
- *   3) 丢弃**不静默**：每次丢弃都进 stats()，关键帧放不下时返回 RejectedNoSpace
- *      由调用方决定（断开该订阅者），而不是悄悄丢掉关键帧让播放端花屏。
+ *   3) 丢弃**不静默**：RejectedNoSpace（不可丢的包进不去）由调用方决定断开该订阅者。
  * ============================================================================
  */
 
@@ -22,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <mutex>
 
 namespace mzmedia {
 
@@ -59,16 +65,15 @@ public:
     FrameQueue();
 
     /// @return false = 上限非法（任一项为 0 或超过硬上限），**保持原值不变**
+    /// @note 只在启动前（没有并发访问时）调用；运行期改上限需要先停流
     bool setLimits(const Limits &limits);
 
-    Limits limits() const {
-        return _limits;
-    }
+    Limits limits() const;
 
-    /// 入队（源线程调用）。见 PushResult 三态语义
+    /// 入队（**源线程**调用）。见 PushResult 四态语义
     PushResult push(MediaPacket::Ptr packet);
 
-    /// 取包（消费者线程调用）；@param packet 出参，成功时写入
+    /// 取包（**消费者线程**调用）；@param packet 出参，成功时写入
     PopResult pop(MediaPacket::Ptr *packet);
 
     /// 标记"不会再有数据了"；@return true = 状态发生改变（重复调用返回 false）
@@ -77,33 +82,27 @@ public:
     /// 清空队列（订阅者断开/回收时用）；@return 被丢弃的包数。**不动 EOS 标记**
     size_t clear();
 
-    size_t packets() const {
-        return _queue.size();
-    }
-    size_t bytes() const {
-        return _bytes;
-    }
-    bool empty() const {
-        return _queue.empty();
-    }
-    bool endOfStream() const {
-        return _end_of_stream;
-    }
-    const Stats &stats() const {
-        return _stats;
-    }
+    /// 当前包数（快照）
+    size_t packets() const;
+    /// 当前字节数（快照）
+    size_t bytes() const;
+    /// 是否为空（快照）
+    bool empty() const;
+    /// 是否已标记流结束
+    bool endOfStream() const;
+    /// 计数快照（可在任意线程读取）
+    Stats stats() const;
 
 private:
     // 硬上限：防止有人把上限调成天文数字，等价于"无界"（有界性不可协商）
     static constexpr size_t kHardMaxPackets = 1u << 20;                // 1,048,576 帧
     static constexpr size_t kHardMaxBytes = 256u * 1024u * 1024u;      // 256MB
 
-    /// 再放一个 size 字节的包会不会超上限
+    /// 以下三个只在持锁时调用
     bool fits(size_t size) const;
-
-    /// 从队头开始找第一个可丢包并丢掉；@return false = 队里没有可丢的包
     bool dropOldestDroppable();
 
+    mutable std::mutex _mutex;
     std::deque<MediaPacket::Ptr> _queue;
     size_t _bytes = 0;
     Limits _limits;

@@ -225,6 +225,24 @@
 - 实测修正（另案，只改文档）：`timer_precision` 在**并行** `ctest -j4` 下会红（4 个测试进程抢 CPU），
   串行/单跑绿 → 计时门禁规矩改为"**串行、无干扰**下取结论"，见 `docs/TESTING.md` §2.2
 
+#### M5-b 媒体层线程打通（FrameQueue SPSC + 唤醒合并 + SourcePump 源线程）
+- `FrameQueue` 加锁成 **SPSC**（源线程 push / 消费者线程 pop）；取值接口改为返回**快照**
+  （原来返回 `const Stats&`，跨线程读就是数据竞争），锁内不做任何外部调用
+- `Subscriber` 支持 `bindPoller()` 绑定消费者线程、`setDrainCallback()`（返回上一个，沿用全项目约定）、
+  **唤醒合并** `notifyIfNeeded()`（每订阅者最多一个未决唤醒）+ `clearNotifyPending()`；
+  观测：`notifyCount / notifyRejectedCount / notifyCoalescedCount`
+- 新增 `SourcePump`：**源线程**反复调用可打断的读回调并推给 `MediaSource`；
+  `stop()` join 线程；`stopRequested()` 供真实实现接 FFmpeg 的 `interrupt_callback`；
+  **正常读完 / 读失败 / 被停止都会广播 EOS**（消费者绝不永久等待），且 `eof()` 与"被停止"分得开
+- 唤醒投递被拒（poller 已退出 / 任务队列满）时**复位未决标记**，否则该订阅者会被永久卡住
+- 测试：`tests/test_media_ntimed.cpp` **6 用例 / 56 断言**（新分组 `ntimed_media`，只用无超时等待 →
+  进 TSAN **严格组**）+ `test_media.cpp` 增 1 个绑定语义用例；总数 **192 用例**
+- 关键验证：2 万帧并发搬运**不丢不重且保序**；100 帧只产生 **1 次**跨线程唤醒而数据一条不少；
+  drain 确认在**轮询线程**上执行；poller 退出后唤醒被拒可重试；源线程三种结束方式都广播 EOS
+- 实现中修正：`MediaSource::Ptr` 别名缺失（M5-a 没人用到，M5-b 才需要）
+- 批计划调整（已同步 `ROADMAP` / `DESIGN_M5` §1）：M5-c = `SourceManager` 懒启动/空闲释放 + 接 `Demuxer`；
+  M5-d = 节流 FR-3.5 + 30s 写阻塞串通 + `/api/stats` 计数（FR-6.1）
+
 ### 说明
 - `v0.1.0` 尚未发布。按 `VERSIONING.md`，tag 只能打在**可独立构建且测试通过**的提交上。
 - M1（Core 层）已完成并推送；后续进入 M2（网络层：EventPoller / TcpServer / Session）。

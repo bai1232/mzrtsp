@@ -72,3 +72,4 @@
 #include "media/frame_queue.h"
 #include "media/gop_cache.h"
 #include "media/media_source.h"
+#include "media/source_pump.h"

@@ -109,6 +109,8 @@ set(MZMEDIA_SOURCES
         src/media/frame_queue.cpp
         src/media/gop_cache.cpp
         src/media/media_source.cpp
+        # M5-b 源线程
+        src/media/source_pump.cpp
         )
 
 # 骨架阶段（第 1 批）没有任何源文件，此时不能创建 STATIC 库目标

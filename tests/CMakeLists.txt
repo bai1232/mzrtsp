@@ -37,6 +37,8 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_ffmpeg.cpp
         # ---- M5-a 媒体分发 ----
         ${CMAKE_CURRENT_SOURCE_DIR}/test_media.cpp
+        # ---- M5-b 源线程与跨线程投递 ----
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_media_ntimed.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS
@@ -78,6 +80,9 @@ set(MZMEDIA_TEST_GROUPS
         # ---- M5-a 媒体分发 ----
         # 单线程纯策略（无内部线程、无等待）→ 进 TSAN 严格组。
         media
+        # ---- M5-b 源线程与跨线程投递 ----
+        # 有线程，但只用无超时等待（Semaphore::wait / sleep_for），不碰已知误报机制 → 仍在严格组。
+        ntimed_media
         )
 
 add_executable(mzmedia_unittest ${MZMEDIA_TEST_SOURCES})

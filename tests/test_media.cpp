@@ -568,3 +568,31 @@ MZ_TEST(media_source_subscriber_lifetime_and_limits) {
     MZ_ASSERT_FALSE(source.unsubscribe(s3->id()));
     MZ_ASSERT_FALSE(source.unsubscribe(id1)); // 早就自动注销了
 }
+
+MZ_TEST(media_subscriber_bind_poller_and_callbacks) {
+    // M5-b 的绑定语义（单线程部分：不需要 poller 线程就能验证的形状）
+    MediaSource source;
+    auto sub = source.subscribe();
+    MZ_ASSERT_NOT_NULL(sub.get());
+    if (!sub) {
+        return;
+    }
+
+    // 未绑定 poller = 同步模式：不产生任何唤醒
+    MZ_ASSERT_FALSE(sub->notifyIfNeeded());
+    MZ_ASSERT_EQ(sub->notifyCount(), 0u);
+    MZ_ASSERT_NULL(sub->poller().get());
+    MZ_ASSERT_FALSE(sub->clearNotifyPending()); // 本来就没有未决唤醒
+
+    // 注册回调返回**上一个**（沿用全项目"注册返回上一个"的约定）
+    auto first = sub->setDrainCallback([](const Subscriber::Ptr &) {});
+    MZ_ASSERT_TRUE(!first);
+    auto second = sub->setDrainCallback([](const Subscriber::Ptr &) {});
+    MZ_ASSERT_TRUE(static_cast<bool>(second));
+    auto third = sub->setDrainCallback(nullptr);
+    MZ_ASSERT_TRUE(static_cast<bool>(third)); // 返回的仍是刚才那个（返回"上一个"）
+
+    // 解绑：bindPoller(nullptr) 返回 false（表示"现在是未绑定状态"）
+    MZ_ASSERT_FALSE(sub->bindPoller(nullptr));
+    MZ_ASSERT_NULL(sub->poller().get());
+}
