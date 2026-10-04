@@ -73,3 +73,5 @@
 #include "media/gop_cache.h"
 #include "media/media_source.h"
 #include "media/source_pump.h"
+#include "media/demuxer_producer.h"
+#include "media/source_manager.h"

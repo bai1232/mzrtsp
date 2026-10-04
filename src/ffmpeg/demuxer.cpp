@@ -44,8 +44,19 @@ Demuxer::~Demuxer() = default;
 
 int Demuxer::interruptCb(void *opaque) {
     auto *self = static_cast<Demuxer *>(opaque);
-    // 返回非 0 = 请求中断
+    // 返回非 0 = 请求中断。
+    // 先看外部中止标志（M5-c）：源被停时要**立刻**把 av_read_frame 打断，
+    // 否则 SourcePump::stop() 的 join 要一直等到读超时（5s）才回来。
+    if (self->_abort != nullptr && self->_abort->load()) {
+        return 1;
+    }
     return getCurrentMillisecond() > static_cast<uint64_t>(self->_deadline_ms) ? 1 : 0;
+}
+
+const std::atomic<bool> *Demuxer::setAbortFlag(const std::atomic<bool> *flag) {
+    const std::atomic<bool> *previous = _abort;
+    _abort = flag;
+    return previous;
 }
 
 bool Demuxer::open(const std::string &path) {

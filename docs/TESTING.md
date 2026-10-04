@@ -162,6 +162,9 @@ curl -s http://127.0.0.1:8080/api/stats | python3 -m json.tool
 | FR-5.2 慢客户端丢帧 | 单测 `media`：溢出丢**最旧的一段**（音视频成对 —— 用例断言一次丢掉音频与视频各一包），**唯一不可丢的是视频关键帧**；腾不出空间 → `RejectedNoSpace`（调用方断开该订阅者）。集成：`tc` 限速或 `kill -STOP` 阻塞客户端，观察 `dropped` 计数与其他客户端 |
 | FR-5.3 隔离性 | 单测 `media`：一个订阅者（一直不取帧）持续溢出，其他订阅者的帧序列仍**逐帧一致**（每帧指针相同） |
 | FR-6.1 `/api/stats` | 单元层面：`MediaSource::totalDelivered / totalDropped / totalRejected / totalBroken` 与 `Subscriber::notify*` 已有计数（M5-a / M5-b）；集成层面（M5-d）：`curl -s /api/stats` 与压测前后对账 |
+| FR-1.2 直播式重放（按需启动、不支持 seek） | 单测 `srcmgr`：**懒启动**（未 acquire 时源数为 0，acquire 才开文件 + 起源线程）；从文件头开始推（新订阅者首包是视频关键帧）。按墙钟节流的部分见 FR-3.5（M5-d） |
+| FR-2.1 v0.1 输入 MP4 / H264 裸流 | 单测 `srcmgr`：`DemuxerProducer` 真读 `samples/sample.mp4`（320x240 H264 + AAC）到 EOF，视频 dts 单调、关键帧 1 个、音视频包都 > 0；H264 裸流由 M4 的 `ffmpeg` 分组覆盖 |
+| FR-6.3 关键事件落日志 | 源创建 / 空闲释放走 `InfoL`（`SourceManager`）；打不开走 `WarnL` 且**不注册源**（`srcmgr_open_failure_not_silent` 断言 `lastError()` 非空） |
 | FR-4.4 连接上限 / 读空闲 / 写阻塞 | 单测：连接上限设为 1 时第 2 个连接被拒且 `totalRejected()` 增长；`recv_idle=50ms` + 连上不发数据的客户端 → 阈内断开且 `onError` 为超时；`send_blocked=50ms` + 只连不读的客户端 → 断开且 `bytesOut` 停止增长 |
 | 各 codec 组合 | `CODEC_MATRIX.md` 每个组合一条 ffprobe 用例 |
 

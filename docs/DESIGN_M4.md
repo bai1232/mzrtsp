@@ -51,11 +51,13 @@ enum class ReadResult { Packet, Eof, Error };     // ★ Eof 与 Error 必须分
 bool open(const std::string &path);               // 失败：false + lastError() + 日志
 ReadResult readPacket();                          // Eof 是稳定终态（重复读仍 Eof）
 bool packetTimestampsMs(int64_t *pts, int64_t *dts);   // 已换算 + 已钳制
+const std::atomic<bool> *setAbortFlag(const std::atomic<bool> *);  // ★M5-c 外部中止（返回上一个）
 ```
 
 | 硬约束 | 做法 | 为什么 |
 |---|---|---|
 | 超时 | FFmpeg `interrupt_callback`（虚拟机上也要真能中断） | "读完再比时间"在卡死时根本回不来 |
+| **外部中止（M5-c 新增）** | `setAbortFlag()`：`interrupt_callback` 除超时外**再检查该标志** | `SourcePump::stop()` 要 join 源线程；只靠"读超时"得等满 5s 才回来。这仍然**没有**引入"另起线程强制关"（同一个回调里多一个判断而已） |
 | 流数上限 | `nb_streams > max_streams` → **拒绝打开** | "只取前 N 路"是静默截断，后面所有统计都对不上 |
 | 单包上限 | `pkt->size > max_packet_size` → 拒绝 + 计数 + 释放 | 不缓存、不截断；异常文件不能把内存拉爆 |
 | 时间戳 | 换算 + 按流单调钳制；失败/缺失都计数 | 播放器把 dts 回退当跳帧；静默改数据不可接受 |

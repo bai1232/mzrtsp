@@ -67,6 +67,13 @@ public:
     bool stopRequested() const {
         return _stop_requested.load();
     }
+
+    /// 供**真实的读实现**绑定：例如 `DemuxerProducer` 把它交给 `Demuxer::setAbortFlag`，
+    /// 这样 `stop()` 才能真正打断正在进行的 `av_read_frame`，而不是干等 join
+    /// @note 返回引用而非 bool：它本来就是给 FFmpeg 的 interrupt_callback 读的原子量
+    const std::atomic<bool> &stopFlag() const {
+        return _stop_requested;
+    }
     /// 是否因为**正常读完**而结束（错误结束时为 false —— 与 DESIGN_M4 的 EOF/Error 分离同一原则）
     bool eof() const {
         return _eof.load();

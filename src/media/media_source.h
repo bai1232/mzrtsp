@@ -1,33 +1,30 @@
 /*
- * MediaSource / Subscriber：一源多消费者（M5-a 建立，M5-b 接通线程，本批上限改为推导值）
+ * MediaSource / Subscriber：一源多消费者（M5-a 建立，M5-b 接通线程，M5-c 订阅管理线程安全）
  * ============================================================================
  * 形状来源：docs/DESIGN_M5.md §3.4；上位依据 ARCHITECTURE.md §3（线程模型）、§4（一源多消费者）、
  *           §5（背压）；需求：FR-5.1（**修订版**：队列上限 = 码率上限 × 延迟额度，只按字节）
  *                FR-5.2（溢出丢最旧的一段，音视频成对）、FR-5.3、NFR-6、FR-6.1
  *
- * 【上限怎么来的】不在这里拍字节数，而是从两个物理量推：
- *     queueMaxBytes() = max_bitrate_bps × latency_budget_ms / 8000   （能容忍多少秒延迟）
- *     gopMaxBytes()   = max_bitrate_bps × max_gop_ms        / 8000   （一个 GOP 有多大）
- *   原因：字节数是**结果**，不是**参数**。写死字节数会在 4K（装不下 1 秒）与低码率
- *   （浪费几十秒内存）两头都失准。
+ * 【线程契约（M5-c 修正）】——TSAN 抓出来的真问题，别再退回去：
+ *   · `pushPacket` 由**源线程**调用；
+ *   · `subscribe` / `unsubscribe` / `subscriberCount` / `endOfStream` / `limits` / `setLimits`
+ *     可以由**任意线程**调用（M5-c 起：HTTP 线程订阅、源线程同时推流是常态）。
+ *   · 因此订阅集合、`GopCache`、`_ended` 全部由内部 `_mutex` 保护。
+ *   · **唤醒一律在锁外做**：`EventPoller::async` 在"调用者本身就是轮询线程"时会**内联执行**，
+ *     内联的 drain 回调可能再次进入本类（例如 subscribe）→ 持锁调用就是死锁。
+ *   · `gopCache()` 返回的引用只供**源线程/内部**使用（它不自己加锁）。
  *
- * 【线程模型】——照 ARCHITECTURE.md §3 规则 2 的原文：
- *   「源线程产出数据后，通过 `EventPoller::async()` 唤醒目标客户端所在线程投递」
- *   落到实现是**两件事分开**：
- *     · 数据通道 = 该订阅者的 `FrameQueue`（源线程 push；SPSC，内部一把锁）；
- *     · 唤醒通道 = `EventPoller::async()`，且**合并**：每订阅者最多一个未决唤醒。
- *   为什么不让"帧本体走 async"：真正的缓冲会变成 poller 的任务队列（上限 65536 条），
- *   队列上限就管不住内存了，丢帧计数也会长期为 0。详见 DESIGN_M5.md §4.4。
+ * 【上限怎么来的】不在这里拍字节数，而是从两个物理量推（见 §4.5）：
+ *     queueMaxBytes() = max_bitrate_bps × latency_budget_ms / 8000
+ *     gopMaxBytes()   = max_bitrate_bps × max_gop_ms        / 8000
  *
  * 【零拷贝】一帧只 `create` 一次，`pushPacket` 把**同一个 MediaPacket** 放进 N 个订阅者的队列
  *   —— 只增加引用计数，不复制字节（用例直接断言"三个订阅者拿到的指针相同"）。
  *
  * 【订阅者生命周期】源只持有 `weak_ptr`（ARCHITECTURE.md §4「引用计数即生命周期」）。
- *   消费者把 `shared_ptr` 一放，源在下次 push/subscriberCount 时**惰性注销**并计数 ——
- *   源不需要被通知，也不会因为消费者异常退出而残留队列（NFR-6）。
+ *   消费者把 `shared_ptr` 一放，源在下次 push/subscriberCount 时**惰性注销**并计数（NFR-6）。
  *
- * 【观测】计数器全部是 `std::atomic`，`dumpStats()` 可以**从任意线程**（例如 HTTP 线程）
- *   安全调用 —— FR-6.1 的最小版实现（完整 StatsCenter 与 `/api/stats` 接线见 M5-d）。
+ * 【观测】计数器全部 `std::atomic`，`dumpStats()` 可从任意线程调用（FR-6.1 的最小版）。
  * ============================================================================
  */
 
@@ -73,23 +70,19 @@ public:
     /**
      * 是否已经"没法正确播放"了
      * @note 当**不可丢**的包（视频关键帧）腾不出空间、或接入时灌不进关键帧，置位。
-     *       这是粘性标志：调用方看到它就该断开这个订阅者并 unsubscribe ——
-     *       FR-5.2 的"断开"由连接层做，媒体层只负责**明确告知**，不静默继续送
+     *       粘性标志：调用方看到它就该断开这个订阅者并 unsubscribe。
+     *       用 atomic：源线程置位、消费者线程读（M5-c 起这两条线程本就并发）
      */
     bool broken() const {
-        return _broken;
+        return _broken.load();
     }
 
     // ---------------------------------------------------------------------
     // M5-b：绑定的消费者线程 + 唤醒（跨线程投递的"唤醒通道"）
     // ---------------------------------------------------------------------
 
-    /**
-     * 绑定消费者所在的 poller
-     * @param poller 传 nullptr = 解绑（同步模式：消费者自己取队列，不产生任何跨线程唤醒）
-     * @return true = 绑定成功；false = 入参为空（已解绑）
-     * @note 绑定后若队列里已有数据（例如接入时灌的 GOP），会**立刻补一次唤醒**
-     */
+    /// @param poller 传 nullptr = 解绑（同步模式：消费者自己取，不产生跨线程唤醒）
+    /// @return true = 绑定成功；false = 入参为空（已解绑）
     bool bindPoller(const EventPoller::Ptr &poller);
 
     EventPoller::Ptr poller() const;
@@ -100,27 +93,22 @@ public:
     /**
      * 源线程调用：有新数据了，唤醒消费者线程
      * @return true = 本次真的投递了唤醒；false = 被合并 / 未绑定 poller / 投递被拒
-     * @note **唤醒合并**：每个订阅者最多一个未决唤醒。数据在队列里，唤醒只是"去看一眼"，
-     *       合并不会丢数据；不合并则是每帧一次跨线程投递，纯属浪费
+     * @note **唤醒合并**：每个订阅者最多一个未决唤醒。数据在队列里，唤醒只是"去看一眼"
      */
     bool notifyIfNeeded();
 
     /**
      * 消费者线程在 drain **之前**调用：清掉未决标记。
      * 顺序很重要 —— 先清再 drain，这样 drain 期间新进来的 push 会再排一次唤醒，不会丢唤醒。
-     * @return true = 状态发生改变
      */
     bool clearNotifyPending();
 
-    /// 唤醒真的被投递出去的次数
     uint64_t notifyCount() const {
         return _notify_count.load();
     }
-    /// 唤醒投递被拒的次数（poller 任务队列满 / poller 已退出）
     uint64_t notifyRejectedCount() const {
         return _notify_rejected_count.load();
     }
-    /// 因"已有未决唤醒"而被合并掉的次数（观测用）
     uint64_t notifyCoalescedCount() const {
         return _notify_coalesced_count.load();
     }
@@ -129,7 +117,6 @@ public:
     // 【占位，M5-d / M6 实现】订阅者的**独立时间戳基准**（ARCHITECTURE.md §4）
     //   为什么必须存在：FLV 的 timestamp 要求从 0 开始递增，而各客户端接入时刻不同；
     //   如果共用源的时间戳，后接入的客户端会看到巨大的初始时间戳 → 播放器异常。
-    //   现在不实现（还没有输出层可以用它），但**位置留在这里**，避免 M6 到处找地方塞：
     //     int64_t timestampBaseMs() const;          // 该订阅者的时间戳偏移
     //     void    setTimestampBaseMs(int64_t ms);
     //   预计落点：M6 的 `FlvSender` 在首次拿到包时以"第一个包的 dts"作为基准写进去。
@@ -140,23 +127,20 @@ private:
 
     Subscriber(Id id, const FrameQueue::Limits &limits)
         : _id(id) {
-        // 上限合法性由 MediaSource::setLimits 统一把关；万一非法，setLimits 保持默认值
-        // （默认值是合法的推导值），不会退化成无界
         (void) _queue.setLimits(limits);
     }
 
     /// @return true = 状态发生改变（已经是 broken 则返回 false，避免重复计数）
     bool markBroken() {
-        if (_broken) {
+        if (_broken.exchange(true)) {
             return false;
         }
-        _broken = true;
         return true;
     }
 
     Id _id;
     FrameQueue _queue;
-    bool _broken = false;
+    std::atomic<bool> _broken{false};
 
     mutable std::mutex _mutex; // 保护 _poller / _drain（源线程与绑定线程可能同时碰）
     EventPoller::Ptr _poller;
@@ -176,14 +160,12 @@ public:
     struct Limits {
         size_t max_bitrate_bps = 8u * 1000u * 1000u; // 单路码率上限：8 Mbps
         uint32_t latency_budget_ms = 2000;           // 延迟额度：2 s → 队列上限 2,000,000 B
-        uint32_t max_gop_ms = 2000;                  // 最大 GOP 时长：2 s → GOP 缓存上限 2,000,000 B
+        uint32_t max_gop_ms = 2000;                  // 最大 GOP 时长：2 s → GOP 上限 2,000,000 B
         size_t max_subscribers = 16;                 // **人数**是硬边界（0/无界不是选项）
 
-        /// 队列上限 = 码率上限 × 延迟额度
         size_t queueMaxBytes() const {
             return bytesFor(max_bitrate_bps, latency_budget_ms);
         }
-        /// GOP 缓存上限 = 码率上限 × 最大 GOP 时长
         size_t gopMaxBytes() const {
             return bytesFor(max_bitrate_bps, max_gop_ms);
         }
@@ -195,52 +177,47 @@ public:
 
     /// 一次 push 的结果（调用方据此判断"要不要断开某人"）
     struct PushStats {
-        size_t delivered = 0;            // 成功入队的订阅者数
-        size_t dropped_to_make_room = 0; // 其中"丢了旧的可丢包才入队"的订阅者数
-        size_t dropped_incoming = 0;     // 其中"新包被丢掉了"（新包可丢，正常降级，无需动作）
-        size_t rejected_no_space = 0;    // 入队失败的订阅者数（新包不可丢 → 对应 Subscriber::broken()）
-        size_t notified = 0;             // 其中真正投递了唤醒的订阅者数（被合并的不算）
-        size_t subscribers = 0;          // 本次实际参与分发的订阅者数（已清理失效者）
+        size_t delivered = 0;
+        size_t dropped_to_make_room = 0;
+        size_t dropped_incoming = 0;
+        size_t rejected_no_space = 0;
+        size_t notified = 0;
+        size_t subscribers = 0;
     };
 
     MediaSource();
     explicit MediaSource(const Limits &limits);
 
-    /// @return false = 上限非法（码率/时长/人数为 0 或超硬上限，或推导出的字节数超硬上限），
-    ///         保持原值不变
+    /// @return false = 上限非法，保持原值不变。**可在任意线程调用**（内部加锁）
     bool setLimits(const Limits &limits);
 
-    Limits limits() const {
-        return _limits;
-    }
+    Limits limits() const;
 
-    /**
-     * 新增订阅者，并**灌入当前 GOP 缓存**（保证第一条是视频关键帧）
-     * @return nullptr = 超过 max_subscribers / 关键帧灌不进该订阅者的队列
-     *         （后者说明"单包比整个队列上限还大"，此时宁可不接，也不让对端花屏）
-     */
+    /// 新增订阅者并灌入当前 GOP 缓存（保证第一条是视频关键帧）
+    /// @return nullptr = 超过 max_subscribers / 关键帧灌不进队列。**可在任意线程调用**
     Subscriber::Ptr subscribe();
 
-    /// 主动移除订阅者（连接层断开时调用）；@return false = 该 id 不存在
+    /// 主动移除订阅者；@return false = 该 id 不存在。**可在任意线程调用**
     bool unsubscribe(Subscriber::Id id);
 
-    /// 当前订阅者数（会先惰性清理已析构的订阅者）
+    /// 当前订阅者数（先惰性清理已析构者）。**可在任意线程调用**
     size_t subscriberCount();
 
-    /// 广播"不会再有数据了"；@return true = 状态发生改变（重复调用返回 false）
+    /// 广播"不会再有数据了"；@return true = 状态发生改变。**可在任意线程调用**
     bool endOfStream();
 
-    /// 源线程：推进一帧（内部会先喂 GOP 缓存，再分发给所有订阅者，并唤醒它们的消费者线程）
+    /// **源线程**：推进一帧（喂 GOP 缓存 → 分发给所有订阅者 → 锁外唤醒）
     PushStats pushPacket(MediaPacket::Ptr packet);
 
+    /// @note 返回的引用只供**源线程/内部**使用（本类不代理它的加锁）
     const GopCache &gopCache() const {
         return _gop;
     }
 
-    /// 一行统计（FR-6.1 的最小版）；**可从任意线程调用**（计数器都是 atomic）
+    /// 一行统计（FR-6.1 的最小版）；**可从任意线程调用**
     std::string dumpStats() const;
 
-    // ---- 观测（FR-6.1 的素材；绝不用计数替代上限）----
+    // 观测（全部 atomic）
     uint64_t totalDelivered() const {
         return _total_delivered.load();
     }
@@ -262,7 +239,6 @@ public:
     uint64_t totalAutoUnsubscribe() const {
         return _total_auto_unsubscribe.load();
     }
-    /// 因"不可丢的包进不去"被置为 broken 的订阅者数（累计）
     uint64_t totalBroken() const {
         return _total_broken.load();
     }
@@ -278,19 +254,23 @@ private:
         return static_cast<size_t>(static_cast<uint64_t>(bitrate_bps) * ms / 8000u);
     }
 
-    /// 清掉 shared_ptr 已释放的订阅者；@return 本次清理掉的个数
-    size_t pruneExpired();
+    /// 清掉 shared_ptr 已释放的订阅者；**调用方必须已持锁**
+    size_t pruneExpiredLocked();
 
     struct Entry {
         std::weak_ptr<Subscriber> sub;
         Subscriber::Id id = 0;
     };
 
+    mutable std::mutex _mutex; // 保护订阅集合 / _gop / _ended / _next_id / _notify_scratch
     Limits _limits;
     GopCache _gop;
     std::vector<Entry> _entries;
     Subscriber::Id _next_id = 1;
     bool _ended = false;
+    // 唤醒清单用**局部** vector，不用成员暂存：
+    // 它是"持锁填、出锁消费"的，若用成员变量，两个不同线程的调用（pushPacket / endOfStream）
+    // 会互相清空对方的结果 —— 一个每帧几十纳秒的小分配，换掉一整类并发 bug，值。
 
     std::atomic<uint64_t> _total_delivered{0};
     std::atomic<uint64_t> _total_dropped_to_make_room{0};

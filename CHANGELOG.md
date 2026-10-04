@@ -263,6 +263,43 @@
   （§1 批计划、§3 契约、§4.2/§4.5、§5 用例、§7 决策、§8 未决 2/3/4/6 关闭）
 - 遗留：**包数防呆硬顶未加**（只按字节后，极小包洪泛会放大记账外内存开销；见 `DESIGN_M5.md` §6 风险 11 / §8 未决 7）
 
+#### M5-c 真接 Demuxer + 源管理（懒启动 / 空闲释放）
+- 新增 `DemuxerProducer`：把 M4 的 `Demuxer` 包成 `SourcePump` 的读回调（`AVPacket → MediaPacket`）。
+  **每包一次拷贝**（全链路唯一一处：Demuxer 的 packet 下一帧就被复用）；扇出到 N 个客户端仍零拷贝。
+  非音视频流（字幕/数据）跳过但**计数**；时间戳换算失败**仍然发包**只累加计数
+- 新增 `SourceManager`：**懒启动**（第一次 acquire 才开文件、才起源线程）、**复用**（同一 path 同一
+  `MediaSource`）、**空闲释放**（最后一个句柄放手后计时，到点停线程 + 关文件）
+  - 句柄用「自定义 deleter + 捕获强引用」：`releaseAll()` 之后句柄依然有效，不悬垂
+  - IO 在锁外做（open 可能超时，占锁 = 阻塞事件循环）；停线程在锁外做（join 耗时）
+  - 计时器只能在轮询线程挂 → `async()` 投递；**挂不上就退化为立即释放**（绝不静默"永不释放"）
+  - `idle_release_ms = 0` 是合法档位：句柄一放就释放（不缓存源），也让用例能完全确定性
+  - 未提供 poller → 明确退化为"释放即回收"，而不是"看着在缓存、其实永不释放"
+- `Demuxer` 增加 `setAbortFlag()`：`interrupt_callback` 除超时外再检查外部中止标志 ——
+  这样 `SourcePump::stop()` 才能真正打断正在进行的 `av_read_frame`，而不是干等 join
+  （`SourcePump` 相应暴露 `stopFlag()`；**唯一一处改 M4 代码**，已同步 `DESIGN_M4`）
+- 测试：`tests/test_source_manager.cpp` **8 用例 / 360 断言**（新分组 `srcmgr`，进 TSAN 严格组）；
+  真读 `samples/sample.mp4`（320x240 H264 + AAC）到 EOF，断言视频 dts 单调、关键帧 1 个、音视频包都 > 0
+- 关键验证：懒启动（acquire 前源数为 0）；复用（两次 acquire 同一指针、`totalCreated == 1`）；
+  空闲窗口内再次 acquire 会**取消计时**（等过原定时长源仍在）；打不开 → nullptr + 计数 + `lastError`；
+  `releaseAll()` 后句柄不悬垂、再 acquire 会重建（`totalCreated == 2`）
+- 变异验证：①「打不开也照样注册源」→ `open_failure_not_silent` + `lazy_start_and_reuse` **红**（有效）；
+  ②「去掉空闲到点的 handles 复查那一行」→ **用例仍全绿**：说明该行是**冗余兜底**
+  （`acquire` 会 cancel 计时器、`armIdleTimer` 也会查 `handles`），当前**不可达**但保留，
+  以防将来某条路径忘记 cancel —— 这类"存活变异"要如实记录，不能当成"验证通过"
+- 三方对齐补齐：`ROADMAP` / `TESTING` 补 **FR-1.2**（按需启动、不支持 seek）、**FR-2.1**（真读 MP4）、
+  **FR-6.3**（源创建/释放落日志）的编号引用
+- **TSAN 抓到真 bug 并修掉（本批最重要的产出）**：接上真实源线程后，调用方会在源线程推流的同时
+  `subscribe()` —— 而 `MediaSource` 的订阅管理当时**完全没有同步**，TSAN 报了 **13 处 data race**
+  （全部指向 `subscribe()` 里读 `GopCache` 那一行）。修法：订阅集合 / `GopCache` / `_ended` / `_next_id`
+  统一由 `_mutex` 保护；**唤醒一律移到锁外**（`async` 在"调用者就是轮询线程"时会内联执行，
+  内联的 drain 回调可能再次进入 `MediaSource` → 持锁调用即死锁）；唤醒清单用**局部** vector
+  （成员暂存会被两个线程的调用互相清空）。`Subscriber::broken()` 改 atomic
+- 附带：`DemuxerProducer` 的计数改 atomic、`lastError()` 走锁（观测方可能在别的线程）
+- 命名坑：用例曾叫 `srcmgr_idle_release_i`**`mmedia`**`te` → 含 "media" 子串，会被纯逻辑的
+  `media` 分组过滤到、把该组拖成"依赖样本"；已改名 `srcmgr_idle_release_without_cache`
+  （子串匹配的坑，已记入 `DESIGN_M5` §5.3）
+- 遗留：**循环播放（FR-1.2 的"可选循环"）留 M6**（要"读完重开 + 时间戳重置"，与源生命周期纠缠）
+
 ### 说明
 - `v0.1.0` 尚未发布。按 `VERSIONING.md`，tag 只能打在**可独立构建且测试通过**的提交上。
 - M1（Core 层）已完成并推送；后续进入 M2（网络层：EventPoller / TcpServer / Session）。

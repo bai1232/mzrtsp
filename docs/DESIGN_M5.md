@@ -11,7 +11,7 @@
 | **M5-a** | `MediaPacket`、`FrameQueue`、`GopCache`、`Subscriber`、`MediaSource`（**单线程策略**，帧由外部喂入） | ✅ |
 | **M5-b** | **线程打通**：`FrameQueue` 加锁成 SPSC；`Subscriber` 绑定消费者线程 + **唤醒合并**；`SourcePump`（源线程驱动一个**可打断**的读回调） | ✅ |
 | **M5-b′**（决策落地） | FR-5.1 改为**只按字节**且上限=**码率×延迟额度**；FR-5.2 改为**音视频成对丢**；GOP 上限=**码率×最大 GOP 时长**；统计最小版 `dumpStats()` | ✅（本文件） |
-| M5-c | `SourceManager`（懒启动 / 空闲 60s 释放）+ `DemuxerProducer`（把 M4 的 `Demuxer` 接到 `SourcePump` 的读回调上，`interrupt_callback` 接停止请求） | 后续 |
+| **M5-c** | `SourceManager`（懒启动 / 复用 / 空闲释放）+ `DemuxerProducer`（把 M4 的 `Demuxer` 接到 `SourcePump` 的读回调上，中止标志接 `interrupt_callback`） | ✅ |
 | M5-d | 节流（FR-3.5：按墙钟对齐推送）、30s 写阻塞断开与 `broken()` 的端到端串通、`dumpStats()` 接进 `/api/stats`（FR-6.1） | 后续 |
 
 **验收（对应 `docs/ROADMAP.md:15`，按批次分配）**：
@@ -25,7 +25,8 @@
 | 源线程 ⇄ 消费者线程之间**数据不丢、不重、不卡**；唤醒**既不丢也不刷**（合并） | M5-b ✅ |
 | 源被停止 / 读失败 / 读完时，消费者都能**明确知道"不会再有数据"**（绝不永久等待） | M5-b ✅ |
 | 丢弃单位是"最旧的一段"（**音视频成对**），关键帧绝不丢 | M5-b′ ✅ |
-| 懒启动、空闲 60s 释放、源与线程 100% 回收 | M5-c |
+| 懒启动、空闲释放、源与线程 100% 回收（**FR-1.2** 按需启动、**NFR-6**） | M5-c ✅ |
+| 真读 v0.1 的 **MP4（H264 + AAC）** 到 EOF；源创建 / 释放落日志（**FR-2.1** / **FR-6.3**） | M5-c ✅ |
 | 10 路并发压测、1 小时长跑 | M6 / M7 |
 
 ## 2. 分层位置与依赖方向
@@ -43,10 +44,12 @@ Output(未做) ← Media ← Network(EventPoller) / Core
 
 ## 3. 契约
 
-**线程契约（M5-b 起）**：数据方向是 **SPSC** —— 源线程只调 `pushPacket` / `notifyIfNeeded`，
-消费者线程只调 `queue().pop()` / drain 回调；两者**可以不是同一线程**。
-内部只在 `FrameQueue` 与 `Subscriber` 的绑定状态上各用一把锁，**不做回调嵌套加锁**。
-`GopCache` 与订阅管理仍假定"只在源线程调用"。
+**线程契约（M5-c 修正）**：数据方向是 **SPSC** —— 源线程只调 `pushPacket`；
+**订阅管理（`subscribe` / `unsubscribe` / `subscriberCount` / `endOfStream` / `limits`）可由任意线程调用**
+（内部 `_mutex` 保护订阅集合、`GopCache`、`_ended`）；消费者线程只调 `queue().pop()` / drain 回调。
+**两条纪律**：① 唤醒一律在**锁外**做（`async` 会内联执行 drain 回调，持锁调用即死锁）；
+② `gopCache()` 返回的引用只供源线程 / 内部使用（它不代理加锁）。
+`GopCache` 本身仍是"外部同步"的组件，只被 `MediaSource` 在持锁状态下使用。
 
 ### 3.1 `MediaPacket`（`media_packet.h`）
 
@@ -264,6 +267,67 @@ public:
 - 三种结束（**读完 / 读失败 / 被停**）都广播 EOS；`eof()` 与 `lastError()` 把"读完"和"失败"分开。
 - `ReadFn` 说好返回 `Packet` 却给空包 → **当作错误停下来**并记原因（否则是"死循环 + 什么都不做"的静默故障）。
 
+### 3.6 `DemuxerProducer`（`demuxer_producer.h`，M5-c）
+
+把 M4 的 `Demuxer` 包成 `SourcePump` 的读回调 —— 它**只做一件事**：`AVPacket → MediaPacket`。
+
+```cpp
+class DemuxerProducer {
+public:
+    struct Config { Demuxer::Limits demux; };
+
+    bool open(const std::string &path);       // false = 打不开（原因见 lastError）
+    const Demuxer &demuxer() const;           // M6 要用流信息写 FLV 的 sequence header
+    const std::atomic<bool> *setAbortFlag(const std::atomic<bool> *flag);  // 返回上一个
+
+    SourcePump::ReadResult read(MediaPacket::Ptr *packet, std::string *error); // 直接当 ReadFn 用
+    uint64_t totalPackets() const;  uint64_t totalBytes() const;
+    uint64_t skippedUnknownStreams() const;  uint64_t timestampFailures() const;
+    std::string lastError() const;
+};
+```
+
+- **每包一次拷贝**（全链路唯一一处）：`Demuxer::packet()` 指向它内部的 `AVPacket`，下一帧就被复用，
+  必须把字节搬进共享载荷。扇出到 N 个客户端仍然是零拷贝。
+- **非音视频流跳过但计数**（字幕 / 数据流）：静默跳过等于悄悄丢数据。
+- 时间戳换算失败**仍然发包**（用 Demuxer 保持的上一次值 + 单调钳制），只累加计数 ——
+  丢一个包比时间戳不够精确更糟。
+
+### 3.7 `SourceManager`（`source_manager.h`，M5-c）
+
+源的**懒启动 / 复用 / 空闲释放**（`ARCHITECTURE.md` §7「lazy 启动 + 空闲 60s 释放」）。
+
+```cpp
+class SourceManager : public std::enable_shared_from_this<SourceManager> {
+public:
+    using Ptr = std::shared_ptr<SourceManager>;
+    struct Config {
+        uint32_t idle_release_ms = 60000;   // 0 = 句柄一放就释放（不缓存源）
+        MediaSource::Limits source;         // 每源的队列 / GOP / 人数上限
+        DemuxerProducer::Config producer;   // 解封装上限
+    };
+
+    static Ptr create(const EventPoller::Ptr &poller);   // 必须用 create（句柄回指需要 weak_ptr）
+    bool setConfig(const Config &config);
+    MediaSource::Ptr acquire(const std::string &path);   // nullptr = 打不开（**不注册源**）
+    bool release(const std::string &path);               // 立刻释放
+    size_t releaseAll();                                 // 关停路径
+    size_t sourceCount() const;  size_t handleCount() const;
+    std::string dumpStats() const;  std::string lastError() const;
+};
+```
+
+四条必须做对的地方（改回去就会出事）：
+
+1. **句柄的生命周期**：对外返回的 `MediaSource::Ptr` 用「自定义 deleter + 捕获强引用」构造 ——
+   句柄自己也让对象活着，所以 `releaseAll()` 摘掉条目之后句柄**依然有效**（不会悬垂）；
+   deleter 只通过 `weak_ptr` 回调管理器，管理器已析构时是 no-op。
+2. **IO 在锁外**：`open` 可能慢甚至超时，而管理器锁**轮询线程也要拿**（挂计时器）——
+   占着它就等于阻塞事件循环。
+3. **计时器只在轮询线程挂**（`doDelayTask` 的约定）→ 一律用 `async()` 投递；
+   投递 / 挂表失败（poller 已退出）**绝不静默"永不释放"** → 计数 + Warn + **退化为立即释放**。
+4. **停线程在锁外**：`pump->stop()` 会 join，持有管理器锁时不做。
+
 ## 4. 关键机制
 
 ### 4.1 零拷贝分发
@@ -325,7 +389,7 @@ M5-a 的用例加锁之后原样通过（这就是"正交"的验证方式）。
 `SourcePump` 只做三件事：**读 → 推 → 收尾广播 EOS**。它**允许**随输入 IO 阻塞，
 但绝不阻塞事件循环：不碰任何 socket、不碰 `Session`，跨线程只通过 `MediaSource::pushPacket`。
 
-## 5. 测试计划（20 个用例：`media` 14 个 + `ntimed_media` 6 个）
+## 5. 测试计划（28 个用例：`media` 14 个 + `ntimed_media` 6 个 + `srcmgr` 8 个）
 
 ### 5.1 单线程纯策略（分组 `media`，14 个）
 
@@ -360,6 +424,19 @@ M5-a 的用例加锁之后原样通过（这就是"正交"的验证方式）。
 **为什么 `ntimed_media` 也能进 TSAN 严格组**：全程只用**无超时**等待（`Semaphore::wait()`）与
 `sleep_for`，不碰本环境已知的 `condition_variable` 超时误报；并发用例要的是"不丢 / 不重 / 不卡"。
 
+### 5.3 真接 Demuxer + 源管理（分组 `srcmgr`，8 个）
+
+| # | 用例 | 覆盖维度 | 断言要点 |
+|---|---|---|---|
+| 1 | `srcmgr_demuxer_producer_reads_mp4` | 正常 | 真读 `sample.mp4` 到 EOF：320x240、视频 dts 单调、关键帧 1 个、音视频包都 > 0、`skippedUnknownStreams == 0`、`lastError()` 空 |
+| 2 | `srcmgr_lazy_start_and_reuse` | 正常 | acquire 前源数为 0；两次 acquire 是**同一指针**且 `totalCreated == 1`；订阅者能收到真包且首包是关键帧 |
+| 3 | `srcmgr_idle_release_without_cache` | 断开 | `idle = 0` 且**没有 poller**：句柄一放就回收（`sourceCount == 0`、`idle_released == 1`、`idle_schedule_failed == 0`）。<br>命名注意：**不要**叫 `*_immediate` —— 里面有 "media" 子串，会被纯逻辑的 `media` 分组过滤到（子串匹配的坑） |
+| 4 | `srcmgr_idle_timer_releases_after_window` | 断开 | `idle = 50ms`：释放句柄后**先不回收**，等窗口到点才回收（`idle_released == 1`、`released == 0`） |
+| 5 | `srcmgr_acquire_cancels_idle_timer` | 正常 / 断开 | 窗口内再 acquire → 复用同一源；等过原定时长后源**仍在**（计时被取消）；再放手才会回收 |
+| 6 | `srcmgr_open_failure_not_silent` | 失败 | 打不开 / 空 path → nullptr、源数为 0、计数 +1、`lastError()` 非空 |
+| 7 | `srcmgr_release_all_stops_sources` | 断开 | `releaseAll()` 立即停源；**句柄仍有效**（不悬垂）；再 acquire 会重建（`totalCreated == 2`）；`release()` 第二次返回 false |
+| 8 | `srcmgr_dump_stats_minimal` | FR-6.1 | 一行统计含 sources / handles / created / idle_schedule_failed |
+
 ## 6. 风险清单
 
 | # | 风险 | 触发条件 | 应对 |
@@ -376,6 +453,7 @@ M5-a 的用例加锁之后原样通过（这就是"正交"的验证方式）。
 | 10 | 跨线程读 `Stats` 得到撕裂值 | 取值接口返回内部引用 | 全部返回**快照** |
 | 11 | **只按字节后，小包洪泛会放大记账外开销** | 生产者发出大量极小包（例如 1 字节/包）：2 MB 上限可容纳 200 万包，每包 `deque` 节点 + `shared_ptr` 控制块 ≈ 百字节 → 实际内存远大于 2 MB | 真实媒体包 ≥ 数十字节（128 kbps / 50 fps 的音频帧 ≈ 320 B），故当前量级下不构成问题；**未加"包数防呆硬顶"**（用户明确要求删掉帧数上限），列为 §8 未决 7，需要时一行即可补 |
 | 12 | 上限推导参数配错（码率填成 8 bps） | 手工传 `Limits` | `setLimits` 校验三者为正数且不超硬上限；推导出的字节数还要过各组件硬上限；用例 12 |
+| 13 | **订阅管理与源线程并发**（M5-c 实测踩到） | 调用方在源线程推流的同时 `subscribe()`（M6 的 HTTP 线程就是这种形态） | 内部 `_mutex` 保护订阅集合 / `GopCache` / `_ended`；**唤醒移到锁外**；`media` / `ntimed_media` / `srcmgr` 全在 TSAN 严格组 —— 本批就是靠它抓到 **13 处真 data race** |
 
 ## 7. 决策记录（为什么这么选 / 排除了什么）
 
@@ -406,11 +484,22 @@ M5-a 的用例加锁之后原样通过（这就是"正交"的验证方式）。
 | "结束"的语义 | 三种结束都广播 EOS；`eof()` 只表示正常读完 | 排除"只有读完才广播 EOS"（被停/出错时消费者永久等待） |
 | 空包处理 | 当作**错误**停下并记原因 | 排除"跳过继续读"（ReadFn 坏掉时变成死循环 + 什么都不做的静默故障） |
 
+| 【M5-c】真读用 `DemuxerProducer` 包装 | 把 `Demuxer` 包成 `ReadFn`（读回调由调用方提供） | 排除"让 `SourcePump` 直接持有 `Demuxer`"（pump 被 FFmpeg 绑死，M5-b 的假源用例就没了）；排除"在 `MediaSource` 里读文件"（策略类又被迫依赖 IO） |
+| 【M5-c】每包**拷一次** | `AVPacket → shared_ptr<const vector<uint8_t>>` | 排除"真零拷贝"（要改 `MediaPacket` 的 payload 类型 + `av_packet_ref` 包装，波及 M5-a/b 全部代码）；NFR-4 的"单路 < 5% 单核"远够，而**扇出到 N 个客户端仍然是零拷贝** |
+| 【M5-c】非音视频流跳过但**计数** | 只把 Video/Audio 喂给媒体层 | 排除"当作错误"（一条字幕轨不该让整个源失败）；排除"静默跳过"（等于悄悄丢数据） |
+| 【M5-c】时间戳换算失败**仍发包** | 用上次值 + 单调钳制，只累加计数 | 排除"丢包"（丢数据比时间戳不够精确更糟）；排除"静默填 0"（那是伪造时间戳） |
+| 【M5-c】中止标志接进 `interrupt_callback` | `Demuxer::setAbortFlag()` + `SourcePump::stopFlag()` | 排除"只靠读超时"（停一个卡在 `av_read_frame` 的源要等满 5s 才回来）；排除"另起线程强制关"（`DESIGN_M4` §7 已排除） |
+| 【M5-c】句柄用「自定义 deleter + 捕获强引用」 | `releaseAll()` 之后句柄依然有效 | 排除"裸指针 + 管理器强引用"（`releaseAll` 后句柄悬垂）；排除"句柄持有 `shared_ptr<Entry>`"（管理器被句柄拖住，无法真正回收） |
+| 【M5-c】IO / 停线程都在**锁外** | 只在对 `_entries` 增删时持锁 | 排除"持锁 open"（open 可能超时，占着锁 = 阻塞轮询线程挂计时器）；排除"持锁 join"（同理） |
+| 【M5-c】空闲计时挂不上就**立即释放** | 计数 + Warn + 立即回收 | 排除"静默不释放"（源线程与文件句柄泄漏，且没有任何迹象）；排除"重试"（poller 都没了，重试无意义） |
+| 【M5-c】`idle_release_ms = 0` 合法 | 含义是"不缓存源"（最保守的一档） | 排除"0 一律拒绝"（那是容量类参数的习惯；这里 0 不是无界而是"立刻回收"）；好处是用例可以完全确定性 |
+| 【M5-c】订阅管理**线程安全**（TSAN 抓出来后修正） | `MediaSource` 内部一把锁保护订阅集合 / `GopCache` / `_ended`；**唤醒移到锁外** | 排除"要求调用方把 subscribe 投递回源线程"（调用方根本没有源线程的句柄；M6 的 HTTP 线程只会直接调）；排除"锁内唤醒"（`async` 在轮询线程上会**内联执行** drain 回调 → 重入死锁）；排除"唤醒清单用成员暂存"（两个线程的调用会互相清空） |
+
 ## 8. 未决事项
 
 | # | 事项 | 何时定 |
 |---|---|---|
-| 1 | `max_subscribers` 初值 16 是否合适 | M5-c 接入真实连接后按 `totalRejected` 观察 |
+| 1 | `max_subscribers` 初值 16 是否合适 | **M6** 接入真实连接（HTTP 层）后按 `totalRejected` 观察 |
 | 2 | ~~队列上限 64 帧/8MB 是否合适~~ | ✅ **已定（M5-b′）**：只按字节，`= 码率上限 × 延迟额度`（初值 8 Mbps × 2 s = 2 MB） |
 | 3 | ~~GOP 缓存 8MB 是否够~~ | ✅ **已定（M5-b′）**：`= 码率上限 × 最大 GOP 时长`（初值 2 MB） |
 | 4 | ~~音频不可丢在拥塞下导致队列只涨不落~~ | ✅ **已定（M5-b′）**：改为**音视频成对丢**（丢最旧的一段） |
@@ -419,6 +508,8 @@ M5-a 的用例加锁之后原样通过（这就是"正交"的验证方式）。
 | 7 | **包数防呆硬顶**（只按字节后，小包洪泛会放大记账外内存开销，见 §6 风险 11） | 待 M6 实测真实包尺寸；若确有必要，加一个**内部**硬顶（非可调业务上限），一行代码 |
 | 8 | `FrameQueue` 的锁粒度是否需要升级（无锁 SPSC 环形缓冲） | M6 拿到真实吞吐后；当前无数据支持升级 |
 | 9 | 唤醒合并是否够（单次 drain 总取不完时要不要批量投递） | M6 实测；当前 100 帧 = 1 次唤醒，余量很大 |
+| 10 | **循环播放**（FR-1.2 的"可选循环"） | **M6**：要"读完重开 + 时间戳基准重置"，与源生命周期纠缠 —— M5-c 已明确不做（用户已确认） |
+| 11 | 空闲释放阈值 60s 是否合适（真实播放里"暂停一分钟再回来"就要重建源） | M7 采集：看 `totalIdleReleased` 与重建开销，必要时调大 |
 
 ## 9. 假设清单与影响面（`AI_COLLAB.md` §1 的②③）
 
@@ -434,9 +525,10 @@ M5-a 的用例加锁之后原样通过（这就是"正交"的验证方式）。
 
 **影响面（M5-a → M5-b′ 累计）**：
 
-- 新增：`src/media/{media_packet,frame_queue,gop_cache,media_source,source_pump}.h/.cpp`、
-  `tests/test_media.cpp`、`tests/test_media_ntimed.cpp`、本文件。
-- 改动：`CMakeLists.txt`、`tests/CMakeLists.txt`（分组 `media` / `ntimed_media`）、`src/mzmedia.h`、
-  `scripts/tsan.sh`（严格组）、`docs/SPEC.md`（**FR-5.1 / FR-5.2 修订**）、`docs/ROADMAP.md`、
+- 新增：`src/media/{media_packet,frame_queue,gop_cache,media_source,source_pump,demuxer_producer,source_manager}.h/.cpp`、
+  `tests/test_media.cpp`、`tests/test_media_ntimed.cpp`、`tests/test_source_manager.cpp`、本文件。
+- 改动：`CMakeLists.txt`、`tests/CMakeLists.txt`（分组 `media` / `ntimed_media` / `srcmgr`）、`src/mzmedia.h`、
+  `scripts/tsan.sh`（严格组）、**`src/ffmpeg/demuxer.h/.cpp`**（M5-c **唯一**一处改 M4 代码：`setAbortFlag`，
+  已同步 `docs/DESIGN_M4.md` §3.3）、`docs/SPEC.md`（FR-5.1 / FR-5.2 修订）、`docs/ROADMAP.md`、
   `docs/TESTING.md`、`CHANGELOG.md`。
-- **不动**：`core/`、`network/`、`http/`、`ffmpeg/` 任何现有代码。
+- **不动**：`core/`、`network/`、`http/` 任何现有代码；`media/` 的既有策略。

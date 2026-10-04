@@ -1,7 +1,7 @@
 /*
- * Demuxer：解封装（M4-a）
+ * Demuxer：解封装（M4-a；M5-c 增加"外部中止标志"）
  * ============================================================================
- * 形状来源：docs/DESIGN_M4.md §3.3
+ * 形状来源：docs/DESIGN_M4.md §3.3、docs/DESIGN_M5.md §3.6
  *
  * 只做三件事：打开 → 报流信息 → 读包。**不解码**（解码在 M5+）。
  *
@@ -12,12 +12,19 @@
  *      不是"读完了再比时间"（那样卡死时根本回不来）；
  *   4) 时间戳：换算 + 单调守卫都要**可见**（计数），绝不静默改数据。
  *
+ * 【M5-c 新增】`setAbortFlag()`：把外部的"要停了"标志接进同一个 interrupt_callback。
+ *   为什么需要：`SourcePump::stop()` 会 join 源线程；如果源正卡在 `av_read_frame` 里
+ *   （大文件慢盘、v0.3 的网络 URL），只靠"读超时"要等满 5s 才回来。
+ *   接上标志后 stop() 立刻生效 —— 这也是 DESIGN_M4 §7 选 interrupt_callback 而不是
+ *   "另起线程强制关"的原因。
+ *
  * 本头文件会把 libav* 的头带进来 —— 这是 M4 的边界（use `mzmedia.h` 的使用方无感）。
  * ============================================================================
  */
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -63,6 +70,14 @@ public:
     bool opened() const;
     const std::string &path() const;
 
+    /**
+     * 绑定外部中止标志（M5-c）
+     * @param flag 由调用方保证**生命周期长于本对象**；传 nullptr = 取消绑定
+     * @return **上一个**标志（沿用全项目"注册返回上一个"的约定）
+     * @note 标志是 atomic<bool>，可从任意线程置位；interrupt_callback 里读它
+     */
+    const std::atomic<bool> *setAbortFlag(const std::atomic<bool> *flag);
+
     const std::vector<StreamInfo> &streams() const;
     const StreamInfo *firstVideo() const;   // 没有则 nullptr
     const StreamInfo *firstAudio() const;
@@ -94,6 +109,7 @@ private:
     AvPacket _pkt;
     std::vector<MonotonicGuard> _pts_guard;   // 按流索引
     std::vector<MonotonicGuard> _dts_guard;
+    const std::atomic<bool> *_abort = nullptr; // 外部中止标志（M5-c）
     int _pkt_stream_index = -1;
     int64_t _pkt_pts_ms = 0;
     int64_t _pkt_dts_ms = 0;

@@ -39,6 +39,8 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_media.cpp
         # ---- M5-b 源线程与跨线程投递 ----
         ${CMAKE_CURRENT_SOURCE_DIR}/test_media_ntimed.cpp
+        # ---- M5-c 真接 Demuxer + 源管理 ----
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_source_manager.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS
@@ -83,6 +85,9 @@ set(MZMEDIA_TEST_GROUPS
         # ---- M5-b 源线程与跨线程投递 ----
         # 有线程，但只用无超时等待（Semaphore::wait / sleep_for），不碰已知误报机制 → 仍在严格组。
         ntimed_media
+        # ---- M5-c 真接 Demuxer + 源管理 ----
+        # 有线程与定时器，但等待方式同上（sleep_for + 有界轮询）→ 严格组。
+        srcmgr
         )
 
 add_executable(mzmedia_unittest ${MZMEDIA_TEST_SOURCES})

@@ -111,6 +111,9 @@ set(MZMEDIA_SOURCES
         src/media/media_source.cpp
         # M5-b 源线程
         src/media/source_pump.cpp
+        # M5-c 真接 Demuxer + 源管理（懒启动 / 空闲释放）
+        src/media/demuxer_producer.cpp
+        src/media/source_manager.cpp
         )
 
 # 骨架阶段（第 1 批）没有任何源文件，此时不能创建 STATIC 库目标
