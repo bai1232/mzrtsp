@@ -22,10 +22,12 @@
 #include "test_main.h"
 
 #include "core/semaphore.h"
+#include "core/util.h"
 #include "media/demuxer_producer.h"
 #include "media/source_manager.h"
 #include "network/event_poller.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -259,7 +261,12 @@ MZ_TEST(srcmgr_idle_timer_releases_after_window) {
     handle.reset();
 
     // 句柄释放后**不能立刻**回收，要等空闲窗口到点
-    const bool released = waitFor([&] { return manager->sourceCount() == 0; });
+    // 超时给得宽：空闲释放依赖"轮询线程被唤醒 + 定时器到点"，在 ASAN / 满载下会被拖慢
+    // （实测：ctest 满载时曾经超过 3s）。失败时打印统计，避免下次只剩一句"期望为真"。
+    const bool released = waitFor([&] { return manager->sourceCount() == 0; }, 10000);
+    if (!released) {
+        MZ_FAIL("空闲释放超时（10s），当前统计：" + manager->dumpStats());
+    }
     MZ_ASSERT_TRUE(released);
     MZ_ASSERT_EQ(manager->totalIdleReleased(), 1u);
     MZ_ASSERT_EQ(manager->totalReleased(), 0u); // 不是主动释放
@@ -300,9 +307,13 @@ MZ_TEST(srcmgr_acquire_cancels_idle_timer) {
     MZ_ASSERT_EQ(manager->sourceCount(), 1u);
     MZ_ASSERT_EQ(manager->totalIdleReleased(), 0u);
 
-    // 再放掉 → 这次才会被回收
+    // 再放掉 → 这次才会被回收（超时同样给宽，理由见上一个用例）
     again.reset();
-    MZ_ASSERT_TRUE(waitFor([&] { return manager->sourceCount() == 0; }));
+    const bool released_after = waitFor([&] { return manager->sourceCount() == 0; }, 10000);
+    if (!released_after) {
+        MZ_FAIL("空闲释放超时（10s），当前统计：" + manager->dumpStats());
+    }
+    MZ_ASSERT_TRUE(released_after);
     MZ_ASSERT_EQ(manager->totalIdleReleased(), 1u);
 
     (void) poller->shutdown();
@@ -374,4 +385,80 @@ MZ_TEST(srcmgr_dump_stats_minimal) {
     MZ_ASSERT_TRUE(stats.find("handles=0") != std::string::npos);
     MZ_ASSERT_TRUE(stats.find("created=0") != std::string::npos);
     MZ_ASSERT_TRUE(stats.find("idle_schedule_failed=0") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// M5-d：统计 JSON 与节流（FR-6.1 / FR-3.5）
+// ---------------------------------------------------------------------------
+
+MZ_TEST(srcmgr_dump_stats_json_has_manager_and_sources) {
+    const std::string path = samplePath("sample.mp4");
+    MZ_ASSERT_FALSE(path.empty());
+    if (path.empty()) {
+        return;
+    }
+
+    auto poller = EventPoller::create("test-srcmgr-json");
+    auto manager = SourceManager::create(poller);
+    auto handle = manager->acquire(path);
+    MZ_ASSERT_NOT_NULL(handle.get());
+    if (!handle) {
+        poller->shutdown();
+        return;
+    }
+
+    const std::string json = manager->dumpStatsJson();
+    MZ_ASSERT_TRUE(json.find("\"source_manager\":{") == 0);          // 片段形态：键名做前缀
+    MZ_ASSERT_TRUE(json.find("\"sources\":1") != std::string::npos);
+    MZ_ASSERT_TRUE(json.find("\"media_sources\":[") != std::string::npos);
+    MZ_ASSERT_TRUE(json.find("\"media_source\":{") != std::string::npos);
+    MZ_ASSERT_TRUE(json.find("\"subscribers\":0") != std::string::npos);
+    MZ_ASSERT_TRUE(json.find("\"counters\":{") != std::string::npos);
+
+    // 最粗的配平检查：花括号必须成对（片段要能直接嵌进 /api/stats 的对象里）
+    const size_t open_braces = static_cast<size_t>(std::count(json.begin(), json.end(), '{'));
+    const size_t close_braces = static_cast<size_t>(std::count(json.begin(), json.end(), '}'));
+    MZ_ASSERT_EQ(open_braces, close_braces);
+
+    (void) poller->shutdown();
+}
+
+MZ_TEST(srcmgr_throttle_limits_delivery_rate) {
+    const std::string path = samplePath("sample.mp4");
+    MZ_ASSERT_FALSE(path.empty());
+    if (path.empty()) {
+        return;
+    }
+
+    auto poller = EventPoller::create("test-srcmgr-throttle");
+    auto manager = SourceManager::create(poller);
+    auto cfg = manager->config();
+    cfg.throttle.enabled = true;
+    cfg.throttle.speed = 8.0; // 样本 2 秒 → 约 250ms 读完（不节流的话是几毫秒）
+    MZ_ASSERT_TRUE(manager->setConfig(cfg));
+
+    auto handle = manager->acquire(path);
+    MZ_ASSERT_NOT_NULL(handle.get());
+    if (!handle) {
+        poller->shutdown();
+        return;
+    }
+    auto sub = handle->subscribe();
+    MZ_ASSERT_NOT_NULL(sub.get());
+    if (!sub) {
+        poller->shutdown();
+        return;
+    }
+
+    const int64_t begin = static_cast<int64_t>(getCurrentMillisecond());
+    // 等到源结束（EOS 广播到订阅者队列）
+    MZ_ASSERT_TRUE(waitFor([&] { return sub->queue().endOfStream(); }, 5000));
+    const int64_t elapsed = static_cast<int64_t>(getCurrentMillisecond()) - begin;
+
+    // 下界证明"没有以磁盘速度全速灌入"（FR-3.5 的核心），上界证明"没有慢到实时"
+    MZ_ASSERT_GE(elapsed, 100);
+    MZ_ASSERT_LT(elapsed, 1500);
+    MZ_ASSERT_GT(sub->queue().stats().pushed, 0u);
+
+    (void) poller->shutdown();
 }

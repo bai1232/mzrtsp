@@ -659,3 +659,34 @@ MZ_TEST(ntimed_http_api_stats) {
     MZ_ASSERT_TRUE(resp.body.find("\"accepted\":") != std::string::npos);
     ::close(cli);
 }
+
+MZ_TEST(ntimed_http_api_stats_extra_provider) {
+    // M5-d（FR-6.1）：上层装配可以把任意模块的统计片段接进 /api/stats。
+    // 这里用假片段验证"钩子通了"，真接线由 M7 的 main 做（接 SourceManager::dumpStatsJson()）
+    ServerFixture fx;
+    MZ_ASSERT_TRUE(fx.setup([](HttpServer &server) {
+        const auto previous = server.setExtraStatsProvider([] {
+            return std::string("\"fake_module\":{\"hits\":7}");
+        });
+        MZ_ASSERT_TRUE(!previous); // 第一次设置：返回"上一个"（为空）
+    }));
+
+    const int cli = connectTo(fx.server->port());
+    MZ_ASSERT_GT(cli, 0);
+
+    MZ_ASSERT_TRUE(sendAll(cli, "GET /api/stats HTTP/1.1\r\n\r\n"));
+    Response resp;
+    std::string carry;
+    MZ_ASSERT_TRUE(readResponse(cli, &resp, 2000, &carry));
+    MZ_ASSERT_EQ(resp.status, 200);
+    // 原有计数还在，追加片段也在（而且拼在同一个 JSON 对象里）
+    MZ_ASSERT_TRUE(resp.body.find("\"requests\":") != std::string::npos);
+    MZ_ASSERT_TRUE(resp.body.find("\"fake_module\":{\"hits\":7}") != std::string::npos);
+    MZ_ASSERT_TRUE(resp.body.find("}\n") != std::string::npos); // 仍然正常收尾
+
+    // start() 之后再设置：按契约**不生效**（返回空，且不会改动已生效的那个）
+    const auto rejected = fx.server->setExtraStatsProvider([] { return std::string(); });
+    MZ_ASSERT_TRUE(!rejected);
+
+    ::close(cli);
+}

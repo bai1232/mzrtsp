@@ -352,6 +352,56 @@ MediaSource::PushStats MediaSource::pushPacket(MediaPacket::Ptr packet) {
     return stats;
 }
 
+std::vector<Subscriber::Id> MediaSource::brokenSubscriberIds() const {
+    // 只读巡检：真正的断连由连接层做（DESIGN_M5 §7）
+    std::vector<Subscriber::Id> ids;
+    std::lock_guard<std::mutex> lock(_mutex);
+    for (const auto &entry : _entries) {
+        if (Subscriber::Ptr sub = entry.sub.lock()) {
+            if (sub->broken()) {
+                ids.push_back(entry.id);
+            }
+        }
+    }
+    return ids;
+}
+
+std::string MediaSource::dumpStatsJson() const {
+    // 契约：合法 JSON 对象**片段**（不含最外层花括号），键名用模块名做前缀
+    std::string out;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        out = "\"max_subscribers\":" + std::to_string(_limits.max_subscribers) +
+              ",\"subscribers\":" + std::to_string(_entries.size()) +
+              ",\"queue_bytes\":" + std::to_string(_limits.queueMaxBytes()) +
+              ",\"gop_bytes\":" + std::to_string(_limits.gopMaxBytes()) +
+              ",\"out_budget_bps\":" + std::to_string(_limits.outputBitrateBudgetBps());
+        out += ",\"broken\":[";
+        bool first = true;
+        for (const auto &entry : _entries) {
+            if (Subscriber::Ptr sub = entry.sub.lock()) {
+                if (sub->broken()) {
+                    if (!first) {
+                        out += ",";
+                    }
+                    first = false;
+                    out += std::to_string(entry.id);
+                }
+            }
+        }
+        out += "]";
+        out += ",\"counters\":{\"delivered\":" + std::to_string(_total_delivered.load()) +
+               ",\"dropped\":" + std::to_string(_total_dropped_to_make_room.load()) +
+               ",\"dropped_incoming\":" + std::to_string(_total_dropped_incoming.load()) +
+               ",\"rejected\":" + std::to_string(_total_rejected.load()) +
+               ",\"subscribe\":" + std::to_string(_total_subscribe.load()) +
+               ",\"seed_failed\":" + std::to_string(_total_seed_failed.load()) +
+               ",\"auto_unsub\":" + std::to_string(_total_auto_unsubscribe.load()) +
+               ",\"broken\":" + std::to_string(_total_broken.load()) + "}";
+    }
+    return "\"media_source\":{" + out + "}";
+}
+
 std::string MediaSource::dumpStats() const {
     // 最小版（FR-6.1）：一行、可 grep、可从任意线程调用。
     // 完整 StatsCenter 与 /api/stats 接线见 M5-d。

@@ -42,6 +42,7 @@ bool SourcePump::start(ReadFn read, MediaSource::Ptr source) {
     _eof.store(false);
     _read_count.store(0);
     _pushed_count.store(0);
+    _throttle.reset(); // 节流基准：每次 start 重新对表（FR-3.5）
     {
         std::lock_guard<std::mutex> lock(_mutex);
         _last_error.clear();
@@ -101,6 +102,11 @@ void SourcePump::run(ReadFn read, MediaSource::Ptr source) {
                 _last_error = "ReadFn 返回 Packet 但包为空（调用方 bug）";
             }
             ErrorL << "SourcePump 停止：" << lastError();
+            break;
+        }
+
+        // 节流（FR-3.5）：按 dts 与墙钟对齐；被中止就立刻退出（不再读下一包）
+        if (!_throttle.pace(packet->dtsMs(), _stop_requested)) {
             break;
         }
 

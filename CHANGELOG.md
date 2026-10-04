@@ -300,6 +300,31 @@
   （子串匹配的坑，已记入 `DESIGN_M5` §5.3）
 - 遗留：**循环播放（FR-1.2 的"可选循环"）留 M6**（要"读完重开 + 时间戳重置"，与源生命周期纠缠）
 
+#### M5-d 节流（FR-3.5）+ 统计接线（FR-6.1）—— M5 收尾
+- 新增 `Throttle`：按 `MediaPacket::dtsMs()` 与**单调墙钟**对齐推送（FR-3.5 "不得以磁盘速度全速灌入"）
+  - 默认 **开**、`speed = 1.0`；`speed` 可调（8.0 = 2 秒样本约 250ms 读完），`enabled = false` 只给压测
+  - **可被打断**：内部按 ≤50ms 的分片睡，中止标志一置位立刻返回 false（否则 `SourcePump::stop()`
+    的 join 要等满一拍）；**不补偿**落后（补偿会让源疯狂追赶，把下游再冲爆一次）
+  - `setConfig` 拒绝 0 / 负数 / NaN / inf / 超硬上限（1000 倍速），且保持原值
+- `SourcePump` 集成节流；`SourceManager::Config` 增加 `throttle`（**必须在 start() 之前配**，
+  否则真样本只能按 1 倍速跑，用例没法快）
+- 统计接线（FR-6.1）：`MediaSource::dumpStatsJson()` / `SourceManager::dumpStatsJson()` 返回
+  **合法 JSON 对象片段**（键名做前缀）；`HttpServer::setExtraStatsProvider()` 单钩子把它们拼进
+  `/api/stats`（**http 层不依赖 media**，接线由 M7 的 main 做）
+  - 顺带修掉隐患：`/api/stats` 原来用 `snprintf` + **固定 640 字节缓冲**，追加片段后长度不可控 →
+    改成 `std::string` 拼接（固定缓冲会**静默截断**，违反 AI_COLLAB §4.5）
+- `broken()` 本批**只做巡检**（`brokenSubscriberIds()` + 进 JSON）；**真正断连留 M6**（现在没有连接对象可断，
+  媒体层自己踢人会让"谁断的"不可追溯）
+- 新增/更新用例：`media` 组 +4（节流：按墙钟等待 / 中止立刻返回 / 非法 speed 被拒 / 关闭即放行）、
+  `srcmgr` 组 +2（统计 JSON / **8 倍速节流实测**）、`ntimed_http` +1（钩子进 JSON 且括号配平）→ **全库 208 用例**
+- **修掉一个观测口径漏洞**（用例抓到的）：`SourceManager::releaseEntry` 原来"先摘条目 → join → 再计数"，
+  节流让 join 变慢（源线程正睡在 50ms 分片里）后，外部会读到"`sourceCount()==0` 但计数仍是 0"的中间态；
+  现在**计数与摘条目在同一临界区**完成
+- 变异验证：① 让节流形同虚设 → `media`/`srcmgr` 相关用例红（有效）；② 让 `/api/stats` 不拼追加片段 →
+  `ntimed_http_api_stats_extra_provider` 红（有效）
+- 用例加固：空闲释放的两个用例超时从 3s 放宽到 **10s**，超时时 `MZ_FAIL` 打印 `dumpStats()`
+  （实测：ASAN ctest 满载时曾偶发超时、单独跑 3/3 绿 —— 先给宽超时 + 留诊断，**不是**"再跑一次就好了"）
+
 ### 说明
 - `v0.1.0` 尚未发布。按 `VERSIONING.md`，tag 只能打在**可独立构建且测试通过**的提交上。
 - M1（Core 层）已完成并推送；后续进入 M2（网络层：EventPoller / TcpServer / Session）。

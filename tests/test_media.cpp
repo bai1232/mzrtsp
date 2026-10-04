@@ -19,12 +19,18 @@
 
 #include "test_main.h"
 
+#include "core/util.h"
 #include "media/frame_queue.h"
 #include "media/gop_cache.h"
 #include "media/media_packet.h"
 #include "media/media_source.h"
+#include "media/throttle.h"
 
+#include <atomic>
+#include <chrono>
+#include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace mzmedia;
@@ -607,4 +613,102 @@ MZ_TEST(media_subscriber_bind_poller_and_callbacks) {
     // 解绑：bindPoller(nullptr) 返回 false（表示"现在是未绑定状态"）
     MZ_ASSERT_FALSE(sub->bindPoller(nullptr));
     MZ_ASSERT_NULL(sub->poller().get());
+}
+
+// ---------------------------------------------------------------------------
+// Throttle：按墙钟节流（M5-d，FR-3.5）
+// ---------------------------------------------------------------------------
+
+MZ_TEST(media_throttle_paces_by_wall_clock) {
+    Throttle throttle; // 默认 enabled=true / speed=1.0
+    throttle.reset();
+    std::atomic<bool> abort{false};
+
+    const int64_t begin = static_cast<int64_t>(getCurrentMillisecond());
+    MZ_ASSERT_TRUE(throttle.pace(0, abort));  // 首个包：只对表，不等待
+    MZ_ASSERT_TRUE(throttle.pace(40, abort)); // 40ms 处的包 → 应等到 ~40ms
+    const int64_t elapsed = static_cast<int64_t>(getCurrentMillisecond()) - begin;
+
+    MZ_ASSERT_GE(elapsed, 30);  // 真的等过墙钟（内核不会早醒，下界因此是稳的）
+    MZ_ASSERT_LT(elapsed, 400); // 也不能夸张地等
+    MZ_ASSERT_EQ(throttle.paceCount(), 2u);
+    MZ_ASSERT_EQ(throttle.abortedCount(), 0u);
+    MZ_ASSERT_GT(throttle.waitedMs(), 0);
+
+    // 快放：speed=100 → 500ms 处的包只需 ~5ms
+    Throttle::Config fast;
+    fast.speed = 100.0;
+    MZ_ASSERT_TRUE(throttle.setConfig(fast));
+    throttle.reset();
+    const int64_t begin_fast = static_cast<int64_t>(getCurrentMillisecond());
+    MZ_ASSERT_TRUE(throttle.pace(0, abort));
+    MZ_ASSERT_TRUE(throttle.pace(500, abort));
+    MZ_ASSERT_LT(static_cast<int64_t>(getCurrentMillisecond()) - begin_fast, 200);
+}
+
+MZ_TEST(media_throttle_aborts_immediately) {
+    std::atomic<bool> abort{true}; // 一开始就是"要停了"
+    Throttle throttle;
+    throttle.reset();
+
+    const int64_t begin = static_cast<int64_t>(getCurrentMillisecond());
+    MZ_ASSERT_FALSE(throttle.pace(0, abort));      // 立刻拒绝，不进入等待
+    MZ_ASSERT_FALSE(throttle.pace(60000, abort));  // 一分钟后的包也不等
+    MZ_ASSERT_LT(static_cast<int64_t>(getCurrentMillisecond()) - begin, 100);
+    MZ_ASSERT_EQ(throttle.abortedCount(), 2u);
+
+    // 中途被叫停：本该等 5 秒，必须在"一片"之内醒来（否则 stop() 的 join 要等满一拍）
+    std::atomic<bool> stop{false};
+    Throttle long_wait;
+    long_wait.reset();
+    MZ_ASSERT_TRUE(long_wait.pace(0, stop));
+    std::thread killer([&stop] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        stop.store(true);
+    });
+    const int64_t begin_wait = static_cast<int64_t>(getCurrentMillisecond());
+    const bool ok = long_wait.pace(5000, stop);
+    const int64_t waited = static_cast<int64_t>(getCurrentMillisecond()) - begin_wait;
+    killer.join();
+
+    MZ_ASSERT_FALSE(ok);
+    MZ_ASSERT_LT(waited, 500);
+    MZ_ASSERT_EQ(long_wait.abortedCount(), 1u);
+}
+
+MZ_TEST(media_throttle_rejects_invalid_speed) {
+    Throttle throttle;
+    Throttle::Config bad;
+
+    bad.speed = 0.0;
+    MZ_ASSERT_FALSE(throttle.setConfig(bad));
+    bad.speed = -1.0;
+    MZ_ASSERT_FALSE(throttle.setConfig(bad));
+    bad.speed = std::numeric_limits<double>::quiet_NaN();
+    MZ_ASSERT_FALSE(throttle.setConfig(bad));
+    bad.speed = std::numeric_limits<double>::infinity();
+    MZ_ASSERT_FALSE(throttle.setConfig(bad));
+    bad.speed = 100000.0; // 超过硬上限（1000 倍速）
+    MZ_ASSERT_FALSE(throttle.setConfig(bad));
+
+    // 被拒之后必须保持原值（不能变成"半套配置"）
+    MZ_ASSERT_NEAR(throttle.config().speed, 1.0, 1e-9);
+    MZ_ASSERT_TRUE(throttle.config().enabled);
+}
+
+MZ_TEST(media_throttle_disabled_passes_through) {
+    Throttle throttle;
+    Throttle::Config off;
+    off.enabled = false;
+    MZ_ASSERT_TRUE(throttle.setConfig(off));
+    throttle.reset();
+
+    std::atomic<bool> abort{false};
+    const int64_t begin = static_cast<int64_t>(getCurrentMillisecond());
+    for (int i = 0; i < 5; ++i) {
+        MZ_ASSERT_TRUE(throttle.pace(i * 1000, abort)); // 时间戳差 4 秒也不等
+    }
+    MZ_ASSERT_LT(static_cast<int64_t>(getCurrentMillisecond()) - begin, 100);
+    MZ_ASSERT_EQ(throttle.waitedMs(), 0);
+    MZ_ASSERT_EQ(throttle.paceCount(), 5u);
 }

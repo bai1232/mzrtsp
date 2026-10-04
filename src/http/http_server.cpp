@@ -240,24 +240,34 @@ bool HttpServer::start(uint16_t port, const std::string &bind_ip) {
     if (!findHandler("/api/stats")) {
         setRoute("/api/stats", [this](const HttpParser &, HttpResponse &resp) {
             TcpServer &t = *_tcp;
-            char buf[640] = {0};
-            std::snprintf(buf, sizeof(buf),
-                          "{\"requests\":%llu,\"4xx\":%llu,\"5xx\":%llu,\"malformed\":%llu,"
-                          "\"sessions\":%zu,\"accepted\":%llu,\"rejected\":%llu,\"idleTimeout\":%llu,"
-                          "\"recvOverflow\":%llu,\"sendOverflow\":%llu,\"acceptError\":%llu}\n",
-                          static_cast<unsigned long long>(_total_requests.load()),
-                          static_cast<unsigned long long>(_total_4xx.load()),
-                          static_cast<unsigned long long>(_total_5xx.load()),
-                          static_cast<unsigned long long>(_total_malformed.load()),
-                          t.sessionCount(),
-                          static_cast<unsigned long long>(t.totalAccepted()),
-                          static_cast<unsigned long long>(t.totalRejected()),
-                          static_cast<unsigned long long>(t.totalIdleTimeout()),
-                          static_cast<unsigned long long>(t.totalRecvOverflow()),
-                          static_cast<unsigned long long>(t.totalSendOverflow()),
-                          static_cast<unsigned long long>(t.totalAcceptError()));
+            // 用 std::string 拼接而不是固定缓冲：追加统计片段后长度不可控，
+            // 固定缓冲会**静默截断**（AI_COLLAB §4.5：静默截断属于失败）
+            std::string json;
+            json.reserve(512);
+            json += "{\"requests\":" + std::to_string(_total_requests.load());
+            json += ",\"4xx\":" + std::to_string(_total_4xx.load());
+            json += ",\"5xx\":" + std::to_string(_total_5xx.load());
+            json += ",\"malformed\":" + std::to_string(_total_malformed.load());
+            json += ",\"sessions\":" + std::to_string(t.sessionCount());
+            json += ",\"accepted\":" + std::to_string(t.totalAccepted());
+            json += ",\"rejected\":" + std::to_string(t.totalRejected());
+            json += ",\"idleTimeout\":" + std::to_string(t.totalIdleTimeout());
+            json += ",\"recvOverflow\":" + std::to_string(t.totalRecvOverflow());
+            json += ",\"sendOverflow\":" + std::to_string(t.totalSendOverflow());
+            json += ",\"acceptError\":" + std::to_string(t.totalAcceptError());
+
+            // 上层装配进来的追加片段（M5-d：media 的源 / 订阅统计）
+            if (_extra_stats_provider) {
+                const std::string extra = _extra_stats_provider();
+                if (!extra.empty()) {
+                    json += ",";
+                    json += extra;
+                }
+            }
+            json += "}\n";
+
             resp.setContentType("application/json; charset=utf-8");
-            resp.setBody(buf);
+            resp.setBody(json);
         });
     }
     if (!findHandler("/stream")) {
@@ -364,8 +374,18 @@ bool HttpServer::setFallback(HttpHandler handler) {
     return true;
 }
 
-bool HttpServer::setParserLimits(const HttpParser::Limits &limits) {
+std::function<std::string()> HttpServer::setExtraStatsProvider(std::function<std::string()> provider) {
     if (_started) {
+        // 与路由/上限同一纪律：运行期改它会让 /api/stats 的行为随时刻变化，难以排查
+        WarnP("HttpServer::setExtraStatsProvider 在 start() 之后调用：不生效");
+        return {};
+    }
+    std::function<std::string()> previous = _extra_stats_provider;
+    _extra_stats_provider = provider;
+    return previous;
+}
+
+bool HttpServer::setParserLimits(const HttpParser::Limits &limits) {    if (_started) {
         WarnP("HttpServer::setParserLimits 在 start() 之后调用：不生效");
         return false;
     }

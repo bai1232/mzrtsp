@@ -12,7 +12,7 @@
 | **M5-b** | **线程打通**：`FrameQueue` 加锁成 SPSC；`Subscriber` 绑定消费者线程 + **唤醒合并**；`SourcePump`（源线程驱动一个**可打断**的读回调） | ✅ |
 | **M5-b′**（决策落地） | FR-5.1 改为**只按字节**且上限=**码率×延迟额度**；FR-5.2 改为**音视频成对丢**；GOP 上限=**码率×最大 GOP 时长**；统计最小版 `dumpStats()` | ✅（本文件） |
 | **M5-c** | `SourceManager`（懒启动 / 复用 / 空闲释放）+ `DemuxerProducer`（把 M4 的 `Demuxer` 接到 `SourcePump` 的读回调上，中止标志接 `interrupt_callback`） | ✅ |
-| M5-d | 节流（FR-3.5：按墙钟对齐推送）、30s 写阻塞断开与 `broken()` 的端到端串通、`dumpStats()` 接进 `/api/stats`（FR-6.1） | 后续 |
+| **M5-d** | 节流（**FR-3.5**：按源时间轴与墙钟对齐推送，不得以磁盘速度全速灌入）；`dumpStatsJson()` + `HttpServer::setExtraStatsProvider()` 接进 `/api/stats`（**FR-6.1**）；`broken()` 只做**巡检**（真正断连留 M6） | ✅ |
 
 **验收（对应 `docs/ROADMAP.md:15`，按批次分配）**：
 
@@ -27,6 +27,8 @@
 | 丢弃单位是"最旧的一段"（**音视频成对**），关键帧绝不丢 | M5-b′ ✅ |
 | 懒启动、空闲释放、源与线程 100% 回收（**FR-1.2** 按需启动、**NFR-6**） | M5-c ✅ |
 | 真读 v0.1 的 **MP4（H264 + AAC）** 到 EOF；源创建 / 释放落日志（**FR-2.1** / **FR-6.3**） | M5-c ✅ |
+| **按源时间轴与墙钟对齐推送**（不得以磁盘速度灌入），且节流**可被打断**（**FR-3.5**） | M5-d ✅ |
+| `/api/stats` 能带上 media 的源 / 订阅 / 丢帧统计（**FR-6.1**） | M5-d ✅ |
 | 10 路并发压测、1 小时长跑 | M6 / M7 |
 
 ## 2. 分层位置与依赖方向
@@ -328,6 +330,41 @@ public:
    投递 / 挂表失败（poller 已退出）**绝不静默"永不释放"** → 计数 + Warn + **退化为立即释放**。
 4. **停线程在锁外**：`pump->stop()` 会 join，持有管理器锁时不做。
 
+### 3.8 `Throttle`（`throttle.h`，M5-d）
+
+按源时间轴与**墙钟**对齐推送 —— **FR-3.5**："文件输入按源时间轴与墙钟对齐推送，不得以磁盘速度全速灌入"。
+
+```cpp
+class Throttle {
+public:
+    struct Config { bool enabled = true; double speed = 1.0; };  // 默认**开**、1 倍速
+    bool setConfig(const Config &config); // false = speed ≤0 / NaN / inf / 超 1000 倍
+    void reset();                          // start() 时对表（记墙钟与首个 dts）
+    bool pace(int64_t dts_ms, const std::atomic<bool> &abort);   // false = 被中止
+    int64_t waitedMs() const; uint64_t paceCount() const; uint64_t abortedCount() const;
+};
+```
+
+- **为什么必须有**：磁盘比网络快几个数量级。不节流的话，2 秒样本会在几毫秒内读完并塞满每个订阅者的
+  队列（然后按 FR-5.1/5.2 大面积丢帧）——对观看者来说不是"流畅播放"，而是"瞬间冲完 + 一堆丢帧"。
+- **可被打断**：内部按 ≤50ms 分片睡，中止标志一置位立刻返回 false；否则 `SourcePump::stop()` 的 join
+  要等满一拍。
+- **不补偿**：已经落后就直接放行。补偿会让落后的源疯狂追赶，把下游又冲爆一次。
+- `speed`：`1.0` = 实时；`>1` = 快放（压测/单测用，如 8.0）；`enabled = false` 只给压测 ——
+  日常路径按 FR-1.2 应当开着。时基用 `dtsMs()`（M4 已换算 + 单调钳制）与**单调时钟**（不用系统时钟）。
+
+### 3.9 统计接线（FR-6.1）
+
+- `MediaSource::dumpStatsJson()` → `"media_source":{...}`（订阅数、推导上限、broken id 列表、各计数）
+- `SourceManager::dumpStatsJson()` → `"source_manager":{...},"media_sources":[{...},...]`
+- `HttpServer::setExtraStatsProvider(std::function<std::string()>)` 把片段拼进 `/api/stats`
+  （返回上一个，沿用项目约定）
+  - **契约**：provider 返回**合法 JSON 对象片段**（不含最外层花括号），键名用模块名做前缀避免撞名
+  - **为什么用钩子而不是让 `http` 依赖 `media`**：分层方向是 `http ← 上层装配`（M7 的 main 接线），
+    http 层编译期不拖上 media；也避免"只有一个 provider 就引入注册表"（`AI_COLLAB §3.6`）
+  - `StatsCenter`（`ARCHITECTURE.md` §2 列出的模块）**推迟到有第二个 provider 时**再抽（§8 未决 12）
+- `broken()`：本批**只做巡检**（`brokenSubscriberIds()` 进 JSON）；真正断连留 M6（现在没有连接对象可断）。
+
 ## 4. 关键机制
 
 ### 4.1 零拷贝分发
@@ -389,7 +426,10 @@ M5-a 的用例加锁之后原样通过（这就是"正交"的验证方式）。
 `SourcePump` 只做三件事：**读 → 推 → 收尾广播 EOS**。它**允许**随输入 IO 阻塞，
 但绝不阻塞事件循环：不碰任何 socket、不碰 `Session`，跨线程只通过 `MediaSource::pushPacket`。
 
-## 5. 测试计划（28 个用例：`media` 14 个 + `ntimed_media` 6 个 + `srcmgr` 8 个）
+## 5. 测试计划（35 个用例：`media` 18 个 + `ntimed_media` 6 个 + `srcmgr` 10 个 + `ntimed_http` 1 个钩子用例）
+
+> 分组口径：按**用例名子串**匹配，所以 `media` 组会连带匹配 `ntimed_media_*`（§8.6 已记录这个性质）。
+> 上表按"实际唯一用例"统计：§5.1 的 14 个 + §5.4 的 4 个节流用例 = `media` 用例 18 个。
 
 ### 5.1 单线程纯策略（分组 `media`，14 个）
 
@@ -436,6 +476,18 @@ M5-a 的用例加锁之后原样通过（这就是"正交"的验证方式）。
 | 6 | `srcmgr_open_failure_not_silent` | 失败 | 打不开 / 空 path → nullptr、源数为 0、计数 +1、`lastError()` 非空 |
 | 7 | `srcmgr_release_all_stops_sources` | 断开 | `releaseAll()` 立即停源；**句柄仍有效**（不悬垂）；再 acquire 会重建（`totalCreated == 2`）；`release()` 第二次返回 false |
 | 8 | `srcmgr_dump_stats_minimal` | FR-6.1 | 一行统计含 sources / handles / created / idle_schedule_failed |
+
+### 5.4 节流与统计接线（M5-d，7 个：6 个新增 + 1 个 http 钩子）
+
+| # | 用例 | 分组 | 覆盖维度 | 断言要点 |
+|---|---|---|---|---|
+| 1 | `media_throttle_paces_by_wall_clock` | media | 正常 | `speed=1`：首包不等、40ms 处的包**真的等** ~40ms（下界 30ms / 上界 400ms）；`speed=100`：500ms 处的包几乎不等 |
+| 2 | `media_throttle_aborts_immediately` | media | 断开 | 中止标志一开始就置位 → 立即返回 false、不进入等待；等待中途置位 → **一片之内**醒来（不睡满 5 秒） |
+| 3 | `media_throttle_rejects_invalid_speed` | media | 非法 / 空 | 0 / 负数 / NaN / inf / 超硬上限 全部被拒，**保持原值** |
+| 4 | `media_throttle_disabled_passes_through` | media | 正常 | `enabled=false`：时间戳差 4 秒也不等，`waitedMs()==0` |
+| 5 | `srcmgr_dump_stats_json_has_manager_and_sources` | srcmgr | FR-6.1 | 片段以 `"source_manager":{` 开头；含 `sources` / `media_sources` / 每源的 `media_source`；**花括号配平**（能直接嵌进 `/api/stats`） |
+| 6 | `srcmgr_throttle_limits_delivery_rate` | srcmgr | FR-3.5 | **8 倍速**读 2 秒样本：用时 **≥100ms**（没有全速灌入）且 **<1500ms**（没有慢到实时） |
+| 7 | `ntimed_http_api_stats_extra_provider` | ntimed_http | FR-6.1 | 设置 provider 后 `/api/stats` 含该片段、原有计数仍在、JSON 正常收尾；**start() 之后再设置不生效**（返回空） |
 
 ## 6. 风险清单
 
@@ -494,6 +546,12 @@ M5-a 的用例加锁之后原样通过（这就是"正交"的验证方式）。
 | 【M5-c】空闲计时挂不上就**立即释放** | 计数 + Warn + 立即回收 | 排除"静默不释放"（源线程与文件句柄泄漏，且没有任何迹象）；排除"重试"（poller 都没了，重试无意义） |
 | 【M5-c】`idle_release_ms = 0` 合法 | 含义是"不缓存源"（最保守的一档） | 排除"0 一律拒绝"（那是容量类参数的习惯；这里 0 不是无界而是"立刻回收"）；好处是用例可以完全确定性 |
 | 【M5-c】订阅管理**线程安全**（TSAN 抓出来后修正） | `MediaSource` 内部一把锁保护订阅集合 / `GopCache` / `_ended`；**唤醒移到锁外** | 排除"要求调用方把 subscribe 投递回源线程"（调用方根本没有源线程的句柄；M6 的 HTTP 线程只会直接调）；排除"锁内唤醒"（`async` 在轮询线程上会**内联执行** drain 回调 → 重入死锁）；排除"唤醒清单用成员暂存"（两个线程的调用会互相清空） |
+| 【M5-d】节流**默认开**、`speed` 可调 | `Throttle::Config{enabled = true, speed = 1.0}` | 排除"默认关"（FR-1.2 要的就是按时间轴节流，默认关等于指望每个调用方都记得开）；排除"按包数限速"（与帧率耦合，换个流就失准） |
+| 【M5-d】节流**不补偿**落后 | 已经超过应当的时刻就直接放行 | 排除"追赶"（落后时突发推送会把下游刚排空的队列再冲爆一次） |
+| 【M5-d】节流**可被打断**（≤50ms 分片） | 中止标志一置位立刻返回 false | 排除"一次睡到底"（`stop()` 的 join 要等满一拍，惰性释放与关停都会变慢） |
+| 【M5-d】`/api/stats` 用**单钩子**而不是注册表 | `HttpServer::setExtraStatsProvider()` + 各模块 `dumpStatsJson()` | 排除"现在就建 `StatsCenter`"（当前只有一个 provider，`AI_COLLAB §3.6` 要求抽象有第二个实现者）；排除"让 http 依赖 media"（破坏分层）；排除"固定缓冲 snprintf"（追加片段后长度不可控 → 静默截断） |
+| 【M5-d】`broken()` 只做**巡检** | `brokenSubscriberIds()` 进 JSON，断连留 M6 | 排除"媒体层自动 unsubscribe"（现在没有连接对象可断，且会让"谁断的"不可追溯） |
+| 【M5-d】计数与状态在**同一临界区** | `releaseEntry` 在锁内"摘条目 + 计数" | 排除"join 完再计数"：节流让 join 变慢后，外部会读到 `sourceCount()==0` 但计数仍为 0 的中间态（用例已抓到） |
 
 ## 8. 未决事项
 
@@ -510,6 +568,9 @@ M5-a 的用例加锁之后原样通过（这就是"正交"的验证方式）。
 | 9 | 唤醒合并是否够（单次 drain 总取不完时要不要批量投递） | M6 实测；当前 100 帧 = 1 次唤醒，余量很大 |
 | 10 | **循环播放**（FR-1.2 的"可选循环"） | **M6**：要"读完重开 + 时间戳基准重置"，与源生命周期纠缠 —— M5-c 已明确不做（用户已确认） |
 | 11 | 空闲释放阈值 60s 是否合适（真实播放里"暂停一分钟再回来"就要重建源） | M7 采集：看 `totalIdleReleased` 与重建开销，必要时调大 |
+| 12 | `StatsCenter`（`ARCHITECTURE.md` §2 列出的模块）要不要现在抽 | 等**第二个** provider 出现（当前只有 media 一个；`AI_COLLAB §3.6` 要求抽象有第二个实现者） |
+| 13 | 节流的对齐基准：现在按**混合 dts**（音视频交替） | M6 实测音画同步后再看是否需要"以音频时钟为准"（FR-3.4 规定音频为主时钟，但那偏封装/播放侧） |
+| 14 | `broken()` 订阅者的**真实断连动作** | **M6**：接上 `FlvSender` + `Session` 后，在送数据前巡检 `brokenSubscriberIds()` 并主动断开 |
 
 ## 9. 假设清单与影响面（`AI_COLLAB.md` §1 的②③）
 
@@ -525,10 +586,10 @@ M5-a 的用例加锁之后原样通过（这就是"正交"的验证方式）。
 
 **影响面（M5-a → M5-b′ 累计）**：
 
-- 新增：`src/media/{media_packet,frame_queue,gop_cache,media_source,source_pump,demuxer_producer,source_manager}.h/.cpp`、
+- 新增：`src/media/{media_packet,frame_queue,gop_cache,media_source,source_pump,demuxer_producer,source_manager,throttle}.h/.cpp`、
   `tests/test_media.cpp`、`tests/test_media_ntimed.cpp`、`tests/test_source_manager.cpp`、本文件。
 - 改动：`CMakeLists.txt`、`tests/CMakeLists.txt`（分组 `media` / `ntimed_media` / `srcmgr`）、`src/mzmedia.h`、
-  `scripts/tsan.sh`（严格组）、**`src/ffmpeg/demuxer.h/.cpp`**（M5-c **唯一**一处改 M4 代码：`setAbortFlag`，
-  已同步 `docs/DESIGN_M4.md` §3.3）、`docs/SPEC.md`（FR-5.1 / FR-5.2 修订）、`docs/ROADMAP.md`、
-  `docs/TESTING.md`、`CHANGELOG.md`。
-- **不动**：`core/`、`network/`、`http/` 任何现有代码；`media/` 的既有策略。
+  `scripts/tsan.sh`（严格组）、`src/ffmpeg/demuxer.h/.cpp`（`setAbortFlag`）、
+  `src/http/http_server.h/.cpp`（`setExtraStatsProvider` + `/api/stats` 改 `std::string` 拼接）、
+  `docs/SPEC.md`（FR-5.1 / FR-5.2 修订）、`docs/ROADMAP.md`、`docs/TESTING.md`、`docs/DESIGN_M4.md`、`CHANGELOG.md`。
+- **不动**：`core/`、`network/` 任何现有代码；`media/` 的既有限流 / 丢帧策略。

@@ -63,6 +63,15 @@ public:
     bool setFallback(HttpHandler handler);
     bool setParserLimits(const HttpParser::Limits &limits);
     bool setSessionTimeout(uint32_t recv_idle_ms, uint32_t send_blocked_ms);
+    /**
+     * 额外的统计片段提供者（FR-6.1，M5-d）
+     * @param provider 返回值应当是**合法 JSON 对象片段**（不含最外层花括号），
+     *                 例如 `"media_source":{...}`；`/api/stats` 会把它拼进同一个 JSON 对象
+     * @return **上一个**提供者（沿用"注册返回上一个"的约定）
+     * @note 为什么用钩子而不是让 `HttpServer` 依赖 `media`：分层方向是 http ← 上层装配
+     *       （M7 的 main 把 `SourceManager::dumpStatsJson()` 接进来），http 层不拖上 media
+     */
+    std::function<std::string()> setExtraStatsProvider(std::function<std::string()> provider);
     bool setMaxSessionCount(size_t max);
     bool setCorsEnabled(bool enable);
 
@@ -91,6 +100,8 @@ private:
     HttpParser::Limits _limits;
     bool _cors_enabled = true;
     bool _started = false;
+    /// 追加统计片段提供者（M5-d）：只在 start() 之前设置，之后读（与路由同一纪律）
+    std::function<std::string()> _extra_stats_provider;
 
     std::atomic<uint64_t> _total_requests{0};
     std::atomic<uint64_t> _total_4xx{0};

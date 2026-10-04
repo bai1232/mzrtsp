@@ -18,6 +18,23 @@
 
 namespace mzmedia {
 
+namespace {
+
+/// 最简 JSON 字符串转义（只处理 `"` 与 `\`）：v0.1 的路径来自命令行，不做完整校验
+std::string jsonEscape(const std::string &in) {
+    std::string out;
+    out.reserve(in.size());
+    for (const char c : in) {
+        if (c == '"' || c == '\\') {
+            out.push_back('\\');
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+} // namespace
+
 SourceManager::Ptr SourceManager::create(const EventPoller::Ptr &poller) {
     return Ptr(new SourceManager(poller));
 }
@@ -105,6 +122,17 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path) {
     }
 
     fresh->pump = std::make_shared<SourcePump>();
+    // 节流**必须在 start() 之前配**（FR-3.5）：默认 1 倍速，压测/单测可调 speed
+    if (!fresh->pump->setThrottleConfig(config.throttle)) {
+        const std::string reason = "节流参数非法（speed 必须为正数且有限）";
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _last_error = reason;
+        }
+        ++_total_acquire_rejected;
+        WarnL << "SourceManager::acquire 失败（不注册源）：" << reason;
+        return nullptr;
+    }
     // 把"要停了"接进 FFmpeg 的 interrupt_callback：stop() 才能真正打断 av_read_frame
     (void) fresh->producer->setAbortFlag(&fresh->pump->stopFlag());
     fresh->source = std::make_shared<MediaSource>(config.source);
@@ -304,15 +332,21 @@ void SourceManager::releaseEntry(const std::string &path, bool idle_triggered) {
             entry->idle_task.reset();
         }
         _entries.erase(it);
+        // 计数与"条目已摘除"放在**同一个临界区**：外部看到 sourceCount()==0 时计数必定已可见。
+        // 曾经的写法是"先摘条目 → join → 再计数"，join 慢的时候（例如源线程正睡在节流片里）
+        // 观察者会读到一个"已经没了但还没记账"的中间态。
+        if (idle_triggered) {
+            ++_total_idle_released;
+        } else {
+            ++_total_released;
+        }
     }
 
     stopEntry(entry); // 锁外：join 可能耗时
 
     if (idle_triggered) {
-        ++_total_idle_released;
         InfoL << "源空闲释放：" << path; // FR-6.3：关键事件（源释放）必须落日志
     } else {
-        ++_total_released;
         InfoL << "源已释放：" << path;
     }
 }
@@ -343,6 +377,43 @@ std::string SourceManager::dumpStats() const {
            " released=" + std::to_string(_total_released.load()) +
            " rejected=" + std::to_string(_total_acquire_rejected.load()) +
            " idle_schedule_failed=" + std::to_string(_total_idle_schedule_failed.load()) + "}";
+}
+
+std::string SourceManager::dumpStatsJson() const {
+    // 契约：返回**合法 JSON 对象片段**（不含最外层花括号），键名用模块名做前缀避免与 http 侧撞名
+    std::string out = "\"source_manager\":{\"sources\":";
+    std::vector<std::pair<std::string, MediaSource::Ptr>> snapshot; // 锁外取每个源的统计
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        out += std::to_string(_entries.size());
+        out += ",\"handles\":" + std::to_string(_handles.load());
+        out += ",\"idle_release_ms\":" + std::to_string(_config.idle_release_ms);
+        out += ",\"created\":" + std::to_string(_total_created.load());
+        out += ",\"reused\":" + std::to_string(_total_reused.load());
+        out += ",\"idle_released\":" + std::to_string(_total_idle_released.load());
+        out += ",\"released\":" + std::to_string(_total_released.load());
+        out += ",\"rejected\":" + std::to_string(_total_acquire_rejected.load());
+        out += ",\"idle_schedule_failed\":" + std::to_string(_total_idle_schedule_failed.load());
+        out += "}";
+        for (const auto &kv : _entries) {
+            if (auto source = kv.second->source) {
+                snapshot.emplace_back(kv.first, source);
+            }
+        }
+    }
+
+    // **锁外**逐个取源统计：锁序固定为「管理器 → 源」，绝不允许反向
+    out += ",\"media_sources\":[";
+    bool first = true;
+    for (const auto &item : snapshot) {
+        if (!first) {
+            out += ",";
+        }
+        first = false;
+        out += "{\"path\":\"" + jsonEscape(item.first) + "\"," + item.second->dumpStatsJson() + "}";
+    }
+    out += "]";
+    return out;
 }
 
 std::string SourceManager::lastError() const {

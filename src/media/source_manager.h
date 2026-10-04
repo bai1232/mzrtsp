@@ -50,6 +50,7 @@ public:
         /// @note **0 是合法值**：含义是"句柄一放就释放"（不缓存源）——它不是"无界"，
         ///       而是最保守的一档；也正因为有这一档，空闲释放的用例可以**完全确定性**
         uint32_t idle_release_ms = 60000;
+        Throttle::Config throttle;        // FR-3.5：默认开、1 倍速（压测/单测可调 speed）
         MediaSource::Limits source;       // 每源的队列 / GOP / 人数上限（推导值在 Limits 里）
         DemuxerProducer::Config producer; // 解封装上限（流数 / 单包 / 超时）
     };
@@ -79,6 +80,9 @@ public:
     size_t handleCount() const;
     /// 一行统计（与 `MediaSource::dumpStats()` 同一风格）
     std::string dumpStats() const;
+    /// JSON 对象**片段**（不含最外层花括号），供 `/api/stats` 直接拼接（FR-6.1）
+    /// @note 形态：`"source_manager":{...},"media_sources":[{...},...]`
+    std::string dumpStatsJson() const;
     /// 最近一次失败原因（快照）
     std::string lastError() const;
 

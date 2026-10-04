@@ -217,6 +217,13 @@ public:
     /// 一行统计（FR-6.1 的最小版）；**可从任意线程调用**
     std::string dumpStats() const;
 
+    /// JSON 对象**片段**（不含最外层花括号）：`"media_source":{...}`（FR-6.1，供 /api/stats 拼接）
+    std::string dumpStatsJson() const;
+
+    /// 当前已置 `broken()` 的订阅者 id 列表
+    /// @note M5-d **只做巡检**（进 stats、由连接层决定怎么处理）；真正的断连在 M6 接上输出层之后
+    std::vector<Subscriber::Id> brokenSubscriberIds() const;
+
     // 观测（全部 atomic）
     uint64_t totalDelivered() const {
         return _total_delivered.load();

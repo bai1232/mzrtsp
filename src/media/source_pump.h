@@ -22,6 +22,7 @@
 #pragma once
 
 #include "media/media_source.h"
+#include "media/throttle.h"
 
 #include <atomic>
 #include <cstdint>
@@ -74,7 +75,19 @@ public:
     const std::atomic<bool> &stopFlag() const {
         return _stop_requested;
     }
-    /// 是否因为**正常读完**而结束（错误结束时为 false —— 与 DESIGN_M4 的 EOF/Error 分离同一原则）
+
+    /**
+     * 节流配置（FR-3.5：按源时间轴与墙钟对齐推送）
+     * @return false = 参数非法（speed ≤ 0 / 非有限 / 超硬上限），保持原值
+     * @note **只在 start() 之前调用**（运行期改它需要先停流，与其它上限同一纪律）
+     */
+    bool setThrottleConfig(const Throttle::Config &config) {
+        return _throttle.setConfig(config);
+    }
+    /// 只读访问（用例断言"真的等过墙钟"）
+    const Throttle &throttle() const {
+        return _throttle;
+    }    /// 是否因为**正常读完**而结束（错误结束时为 false —— 与 DESIGN_M4 的 EOF/Error 分离同一原则）
     bool eof() const {
         return _eof.load();
     }
@@ -91,6 +104,7 @@ public:
 private:
     void run(ReadFn read, MediaSource::Ptr source);
 
+    Throttle _throttle; // FR-3.5：按墙钟节流（只由源线程使用）
     std::thread _thread;
     std::atomic<bool> _running{false};
     std::atomic<bool> _stop_requested{false};
