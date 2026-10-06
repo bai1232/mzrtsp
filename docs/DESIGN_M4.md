@@ -61,6 +61,7 @@ const std::atomic<bool> *setAbortFlag(const std::atomic<bool> *);  // ★M5-c �
 | 流数上限 | `nb_streams > max_streams` → **拒绝打开** | "只取前 N 路"是静默截断，后面所有统计都对不上 |
 | 单包上限 | `pkt->size > max_packet_size` → 拒绝 + 计数 + 释放 | 不缓存、不截断；异常文件不能把内存拉爆 |
 | 时间戳 | 换算 + 按流单调钳制；失败/缺失都计数 | 播放器把 dts 回退当跳帧；静默改数据不可接受 |
+| **初始化数据（M6-a 新增）** | `StreamInfo::extradata` 由 `Demuxer` **拷贝**带出（H264=avcC / AAC=AudioSpecificConfig） | FLV 的 sequence header 直接用它；不拷贝的话 `AVFormatContext` 一关就没了，而 sequence header 是**每个连接都要发**的 |
 | 观测 | `totalPackets/totalBytes/rejectedPackets/rescaleFailures/monotonicClamped` + `lastError()` | 每个上限与降级都要能被证明"发生过" |
 
 ## 4. 分批

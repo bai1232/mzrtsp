@@ -167,6 +167,10 @@ curl -s http://127.0.0.1:8080/api/stats | python3 -m json.tool
 | FR-2.1 v0.1 输入 MP4 / H264 裸流 | 单测 `srcmgr`：`DemuxerProducer` 真读 `samples/sample.mp4`（320x240 H264 + AAC）到 EOF，视频 dts 单调、关键帧 1 个、音视频包都 > 0；H264 裸流由 M4 的 `ffmpeg` 分组覆盖 |
 | FR-6.3 关键事件落日志 | 源创建 / 空闲释放走 `InfoL`（`SourceManager`）；打不开走 `WarnL` 且**不注册源**（`srcmgr_open_failure_not_silent` 断言 `lastError()` 非空） |
 | FR-4.4 连接上限 / 读空闲 / 写阻塞 | 单测：连接上限设为 1 时第 2 个连接被拒且 `totalRejected()` 增长；`recv_idle=50ms` + 连上不发数据的客户端 → 阈内断开且 `onError` 为超时；`send_blocked=50ms` + 只连不读的客户端 → 断开且 `bytesOut` 停止增长 |
+| FR-3.1 HTTP-FLV（chunked、首包即 sequence header） | **M6-a ✅**：单元 `flv` 组逐字节断言 header/tag/sequence header；集成 `scripts/flv_mux_test.sh` —— 产物经 `ffprobe` 认成 **h264 320x240 + aac**、解码 **50 帧 / 2 秒**、`ffmpeg -f null -` 完整解码无 error（**8/8**）。M6-b：`curl -N http://…/live/x.flv` 拿到合法 FLV |
+| FR-3.3 AAC 转发 / 无音频也能播 | 单元 `flv`：AAC sequence header（`0xAF` + AudioSpecificConfig）与 raw 包布局；另有**纯视频**用例（`Streams{video, nullptr}`）证明"没有音频不报错" |
+| FR-3.4 时间戳基准（FLV → 毫秒） | 单元 `flv`：`CompositionTime = pts - dts`（含负值的 24 位补码）；**per-client 基准**（中途接入的时间戳也从 0 开始）；32 位自然回绕；早于基准的包钳 0 并计数 |
+| FR-4.1 `/live/<name>.flv` 路由 | **M6-b**：`curl -N http://127.0.0.1:8080/live/sample.flv` 拿到合法 FLV（`ffprobe` 认编码/分辨率/音频），且首包即 sequence header；M6-a 已就绪的部分见上一行 |
 | 各 codec 组合 | `CODEC_MATRIX.md` 每个组合一条 ffprobe 用例 |
 
 ## 8. 并发检查（TSAN）

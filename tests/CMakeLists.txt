@@ -41,6 +41,8 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_media_ntimed.cpp
         # ---- M5-c 真接 Demuxer + 源管理 ----
         ${CMAKE_CURRENT_SOURCE_DIR}/test_source_manager.cpp
+        # ---- M6-a FLV 封装 ----
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_flv_muxer.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS
@@ -88,6 +90,9 @@ set(MZMEDIA_TEST_GROUPS
         # ---- M5-c 真接 Demuxer + 源管理 ----
         # 有线程与定时器，但等待方式同上（sleep_for + 有界轮询）→ 严格组。
         srcmgr
+        # ---- M6-a FLV 封装 ----
+        # 纯函数（不碰网络/线程/文件），只是最后落一个文件 → 严格组。
+        flv
         )
 
 add_executable(mzmedia_unittest ${MZMEDIA_TEST_SOURCES})

@@ -118,11 +118,18 @@ bool Demuxer::open(const std::string &path) {
         info.channels = par->channels;   // FFmpeg 4.4 用 channels（5.x 才是 ch_layout）
         info.time_base = fromRational(st->time_base);
         info.frame_rate = fromRational(st->avg_frame_rate);
+        if (par->extradata != nullptr && par->extradata_size > 0) {
+            // M6-a：FLV 的 AVC/AAC sequence header 要用它。
+            // 拷贝一份（不能只存指针：AVFormatContext 一关就没了）
+            info.extradata = std::make_shared<const std::vector<uint8_t>>(
+                par->extradata, par->extradata + par->extradata_size);
+        }
         _streams.push_back(info);
-        InfoP("Demuxer: 流 %d：%s %dx%d rate=%d/%d tb=%d/%d", info.index, info.codec_name.c_str(),
-              info.width, info.height, static_cast<int>(info.frame_rate.num),
-              static_cast<int>(info.frame_rate.den), static_cast<int>(info.time_base.num),
-              static_cast<int>(info.time_base.den));
+        InfoP("Demuxer: 流 %d：%s %dx%d rate=%d/%d tb=%d/%d init=%zuB", info.index,
+              info.codec_name.c_str(), info.width, info.height,
+              static_cast<int>(info.frame_rate.num), static_cast<int>(info.frame_rate.den),
+              static_cast<int>(info.time_base.num), static_cast<int>(info.time_base.den),
+              info.extradata ? info.extradata->size() : 0u);
     }
 
     _pkt = makePacket();

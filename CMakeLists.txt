@@ -116,6 +116,8 @@ set(MZMEDIA_SOURCES
         src/media/source_manager.cpp
         # M5-d 节流（FR-3.5）
         src/media/throttle.cpp
+        # M6-a FLV 封装（FR-3.1 / 3.3 / 3.4）
+        src/output/flv_muxer.cpp
         )
 
 # 骨架阶段（第 1 批）没有任何源文件，此时不能创建 STATIC 库目标

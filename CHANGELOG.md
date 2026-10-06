@@ -325,6 +325,28 @@
 - 用例加固：空闲释放的两个用例超时从 3s 放宽到 **10s**，超时时 `MZ_FAIL` 打印 `dumpStats()`
   （实测：ASAN ctest 满载时曾偶发超时、单独跑 3/3 绿 —— 先给宽超时 + 留诊断，**不是**"再跑一次就好了"）
 
+#### M6-a FLV 封装（`FlvMuxer`，纯函数式）+ ffprobe 验收
+- 新增 `src/output/flv_muxer.h/.cpp`：FLV Header、AVC/AAC sequence header、视频/音频 tag、
+  `CompositionTime = pts - dts`（24 位有符号）、**每客户端一份的时间戳基准**、32 位自然回绕
+  - **没有初始化头就不开工**：H264 缺 avcC / AAC 缺 AudioSpecificConfig → `prepare()` 直接失败并给原因
+  - **本批只吃 MP4/avcC**：初始化数据看着像 Annex-B（首字节 0x00）→ `AnnexBNotSupported` **明确拒绝**
+    （不做转换、不出坏流；转换归 M6-c）—— 视频 NALU 直接搬，因为 MP4 的包本来就是 length-prefixed
+  - 早于基准的包**钳到 0 + 计数 + 首次告警**（不让 32 位回绕出"40 亿"这种时间戳）
+  - 外来流不静默丢（`InvalidPacket`）；tag 超 24 位长度上限 → `TooLarge`
+- `StreamInfo` 增加 `extradata`：`Demuxer` 从 `AVCodecParameters` **拷贝**带出（已同步 `DESIGN_M4`）
+- 新增 `examples/flv_mux_demo.cpp`（demux → 封成 FLV 落盘）与 `scripts/flv_mux_test.sh`（**M6-a 验收**）：
+  产物 **55,623 字节 / 140 tag（视频 50 + 音频 88，时间戳基准 -23 ms）**，`ffprobe` 认成
+  **h264 320x240 + aac**、解码出 **50 帧 / 2 秒**、`ffmpeg -f null -` 完整解码**无 error** → **8/8 通过**
+- 测试：`tests/test_flv_muxer.cpp` **10 用例 / 515 断言**（新分组 `flv`，进 TSAN 严格组），
+  全部**字节级**断言（tag 类型 / dataSize / 时间戳 / CompositionTime / PreviousTagSize / 负载与 extradata 逐字节比对）
+- 变异验证：① FLV header 的 audio/video flags 全 0 → 红；② 视频包 `AVCPacketType` 写成 0 → 红
+- 修掉一个**测试自身**的坑：`static_cast<int>(out[i])` 在 x86 上会符号扩展（0xAF → -81）→ 统一走 `byteAt()`
+- 文档：新增 `docs/DESIGN_M6.md`（FLV 逐字段布局、per-client 基准、sequence header 重发纪律、验收方式）；
+  `ROADMAP` / `TESTING` / `README` / `DESIGN_M4` 同批同步
+- 门禁：串行 ctest **20/20**、ASAN **20/20**、TSAN **290 用例 0 报告**、单进程全量 **217/217**、零警告
+- 遗留：`flv.js` 入库（M6-c，含许可证声明）、`onMetaData` / AVC end-of-sequence 是否发（M6-c 实测后定）、
+  Annex-B→AVCC 转换（M6-c）
+
 ### 说明
 - `v0.1.0` 尚未发布。按 `VERSIONING.md`，tag 只能打在**可独立构建且测试通过**的提交上。
 - M1（Core 层）已完成并推送；后续进入 M2（网络层：EventPoller / TcpServer / Session）。

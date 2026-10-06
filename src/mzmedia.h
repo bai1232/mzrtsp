@@ -76,3 +76,6 @@
 #include "media/demuxer_producer.h"
 #include "media/source_manager.h"
 #include "media/throttle.h"
+
+// M6 输出层（已接入）
+#include "output/flv_muxer.h"

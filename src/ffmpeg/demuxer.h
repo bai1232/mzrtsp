@@ -47,6 +47,15 @@ struct StreamInfo {
     int channels = 0;
     TimeBase time_base;    // 该流的时间基
     TimeBase frame_rate;   // 帧率（num/den，未提供时为 0/0）
+
+    /**
+     * 编码器初始化数据（M6-a 起提供）
+     * - H264（MP4/avcC）：即 `AVCDecoderConfigurationRecord` —— FLV 的 **AVC sequence header 直接用它**
+     * - AAC：即 `AudioSpecificConfig` —— FLV 的 **AAC sequence header 直接用它**
+     * @note 没有它就没法写 FLV 的初始化头 → 播放端一片黑/无声，所以必须**如实带出来**
+     *       （为空 = 该流确实没有；调用方要按"缺初始化头"处理，不许猜）
+     */
+    std::shared_ptr<const std::vector<uint8_t>> extradata;
 };
 
 class Demuxer {
