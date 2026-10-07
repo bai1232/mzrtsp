@@ -9,7 +9,7 @@
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
 | 设计 | 规格、架构、能力矩阵、验收指标 | ✅ 已定稿 |
-| **v0.1.0** | MP4 / H264 裸流 → **HTTP-FLV**，remux 零拷贝，多客户端共享 | 🚧 开发中 |
+| **v0.1.0** | MP4 / H264 裸流 → **HTTP-FLV**，remux 零拷贝，多客户端共享 | 🚧 开发中（**M1–M6-c 已完成**：端到端可播；M6-d 并发/长跑 + M7 收尾） |
 | v0.2.0 | MKV / TS 输入、**HLS** 输出、转码 | ⏳ 计划 |
 | v0.3.0 | RTSP 输入、解码处理（滤镜/缩放/水印） | ⏳ 计划 |
 
@@ -59,6 +59,11 @@
 | FFmpeg 开发库 | **4.4.x** | `libavformat` / `libavcodec` / `libavutil` |
 | FFmpeg 开发库（v0.2 起） | 4.4.x | 追加 `libswscale-dev`、可选 `libavfilter-dev` |
 
+**C++ 代码零第三方依赖**（网络、线程、定时器、日志、测试框架全部自研）。
+唯一的例外是**浏览器播放器** `flv.js` 1.6.2（Apache-2.0）：浏览器原生不能播 FLV，
+需要它做 FLV → MSE 的转换。它**已入库**在 `third_party/flv.js/`（离线可用，
+来源/版本/MD5/许可声明见该目录 `README.md`），由服务端通过 `GET /flv.min.js` 提供给网页。
+
 ```bash
 # Ubuntu 22.04：v0.1 所需（通常已随系统安装）
 sudo apt-get install -y libavformat-dev libavcodec-dev libavutil-dev libswresample-dev
@@ -80,16 +85,46 @@ cmake --build build -j$(nproc)
 
 ## 快速开始
 
-> v0.1.0 尚未完成，以下为设计目标用法。
+> v0.1.0 的 **M6-c 已完成**：HTTP-FLV 端到端可播（浏览器 / `ffplay` 都行）。
+> 零参数就能跑起来（`FR-7.2`）；下面每一步都是本机实测过的。
 
 ```bash
-# 启动服务（零参数也会启动内置测试页）
-./build/bin/mzmedia -f media/sample.mp4 -p 8080
+# 1) 构建（Debug 是默认值；发布用 -DCMAKE_BUILD_TYPE=Release）
+cmake -B build && cmake --build build -j"$(nproc)"
 
-# 浏览器打开测试页
-xdg-open http://127.0.0.1:8080/
-# 或用 ffplay 直接拉流
+# 2) 生成测试样本（320x240 H264 + 44.1k AAC 2 秒，以及一份 H264 裸流）
+./scripts/make_samples.sh
+
+# 3) 启动服务：零参数 = 0.0.0.0:8080 + 媒体目录 ./samples
+./build/bin/mzmedia
+#    常用选项：--port 9000 --media-root /data --loop --speed 4 --log-level debug --help
+
+# 4) 看画面（二选一）
+#    浏览器：打开 http://127.0.0.1:8080/ ，点「播放」（页面用的是**入库**的 flv.js，离线可用）
 ffplay -f flv http://127.0.0.1:8080/live/sample.flv
+
+# 5) 命令行拉流 / 存盘（HTTP-FLV 就是 FLV，可以直接落盘给 ffprobe）
+curl -N http://127.0.0.1:8080/live/sample.flv -o /tmp/x.flv
+ffprobe /tmp/x.flv
+
+# 6) H264 裸流也能拉（服务端现场构造 avcC 并把 Annex-B 转成 AVCC）
+curl -N http://127.0.0.1:8080/live/sample.h264.flv -o /tmp/y.flv
+ffprobe /tmp/y.flv
+
+# 7) 循环推流 + 运行统计
+./build/bin/mzmedia --loop &          # 播完自动从头接上（时间戳连续，不会回退）
+curl -s http://127.0.0.1:8080/api/stats | head -c 400
+```
+
+### 验证（每个脚本都会打印"通过 N 项 / 失败 N 项"）
+
+```bash
+cd build && ctest                        # 21 个分组（243 个用例），串行跑
+./bin/mzmedia_unittest producer           # 只跑某组：分组名是**用例名的子串**
+../scripts/flv_http_test.sh               # M6-c 端到端验收：49 项（HTTP + ffprobe + 浏览器资源 + 循环）
+../scripts/flv_mux_test.sh                # M6-a：8 项（FLV 封装 → ffprobe）
+../scripts/http_test.sh                   # M3：HTTP 层
+../scripts/tsan.sh                        # TSAN：严格组 0 报告
 ```
 
 ## 文档
@@ -115,5 +150,8 @@ ffplay -f flv http://127.0.0.1:8080/live/sample.flv
 ## 许可证
 
 项目本体采用 [MIT](LICENSE)。
+
+**入库的第三方文件**：`third_party/flv.js/`（浏览器播放器，Apache-2.0，含 `LICENSE` 与来源说明）——
+它是 v0.1.0 "浏览器能播"的唯一第三方组成，再分发时请保留其版权与许可声明。
 
 但请注意**运行时依赖的许可证**：本项目动态链接 Ubuntu 打包的 FFmpeg 库，该构建**启用了 GPL 组件**（`libx264`、`libx265` 等）。因此**以二进制形式对外分发**时，整体须遵循 GPL 的约束；仅源码分发或自用不受影响。若需宽松分发，可改用不含 GPL 组件的 FFmpeg 构建并避免使用 `libx264`。

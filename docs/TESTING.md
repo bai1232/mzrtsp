@@ -81,34 +81,66 @@ MZ_TEST(timestamp_rational_conversion) {
 
 ## 3. 集成测试（ffprobe 校验，可自动化）
 
+**M6-c 起：全部走脚本**（不要手敲命令 —— 脚本会同时验证"浏览器要的东西"和"字节对不对"，且会自己起停服务）：
+
 ```bash
-# 1) 服务启动
-./build/bin/mzmedia -f media/sample.mp4 -p 8080 &
-
-# 2) 拉流存盘（限时长，便于校验）
-timeout 10 ffmpeg -hide_banner -loglevel error \
-  -i http://127.0.0.1:8080/live/sample.flv -c copy -t 8 /tmp/out.flv
-
-# 3) 校验输出流：编码、分辨率、是否有音频
-ffprobe -v error -show_entries stream=codec_name,width,height,channels \
-        -of default=noprint_wrappers=1 /tmp/out.flv
-
-# 4) 期望结果（源为 1920x1080 H264 时）
-#   codec_name=h264
-#   width=1920
-#   height=1080
+./scripts/flv_http_test.sh     # M6-c 端到端 49 项（HTTP + chunked + ffprobe + 播放器资源 + 循环 + 边界）
+./scripts/flv_mux_test.sh      # M6-a 封装链 8 项（demux → FLV → 落盘 → ffprobe）
+./scripts/http_test.sh         # M3 HTTP 层（含 Range / chunked / 统计）
+./scripts/echo_test.sh         # M2 网络层（100MB 回显）
 ```
 
-**判定标准**：输出流参数与源一致；`ffmpeg` 转存过程**零错误输出**；帧数与时长匹配（允许 1 帧误差）。
+手工复现（脚本里的关键几步）：
+
+```bash
+# 1) 起服务（零参数即可：0.0.0.0:8080 + ./samples）
+./build/bin/mzmedia &
+
+# 2) 拉流存盘（HTTP-FLV 就是 FLV，可以直接落盘）
+curl -sN --max-time 30 http://127.0.0.1:8080/live/sample.flv -o /tmp/out.flv
+
+# 3) 校验输出流：编码、分辨率、音频、帧数
+ffprobe -v error -show_entries stream=codec_name,width,height,sample_rate,channels \
+        -of default=noprint_wrappers=1 /tmp/out.flv
+ffprobe -v error -count_frames -select_streams v:0 \
+        -show_entries stream=nb_read_frames -of csv=p=0 /tmp/out.flv
+
+# 4) 完整解码（**不许有任何 error 输出**）
+ffmpeg -v error -i /tmp/out.flv -f null -
+
+# 5) H264 裸流走同一套（`sample.h264.flv` → `<media-root>/sample.h264`）
+curl -sN --max-time 30 http://127.0.0.1:8080/live/sample.h264.flv -o /tmp/raw.flv
+ffprobe -v error -show_entries stream=codec_name,width,height -of default=noprint_wrappers=1 /tmp/raw.flv
+ffmpeg -v error -i /tmp/raw.flv -f null -
+```
+
+**判定标准**：输出流参数与源一致（`sample.mp4` → h264 320x240 + aac 44100）；帧数与源一致（±2）；
+`ffmpeg` 转存过程**零错误输出**；裸流那条同样要求（avcC 构造错了这里必红）。
+
+### 3.1 `NFR-1`（首帧 < 1s）怎么量
+
+- **协议层（自动，脚本 §4）**：后台 `curl -N` 存盘，前台每 20ms 看一次文件大小，长到 **2KB**
+  （≈ FLV 头 + sequence header + 第一帧的一部分）即认为"首帧已到"。粒度 20ms，用来抓
+  "要等一秒才出画面"这类真问题；**它不追求毫秒级精度**（那需要播放器埋点）。
+  实测：**20ms 级**（`curl -w '%{time_starttransfer}'` 的 TTFB 是 3.3ms）。
+- **播放器层（人工）**：浏览器 DevTools → Network → 该 FLV 请求的 **Time to First Byte**，
+  以及页面 `#err` 区域是否为空（页面会把 flv.js 的加载/播放错误直接写出来）。
+- 用**冷启动**的媒体文件量（脚本里每个阶段各用一份复制文件）：源读过一遍就 EOS 了，
+  再量到的是"缓存回放"，不是首帧延迟。
 
 ## 4. 端到端（播放器）
 
 | 播放端 | 命令 / 方式 | 关注点 |
 |---|---|---|
 | ffplay | `ffplay -f flv http://127.0.0.1:8080/live/sample.flv` | 出画面、有声音、无卡顿 |
-| 内置测试页 | 浏览器打开 `http://127.0.0.1:8080/` | flv.js 能播、CORS 正常、首帧 <1s |
+| 浏览器（内置页） | `http://127.0.0.1:8080/` → 填媒体名 → 点「播放」 | flv.js **入库**（`/flv.min.js`）能播、CORS 正常、首帧 <1s；页面上会显示 `flvjs.version`（应为 **1.6.2**）。若 flv.js 没取到，页面会**明确写出原因**（不是"点了没反应"） |
+| 浏览器（循环） | `./build/bin/mzmedia --loop` 后打开同一页 | 播完自动从头接上；时间戳连续（不会回退花屏） |
 | curl（协议层） | `curl -N -v http://127.0.0.1:8080/live/sample.flv \| head -c 1k \| xxd` | 前 9 字节是 `FLV\x01`；chunked 头正确 |
 | hls（v0.2） | `ffplay http://127.0.0.1:8080/hls/sample.m3u8` | 切片连续、无 404 |
+
+**没有浏览器时的替代验证**（脚本 §1 就是这么做的）：`GET /` 的正文里必须有 `<video>` /
+`flv.min.js` / `flvjs.createPlayer` / `/live/`，且 `GET /flv.min.js` 与入库文件**逐字节一致** ——
+这能证明"浏览器要的东西确实能取到"，但**不能**证明真实渲染（那需要人看一眼）。
 
 ## 5. 稳定性（1 小时长跑）
 
@@ -170,8 +202,13 @@ curl -s http://127.0.0.1:8080/api/stats | python3 -m json.tool
 | FR-3.1 HTTP-FLV（chunked、首包即 sequence header） | **M6-a ✅**：单元 `flv` 组逐字节断言 header/tag/sequence header；集成 `scripts/flv_mux_test.sh` —— 产物经 `ffprobe` 认成 **h264 320x240 + aac**、解码 **50 帧 / 2 秒**、`ffmpeg -f null -` 完整解码无 error（**8/8**）。M6-b：`curl -N http://…/live/x.flv` 拿到合法 FLV |
 | FR-3.3 AAC 转发 / 无音频也能播 | 单元 `flv`：AAC sequence header（`0xAF` + AudioSpecificConfig）与 raw 包布局；另有**纯视频**用例（`Streams{video, nullptr}`）证明"没有音频不报错" |
 | FR-3.4 时间戳基准（FLV → 毫秒） | 单元 `flv`：`CompositionTime = pts - dts`（含负值的 24 位补码）；**per-client 基准**（中途接入的时间戳也从 0 开始）；32 位自然回绕；早于基准的包钳 0 并计数 |
-| FR-4.1 `/live/<name>.flv` 路由 | **M6-b ✅**：`scripts/flv_http_test.sh` **15/15** —— `curl -N` 拉到 **55,623 字节**合法 FLV（`ffprobe` 认 h264 320x240 + aac、解码 50 帧；`ffmpeg -f null -` 无 error）；`Content-Type: video/x-flv` + chunked + CORS；不存在 / 目录穿越 / 非法名一律 404 |
-| NFR-1 首帧 < 1s | **M6-b**：`FlvSender::start()` 在路由处理器内**同步**发出 FLV Header + sequence header（**不等第一帧**，FR-3.1），首个媒体包来自 `GopCache`（关键帧）；浏览器实测归 **M6-c**（Performance 面板 / `curl -w '%{time_starttransfer}'`） |
+| FR-4.1 `/live/<name>.flv` 路由 | **M6-c ✅**：`scripts/flv_http_test.sh` **49/49** —— `curl -N` 拉到 **55,623 字节**合法 FLV（`ffprobe` 认 h264 320x240 + aac、解码 50 帧；`ffmpeg -f null -` 无 error）；`Content-Type: video/x-flv` + chunked + CORS；名字映射支持白名单扩展名（`.mp4/.h264/…`）；不存在 / 目录穿越 / 非法名 / 非白名单扩展名一律 404（并用**不同提示语**区分"路径非法"与"文件不存在"） |
+| NFR-1 首帧 < 1s | **M6-c ✅**：协议层用脚本 §4（"文件长到 2KB"近似首帧到达，实测 **20ms 级**，TTFB 3.3ms）；`FlvSender::start()` 在路由处理器内**同步**发出 FLV Header + sequence header 并**立刻搬一次队列**（不等第一帧，FR-3.1）；浏览器侧看 DevTools 的 TTFB（第 3.1 节） |
+| FR-2.1 裸流 → FLV（Annex-B → AVCC） | **M6-c ✅**：纯函数单测 `ffmpeg` 组 7 例（逐字节转换、avcC 逐字段、拒绝畸形）；`producer` 组断言快照是 avcC 且 `FlvMuxer::prepare()==Ok`、每个包都是合法 AVCC；端到端 `scripts/flv_http_test.sh` §3 用 `ffprobe`+`ffmpeg`+**python 逐 tag 复查 AVCC 结构**三重判定 |
+| FR-7.1 / FR-7.2 / FR-7.3 命令行与零参数启动 | **M6-c ✅**：`./build/bin/mzmedia` 零参数启动并在横幅打印播放页/拉流/统计 URL（脚本 §0 断言横幅里有 URL）；`--port/--media-root/--web-root/--loop/--speed/--log-level/--help`；**未知参数直接报错退出**（不静默忽略） |
+| `--loop`（循环播放，默认关） | **M6-c ✅**：单测 `producer_loop_offsets_timestamps_monotonically`（跨趟**视频与音频各自严格递增**、偏移≈样本时长、`loopFailures()==0`）；端到端脚本 §9（4 倍速拉 3 秒 → **11 秒**媒体时长 / 297 帧 / `loops=6` / `ffmpeg` 解码无 error） |
+| 源结束后的行为（不挂连接） | **M6-c ✅**：单测 `flv_sender_start_drains_already_ended_source`；端到端脚本 §8（修前 `curl rc=28` 挂满超时，修后 **12ms** 正常结束） |
+| 空闲释放不打断观看 | **M6-c ✅**：单测 `srcmgr_idle_release_waits_for_subscribers`（有订阅者 → 推迟并计数；订阅者一走 → 下一次复查释放） |
 | 各 codec 组合 | `CODEC_MATRIX.md` 每个组合一条 ffprobe 用例 |
 
 ## 8. 并发检查（TSAN）
@@ -260,11 +297,23 @@ cmake -B build-tsan -DMZMEDIA_ENABLE_TSAN=ON -DCMAKE_CXX_COMPILER=g++-12
 
 ### 8.6 当前基线
 
-| 分组 | 用例数（去重） | TSAN 报告 |
+**M6-c 实测**（`./scripts/tsan.sh`，g++-12 运行时；**全绿，0 报告**）：
+
+| 分组 | 用例数 | TSAN 报告 |
 |---|---|---|
-| 严格组：`selftest` / `util` / `logger` / `queue` / `pool` / `semaphore` / `core` | 58 | **0** |
-| 已知误报组：`qtimed` / `ptimed` | 3 | 5（全部为第 8.2 节的误报） |
-| 合计 | 61 | 真问题 **0** |
+| 严格组（18 组）：`selftest` / `util` / `logger` / `queue` / `pool` / `semaphore` / `core` / `poller` / `timer` / `buffer` / `http` / `ntimed_http` / `ffmpeg` / `media` / `ntimed_media` / `srcmgr` / `flv` / `producer` | 278 | **0** |
+| 含超时等待的组：`qtimed` / `ptimed` / `ntimed` | 41 | **0**（g++-12 运行时已无第 8.2 节的误报） |
+| 合计（脚本统计） | **317** | 真问题 **0** |
+
+**同批其它门禁**（`VERSIONING.md` 发版清单里的项目）：
+
+| 门禁 | 命令 | M6-c 实测 |
+|---|---|---|
+| 单元（串行） | `cd build && ctest --output-on-failure` | **21/21 分组通过**（243 用例；**不要**加 `-j`，见 §2.2） |
+| 单元（ASAN） | `cmake -B build-asan -DMZMEDIA_ENABLE_ASAN=ON && cd build-asan && ctest` | **21/21 通过** |
+| 单进程全量 | `./build/bin/mzmedia_unittest` | **243/243 用例、61,254 条断言**（诊断用，不作为计时门禁） |
+| 编译 | `cmake --build build` | **0 warning / 0 error**（`-Wall -Wextra`，无任何 `-Wno-`；ASAN 构建同样 0） |
+| 脚本验收 | `scripts/{http,flv_mux,flv_http}_test.sh` | **全绿**（M3 / 8 项 / **49 项**） |
 
 > 分组按**用例名子串**匹配，因此个别用例会同时属于两个组
 > （如 `logger_queue_overflow_drop` 同时属于 `logger` 与 `queue`）。上表为去重后的数字。

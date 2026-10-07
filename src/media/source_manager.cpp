@@ -58,6 +58,12 @@ bool SourceManager::setConfig(const Config &config) {
         WarnL << "SourceManager::setConfig 被拒：idle_release_ms 超过硬上限 " << kHardMaxIdleMs;
         return false;
     }
+    // deferred_recheck_ms 不能是 0：它是"再过多久复查一次"，0 会让复查退化成忙等
+    if (config.deferred_recheck_ms == 0 || config.deferred_recheck_ms > kHardMaxIdleMs) {
+        WarnL << "SourceManager::setConfig 被拒：deferred_recheck_ms 必须在 (0, " << kHardMaxIdleMs
+              << "] 内（0 = 忙等，不是「不限」）";
+        return false;
+    }
     // 每源上限复用 MediaSource 自己的校验（避免同一套规则写两遍然后漂移）
     MediaSource probe;
     if (!probe.setLimits(config.source)) {
@@ -179,14 +185,25 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path) {
     return makeHandle(fresh);
 }
 
-const Demuxer *SourceManager::demuxerFor(const std::string &path) const {
-    std::lock_guard<std::mutex> lock(_mutex);
-    const auto it = _entries.find(path);
-    if (it == _entries.end() || !it->second->producer) {
-        return nullptr;
+SourceManager::MuxerStreams SourceManager::muxerStreamsFor(const std::string &path) const {
+    MuxerStreams out;
+    std::shared_ptr<DemuxerProducer> producer;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        const auto it = _entries.find(path);
+        if (it == _entries.end()) {
+            return out; // 没有这个源：两路都是 nullptr
+        }
+        producer = it->second->producer;
     }
-    // producer 与 entry 同生命周期；调用方拿到后应立刻取 StreamInfo，不要长期持有
-    return &it->second->producer->demuxer();
+    if (!producer) {
+        return out;
+    }
+    // 锁外取：producer 的快照是"写一次、之后只读"的，读它不需要管理器锁
+    out.video = producer->muxerVideo();
+    out.audio = producer->muxerAudio();
+    out.annex_b_video = producer->annexBVideo();
+    return out;
 }
 
 MediaSource::Ptr SourceManager::makeHandle(const std::shared_ptr<Entry> &entry) {
@@ -226,7 +243,10 @@ void SourceManager::onHandleReleased(const std::string &path) {
     }
 
     if (idle_ms == 0 || !_poller) {
-        releaseEntry(path, true); // 不缓存：立即回收（idle 语义，故计入 idle_released）
+        // 不缓存模式：**仍然要守住"有订阅者在看就不释放"**（M6-c 修的 bug，见 tryIdleRelease）
+        if (!tryIdleRelease(path, idle_ms)) {
+            return; // 还有订阅者：已安排复查，等它走
+        }
         return;
     }
 
@@ -239,6 +259,7 @@ void SourceManager::onHandleReleased(const std::string &path) {
     });
     if (!posted) {
         // poller 已退出：**绝不能静默"永不释放"**（那就是泄漏）→ 退化为立即释放
+        // （poller 都没了 = 正在关停，"保证观看"已无意义，所以这里不看订阅者）
         ++_total_idle_schedule_failed;
         WarnL << "SourceManager：poller 已退出，源 " << path << " 退化为立即释放";
         releaseEntry(path, true);
@@ -261,7 +282,7 @@ void SourceManager::armIdleTimer(const std::string &path) {
     }
 
     if (idle_ms == 0 || !_poller) {
-        releaseEntry(path, true);
+        (void) tryIdleRelease(path, idle_ms); // 同样要守住"有订阅者在看就不释放"
         return;
     }
 
@@ -289,6 +310,7 @@ void SourceManager::armIdleTimer(const std::string &path) {
 }
 
 void SourceManager::onIdleTimeout(const std::string &path) {
+    uint32_t idle_ms = 0;
     {
         std::lock_guard<std::mutex> lock(_mutex);
         const auto it = _entries.find(path);
@@ -298,8 +320,81 @@ void SourceManager::onIdleTimeout(const std::string &path) {
         if (it->second->handles > 0) {
             return; // 又有人用了（理论上计时已被取消，这里再兜一层）
         }
+        // 本次延迟任务已经触发：清掉句柄，允许 tryIdleRelease 重新挂表
+        it->second->idle_task.reset();
+        idle_ms = _config.idle_release_ms;
     }
-    releaseEntry(path, true);
+    (void) tryIdleRelease(path, idle_ms);
+}
+
+std::shared_ptr<SourceManager::Entry> SourceManager::findEntry(const std::string &path) const {
+    std::lock_guard<std::mutex> lock(_mutex);
+    const auto it = _entries.find(path);
+    return it == _entries.end() ? nullptr : it->second;
+}
+
+bool SourceManager::tryIdleRelease(const std::string &path, uint32_t idle_ms) {
+    const std::shared_ptr<Entry> entry = findEntry(path);
+    if (!entry) {
+        return true; // 条目已经不在了（releaseAll / 之前的复查释放过）
+    }
+    const size_t viewers = entry->source ? entry->source->subscriberCount() : 0;
+    if (viewers == 0) {
+        releaseEntry(path, true);
+        return true;
+    }
+
+    // 还有人在看：**不能释放** —— 句柄计数只说明"应用层不再拿着句柄"，
+    // 而订阅者还在推流。释放会把源线程停掉，观看者会突然"播完"（M6-c 之前的 bug）。
+    ++_total_idle_deferred;
+    if (idle_ms == 0) {
+        // "不缓存"与"有人在看"冲突时，**优先保证观看不被打断**：
+        // 用配置的复查间隔重新看，绝不原地忙等，也绝不假装"已经回收"
+        uint32_t recheck = 0;
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            recheck = _config.deferred_recheck_ms;
+        }
+        if (recheck == 0) {
+            recheck = 1; // 理论上 setConfig 已挡住 0；这里是最后一道（宁可 1ms 也不忙等）
+        }
+        scheduleIdleRecheck(path, recheck);
+    } else {
+        scheduleIdleRecheck(path, idle_ms);
+    }
+    InfoL << "源 " << path << " 空闲计时到期，但还有 " << viewers << " 个订阅者在看 → 推迟释放（第 "
+          << _total_idle_deferred.load() << " 次）";
+    return false;
+}
+
+void SourceManager::scheduleIdleRecheck(const std::string &path, uint32_t delay_ms) {
+    // **必须在轮询线程调用**（doDelayTask 的约定）：两个调用点分别来自
+    // armIdleTimer / onIdleTimeout，二者都在轮询线程上
+    if (!_poller) {
+        return; // 没有 poller：无法复查 → 留给 releaseAll()（关停路径）
+    }
+    std::weak_ptr<SourceManager> weak_self = weak_from_this();
+    EventPoller::DelayTask::Ptr task =
+        _poller->doDelayTask(delay_ms, [weak_self, path]() -> uint64_t {
+            if (auto self = weak_self.lock()) {
+                self->onIdleTimeout(path);
+            }
+            return 0; // 一次性
+        });
+    if (!task) {
+        ++_total_idle_schedule_failed;
+        WarnL << "SourceManager：复查定时器被拒（poller 已退出），源 " << path
+              << " 留到 releaseAll() 再回收";
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(_mutex);
+    const auto it = _entries.find(path);
+    if (it == _entries.end()) {
+        task->cancel(); // 挂表期间被释放
+        return;
+    }
+    it->second->idle_task = task;
 }
 
 bool SourceManager::release(const std::string &path) {
@@ -386,28 +481,40 @@ std::string SourceManager::dumpStats() const {
            " idle_released=" + std::to_string(_total_idle_released.load()) +
            " released=" + std::to_string(_total_released.load()) +
            " rejected=" + std::to_string(_total_acquire_rejected.load()) +
-           " idle_schedule_failed=" + std::to_string(_total_idle_schedule_failed.load()) + "}";
+           " idle_schedule_failed=" + std::to_string(_total_idle_schedule_failed.load()) +
+           " idle_deferred=" + std::to_string(_total_idle_deferred.load()) + "}";
 }
 
 std::string SourceManager::dumpStatsJson() const {
     // 契约：返回**合法 JSON 对象片段**（不含最外层花括号），键名用模块名做前缀避免与 http 侧撞名
+    struct SnapshotItem {
+        std::string path;
+        MediaSource::Ptr source;
+        std::shared_ptr<DemuxerProducer> producer;
+    };
     std::string out = "\"source_manager\":{\"sources\":";
-    std::vector<std::pair<std::string, MediaSource::Ptr>> snapshot; // 锁外取每个源的统计
+    std::vector<SnapshotItem> snapshot; // 锁外取每个源的统计
     {
         std::lock_guard<std::mutex> lock(_mutex);
         out += std::to_string(_entries.size());
         out += ",\"handles\":" + std::to_string(_handles.load());
         out += ",\"idle_release_ms\":" + std::to_string(_config.idle_release_ms);
+        out += ",\"deferred_recheck_ms\":" + std::to_string(_config.deferred_recheck_ms);
         out += ",\"created\":" + std::to_string(_total_created.load());
         out += ",\"reused\":" + std::to_string(_total_reused.load());
         out += ",\"idle_released\":" + std::to_string(_total_idle_released.load());
+        out += ",\"idle_deferred\":" + std::to_string(_total_idle_deferred.load());
         out += ",\"released\":" + std::to_string(_total_released.load());
         out += ",\"rejected\":" + std::to_string(_total_acquire_rejected.load());
         out += ",\"idle_schedule_failed\":" + std::to_string(_total_idle_schedule_failed.load());
         out += "}";
         for (const auto &kv : _entries) {
-            if (auto source = kv.second->source) {
-                snapshot.emplace_back(kv.first, source);
+            SnapshotItem item;
+            item.path = kv.first;
+            item.source = kv.second->source;
+            item.producer = kv.second->producer;
+            if (item.source) {
+                snapshot.push_back(std::move(item));
             }
         }
     }
@@ -420,7 +527,22 @@ std::string SourceManager::dumpStatsJson() const {
             out += ",";
         }
         first = false;
-        out += "{\"path\":\"" + jsonEscape(item.first) + "\"," + item.second->dumpStatsJson() + "}";
+        out += "{\"path\":\"" + jsonEscape(item.path) + "\"," + item.source->dumpStatsJson();
+        // M6-c：把"输入侧"的信息也带上（解码/循环/Annex-B 是否发生，一眼能看出来）
+        if (item.producer) {
+            const DemuxerProducer &p = *item.producer;
+            out += ",\"producer\":{\"packets\":" + std::to_string(p.totalPackets());
+            out += ",\"bytes\":" + std::to_string(p.totalBytes());
+            out += ",\"skipped_unknown\":" + std::to_string(p.skippedUnknownStreams());
+            out += ",\"ts_failures\":" + std::to_string(p.timestampFailures());
+            out += ",\"annex_b_video\":" + std::string(p.annexBVideo() ? "true" : "false");
+            out += ",\"annex_b_packets\":" + std::to_string(p.annexBPackets());
+            out += ",\"loops\":" + std::to_string(p.loopCount());
+            out += ",\"loop_offset_ms\":" + std::to_string(p.loopOffsetMs());
+            out += ",\"loop_failures\":" + std::to_string(p.loopFailures());
+            out += "}";
+        }
+        out += "}";
     }
     out += "]";
     return out;

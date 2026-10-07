@@ -100,6 +100,22 @@ bool skipScalingList(BitReader &br, int size_of_list) {
 constexpr uint8_t kNalSps = 7;
 constexpr uint8_t kNalPps = 8;
 
+/// 单个 NAL 的硬上限：与 `Demuxer::Limits::max_packet_size` 同量级。
+/// 一个 NAL 比整个包上限还大 = 数据已经不对了，宁可失败也不要"照长度写出去"
+constexpr size_t kMaxNalSize = 8u * 1024u * 1024u;
+
+void appendU16Be(std::vector<uint8_t> *out, size_t value) {
+    out->push_back(static_cast<uint8_t>((value >> 8) & 0xFFu));
+    out->push_back(static_cast<uint8_t>(value & 0xFFu));
+}
+
+void appendU32Be(std::vector<uint8_t> *out, size_t value) {
+    out->push_back(static_cast<uint8_t>((value >> 24) & 0xFFu));
+    out->push_back(static_cast<uint8_t>((value >> 16) & 0xFFu));
+    out->push_back(static_cast<uint8_t>((value >> 8) & 0xFFu));
+    out->push_back(static_cast<uint8_t>(value & 0xFFu));
+}
+
 } // namespace
 
 size_t splitAnnexBNals(const uint8_t *data, size_t size, std::vector<H264Nal> *out) {
@@ -311,6 +327,75 @@ bool parseSpsDimension(const uint8_t *sps, size_t size, int *width, int *height)
     }
     *width = w;
     *height = h;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// M6-c：Annex-B → AVCC + avcC 构造
+// ---------------------------------------------------------------------------
+
+bool looksLikeAnnexB(const uint8_t *data, size_t size) {
+    if (data == nullptr || size < 3) {
+        return false;
+    }
+    if (data[0] != 0 || data[1] != 0) {
+        return false;
+    }
+    if (data[2] == 1) {
+        return true; // 3 字节起始码 00 00 01
+    }
+    return size >= 4 && data[2] == 0 && data[3] == 1; // 4 字节 00 00 00 01
+}
+
+bool annexBToAvcc(const uint8_t *data, size_t size, std::vector<uint8_t> *out) {
+    if (data == nullptr || out == nullptr) {
+        return false;
+    }
+    out->clear();
+    if (size == 0) {
+        return false;
+    }
+    std::vector<H264Nal> nals;
+    if (splitAnnexBNals(data, size, &nals) == 0) {
+        return false; // 没有起始码：这不是 Annex-B（**报错**，别猜）
+    }
+    for (const auto &nal : nals) {
+        if (nal.size == 0 || nal.size > kMaxNalSize) {
+            out->clear();
+            return false;
+        }
+        appendU32Be(out, nal.size);
+        out->insert(out->end(), nal.data, nal.data + nal.size);
+    }
+    return !out->empty();
+}
+
+bool buildAvcC(const uint8_t *sps, size_t sps_size, const uint8_t *pps, size_t pps_size,
+               std::vector<uint8_t> *out) {
+    if (sps == nullptr || pps == nullptr || out == nullptr) {
+        return false;
+    }
+    // 最短合法 SPS 也要能拿出 profile/compat/level 三个字节（+ NAL header）
+    if (sps_size < 4 || sps_size > 0xFFFFu || pps_size == 0 || pps_size > 0xFFFFu) {
+        return false;
+    }
+    if ((sps[0] & 0x1Fu) != kNalSps || (pps[0] & 0x1Fu) != kNalPps) {
+        return false; // 传进来的不是 SPS/PPS：宁可失败，也不构造一个假头
+    }
+
+    out->clear();
+    out->reserve(11 + sps_size + pps_size);
+    out->push_back(1);        // configurationVersion
+    out->push_back(sps[1]);   // AVCProfileIndication
+    out->push_back(sps[2]);   // profile_compatibility
+    out->push_back(sps[3]);   // AVCLevelIndication
+    out->push_back(0xFF);     // 6 bits reserved(111111) + lengthSizeMinusOne(11) → NAL 长度 4 字节
+    out->push_back(0xE1);     // 3 bits reserved(111) + numOfSequenceParameterSets(1)
+    appendU16Be(out, sps_size);
+    out->insert(out->end(), sps, sps + sps_size);
+    out->push_back(1);        // numOfPictureParameterSets
+    appendU16Be(out, pps_size);
+    out->insert(out->end(), pps, pps + pps_size);
     return true;
 }
 

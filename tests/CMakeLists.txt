@@ -45,6 +45,8 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_flv_muxer.cpp
         # ---- M6-b 每连接的 FLV 发送器（用例名 flv_sender_*，同属 flv 分组）----
         ${CMAKE_CURRENT_SOURCE_DIR}/test_flv_sender.cpp
+        # ---- M6-c 输入形状转换与循环重开（用例名 producer_*）----
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_demuxer_producer.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS
@@ -95,6 +97,9 @@ set(MZMEDIA_TEST_GROUPS
         # ---- M6-a FLV 封装 ----
         # 纯函数（不碰网络/线程/文件），只是最后落一个文件 → 严格组。
         flv
+        # ---- M6-c 输入形状（Annex-B → AVCC）与循环重开 ----
+        # 单线程、无等待（起线程/定时器的事在 srcmgr 组），只用真样本文件 → 严格组。
+        producer
         )
 
 add_executable(mzmedia_unittest ${MZMEDIA_TEST_SOURCES})

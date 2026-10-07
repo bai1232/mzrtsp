@@ -88,6 +88,19 @@ public:
     bool setEndStream(EndStreamFn fn);
     const EndStreamFn &endStreamFn() const;
 
+    /**
+     * 「异常终止」出口：**由 `HttpSession` 注入** —— 立刻关闭连接，**不发**结束块（M6-c）
+     * @note 与 `endStreamFn()` 的分工（两个语义不能混）：
+     *       · 正常结束（源读完 / 客户端的流已完整）→ `endStreamFn()`：发 `0\r\n\r\n` + 等排空再关，
+     *         客户端看到的是一个**完整**的流；
+     *       · 异常结束（订阅者 broken、写失败、被中止）→ 本出口：直接关，
+     *         客户端会明确报"传输被截断"（curl: transfer closed with outstanding read data）——
+     *         这才是事实。用结束块收尾等于替客户端把"流是残缺的"这件事掩盖掉。
+     */
+    using AbortFn = std::function<bool()>;
+    bool setAbortFn(AbortFn fn);
+    const AbortFn &abortFn() const;
+
     /// 声明这是**异步流式**响应：框架不再兜底 `endChunked()`
     /// （兜底只对"同步发完"的处理器有意义；对异步流会误把流结束掉）
     bool setChunkedAsync();
@@ -110,6 +123,7 @@ private:
     std::string _body;
     Sender _sender;
     EndStreamFn _end_stream;
+    AbortFn _abort_stream;
     bool _chunked = false;
     bool _chunked_ended = false;
     bool _chunked_async = false;

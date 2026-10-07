@@ -31,21 +31,122 @@ namespace {
 /// 「发完再关」的最长等待（M6-b）：够本地把最后一块写完，又不会让连接挂太久
 constexpr uint32_t kFlushCloseWaitMs = 5000;
 
-/// 内置测试页（SC-1 的落地）：**不依赖外部 CDN**，离线可用
-const char *kTestPage =
-    "<!DOCTYPE html>\n"
-    "<html lang=\"zh-CN\">\n"
-    "<head><meta charset=\"utf-8\"><title>mzmedia</title></head>\n"
-    "<body>\n"
-    "<h1>mzmedia</h1>\n"
-    "<p>HTTP 层已就绪（M3-b）。FLV 播放页将在 M6 接入。</p>\n"
-    "<ul>\n"
-    "  <li>GET /            —— 本页</li>\n"
-    "  <li>GET /api/stats    —— 运行统计（M3-c）</li>\n"
-    "  <li>GET /live/N.flv   —— HTTP-FLV（M6）</li>\n"
-    "</ul>\n"
-    "</body>\n"
-    "</html>\n";
+/**
+ * 内置测试页（SC-1 的落地）：**不依赖外部 CDN** —— 播放器用的是**入库**的 flv.js
+ * （`third_party/flv.js/flv.min.js`，Apache-2.0），由 app 通过 `/flv.min.js` 提供
+ * （见 `src/main.cpp` 的 `--web-root`）。所以离线也能播，而不是"页面能开、播放器加载不出来"。
+ *
+ * 页面里刻意做了一件事：**flv.js 没加载出来时明确写在页面上**。
+ * 否则用户看到的是一个"点了没反应"的播放器，无从判断是页面坏了还是流坏了。
+ */
+// M6-c：标题保持 `<title>mzmedia</title>` —— `scripts/http_test.sh` 用它判断"是我们的内置页"，
+// 这是既有的对外契约，不能因为改了页面就悄悄失效
+const char *kTestPage = R"HTML(<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>mzmedia</title>
+<style>
+ body { font-family: sans-serif; margin: 24px; max-width: 900px; }
+ input { padding: 4px; }
+ button { padding: 4px 12px; margin-left: 4px; }
+ #state { margin-left: 12px; color: #555; }
+ #err { color: #b00; white-space: pre-wrap; }
+ video { background: #000; width: 640px; max-width: 100%; }
+ pre { background: #f6f6f6; padding: 8px; overflow-x: auto; }
+</style>
+</head>
+<body>
+<h1>mzmedia</h1>
+<p>HTTP-FLV 播放页。媒体文件放在服务端 <code>--media-root</code> 目录下：填 <code>sample</code>
+   就会去拉 <code>/live/sample.flv</code>（对应 <code>sample.mp4</code>；
+   填 <code>sample.h264</code> 就是 H264 裸流，服务端会现场构造 avcC 并转 AVCC）。</p>
+<p>
+  <label>媒体名：<input id="name" value="sample" size="20"></label>
+  <button id="play">播放</button>
+  <button id="stop">停止</button>
+  <span id="state">未开始</span>
+</p>
+<video id="v" controls autoplay muted playsinline></video>
+<p id="err"></p>
+<details open><summary>/api/stats（每 2 秒刷新）</summary><pre id="stats">…</pre></details>
+<p>其它接口：<code>GET /api/stats</code>（运行统计）· <code>GET /stream</code>（chunked 演示）·
+   <code>GET /hls/N.m3u8</code>（HLS，v0.2 接入）。服务器加 <code>--loop</code> 启动则循环推流。</p>
+<script src="/flv.min.js"></script>
+<script>
+(function () {
+  var stateEl = document.getElementById('state');
+  var errEl = document.getElementById('err');
+  var video = document.getElementById('v');
+  var player = null;
+
+  function setState(s) { stateEl.textContent = s; }
+  function setErr(s) { errEl.textContent = s || ''; }
+
+  if (!window.flvjs) {
+    setState('flv.js 未加载');
+    setErr('没有取到 /flv.min.js：浏览器播 FLV 依赖它。\n' +
+           '请用 bin/mzmedia 启动（它的 --web-root 默认指向 third_party/flv.js），' +
+           '或确认该文件存在且路径正确。');
+    return;
+  }
+  setState('flv.js ' + flvjs.version + ' 已就绪');
+
+  function stop() {
+    if (player) {
+      try { player.unload(); player.detachMediaElement(); player.destroy(); } catch (e) { /* 已停 */ }
+      player = null;
+    }
+    setState('已停止');
+  }
+
+  function play() {
+    stop();
+    setErr('');
+    var name = document.getElementById('name').value.trim();
+    if (!name) { setErr('请填媒体名'); return; }
+    if (!flvjs.isSupported()) {
+      setErr('这个浏览器不支持 MSE（flv.js 依赖它）。Chrome/Firefox/Edge 桌面版可以。');
+      return;
+    }
+    var url = '/live/' + name + '.flv';
+    player = flvjs.createPlayer({ type: 'flv', isLive: false, url: url },
+                                { enableStashBuffer: false, stashInitialSize: 128 });
+    player.attachMediaElement(video);
+    player.on(flvjs.Events.ERROR, function (type, detail) {
+      setState('出错');
+      setErr('播放出错：' + type + ' / ' + detail +
+             '\n常见原因：文件名不对（应能在服务端 --media-root 下找到）、' +
+             '不是 H264+AAC、或服务器没回 200。');
+    });
+    player.load();
+    var p = player.play();
+    if (p && p.catch) {
+      p.catch(function (e) { setErr('自动播放被浏览器策略拦住，请点视频上的播放键：' + e); });
+    }
+    setState('正在播放 ' + url);
+  }
+
+  document.getElementById('play').onclick = play;
+  document.getElementById('stop').onclick = stop;
+  document.getElementById('name').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { play(); }
+  });
+
+  function refreshStats() {
+    fetch('/api/stats').then(function (r) { return r.text(); }).then(function (t) {
+      document.getElementById('stats').textContent = t;
+    }).catch(function (e) {
+      document.getElementById('stats').textContent = '取统计失败：' + e;
+    });
+  }
+  refreshStats();
+  setInterval(refreshStats, 2000);
+})();
+</script>
+</body>
+</html>
+)HTML";
 
 /**
  * 单区间 Range（M3-c）：只支持 `bytes=a-b` / `bytes=a-`
@@ -179,6 +280,14 @@ private:
                     return false; // 连接已坏
                 }
                 return shutdownAfterFlush(kFlushCloseWaitMs);
+            });
+            // M6-c：**异常终止**出口。流是残缺的（订阅者 broken / 写失败）时，不能发结束块
+            // —— 那等于替客户端掩盖"数据丢了"。直接关连接，客户端会明确报传输被截断
+            resp.setAbortFn([this]() -> bool {
+                ErrorP("HttpServer: 流式响应异常终止 → 直接关闭连接（不发结束块）");
+                shutdown(SockException(SockException::ErrType::Shutdown, 0,
+                                       "stream aborted (broken/failed)"));
+                return true;
             });
             try {
                 handler(_parser, resp);

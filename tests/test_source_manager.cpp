@@ -462,3 +462,115 @@ MZ_TEST(srcmgr_throttle_limits_delivery_rate) {
 
     (void) poller->shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// M6-c：空闲释放必须避开"有人在看"；输出层要的流快照
+// ---------------------------------------------------------------------------
+
+MZ_TEST(srcmgr_idle_release_waits_for_subscribers) {
+    // ★ M6-c 修的 bug：句柄数归零 ≠ 没人看。
+    //   应用层 handler 一返回就把 `MediaSource::Ptr` 句柄放了，而连接还连着、订阅者还在推流。
+    //   修前 `onIdleTimeout` 只看 handles：60s 一到就把源线程停掉 —— 观看者会**突然"播完"**
+    //   （M6-d 的 5 分钟验收必然踩到）。
+    const std::string path = samplePath("sample.mp4");
+    MZ_ASSERT_FALSE(path.empty());
+    if (path.empty()) {
+        return;
+    }
+
+    auto poller = EventPoller::create("test-srcmgr-subscriber-guard");
+    auto manager = SourceManager::create(poller);
+    auto cfg = manager->config();
+    cfg.idle_release_ms = 0;      // 最激进：句柄一放就想回收
+    cfg.deferred_recheck_ms = 20; // 复查窗口调小：用例能快速跑完
+    MZ_ASSERT_TRUE(manager->setConfig(cfg));
+
+    auto handle = manager->acquire(path);
+    MZ_ASSERT_NOT_NULL(handle.get());
+    if (!handle) {
+        (void) poller->shutdown();
+        return;
+    }
+    auto subscriber = handle->subscribe(); // ★ 有人在看
+    MZ_ASSERT_NOT_NULL(subscriber.get());
+    if (!subscriber) {
+        (void) poller->shutdown();
+        return;
+    }
+
+    handle.reset(); // 应用层 handler 返回：句柄放了，但连接还在
+    MZ_ASSERT_EQ(manager->sourceCount(), 1u);     // **不能**立刻回收
+    MZ_ASSERT_EQ(manager->totalIdleReleased(), 0u);
+
+    // 反复复查：订阅者还在，就一直不能释放（每次都会记账，可观测）
+    const bool deferred = waitFor([&] { return manager->totalIdleDeferred() >= 2; }, 3000);
+    if (!deferred) {
+        MZ_FAIL("没有观察到推迟释放（统计：" + manager->dumpStats() + "）");
+    }
+    MZ_ASSERT_TRUE(deferred);
+    MZ_ASSERT_EQ(manager->sourceCount(), 1u);
+    MZ_ASSERT_EQ(manager->totalIdleReleased(), 0u);
+    MZ_ASSERT_EQ(manager->totalIdleScheduleFailed(), 0u);
+
+    // 连接断开（订阅者释放）→ 下一次复查就该回收，不能永远留着
+    subscriber.reset();
+    const bool released = waitFor([&] { return manager->sourceCount() == 0; }, 3000);
+    if (!released) {
+        MZ_FAIL("订阅者退出后仍未释放（统计：" + manager->dumpStats() + "）");
+    }
+    MZ_ASSERT_TRUE(released);
+    MZ_ASSERT_EQ(manager->totalIdleReleased(), 1u);
+
+    (void) poller->shutdown();
+}
+
+MZ_TEST(srcmgr_muxer_streams_for_mp4_and_annexb) {
+    // M6-c：输出层拿流信息只走 `muxerStreamsFor()`（不再暴露 `Demuxer*`）。
+    // 裸流必须在这里就变成"带 avcC"的快照 —— 否则每个连接都要自己做一次转换。
+    const std::string mp4 = samplePath("sample.mp4");
+    const std::string raw = samplePath("sample.h264");
+    MZ_ASSERT_FALSE(mp4.empty());
+    MZ_ASSERT_FALSE(raw.empty());
+    if (mp4.empty() || raw.empty()) {
+        return;
+    }
+
+    auto poller = EventPoller::create("test-srcmgr-muxer-streams");
+    auto manager = SourceManager::create(poller);
+
+    auto h_mp4 = manager->acquire(mp4);
+    MZ_ASSERT_NOT_NULL(h_mp4.get());
+    if (!h_mp4) {
+        (void) poller->shutdown();
+        return;
+    }
+    const SourceManager::MuxerStreams s_mp4 = manager->muxerStreamsFor(mp4);
+    MZ_ASSERT_NOT_NULL(s_mp4.video);
+    MZ_ASSERT_NOT_NULL(s_mp4.audio);
+    MZ_ASSERT_FALSE(s_mp4.annex_b_video);
+    if (s_mp4.video != nullptr && s_mp4.video->extradata != nullptr) {
+        MZ_ASSERT_EQ(s_mp4.video->extradata->at(0), 0x01u); // MP4 直接就是 avcC
+    }
+
+    auto h_raw = manager->acquire(raw);
+    MZ_ASSERT_NOT_NULL(h_raw.get());
+    if (!h_raw) {
+        (void) poller->shutdown();
+        return;
+    }
+    const SourceManager::MuxerStreams s_raw = manager->muxerStreamsFor(raw);
+    MZ_ASSERT_NOT_NULL(s_raw.video);
+    MZ_ASSERT_NULL(s_raw.audio);            // 裸流样本没有音频
+    MZ_ASSERT_TRUE(s_raw.annex_b_video);    // 输入是 Annex-B
+    if (s_raw.video != nullptr && s_raw.video->extradata != nullptr) {
+        MZ_ASSERT_TRUE(s_raw.video->extradata->size() > 11u);
+        MZ_ASSERT_EQ(s_raw.video->extradata->at(0), 0x01u); // 快照里已是 avcC
+        MZ_ASSERT_EQ(s_raw.video->extradata->at(5), 0xE1u); // 1 个 SPS
+    }
+    // 不存在的源：两路都是 nullptr（而不是一个半初始化结构）
+    const SourceManager::MuxerStreams missing = manager->muxerStreamsFor(mp4 + ".nope");
+    MZ_ASSERT_NULL(missing.video);
+    MZ_ASSERT_NULL(missing.audio);
+
+    (void) poller->shutdown();
+}

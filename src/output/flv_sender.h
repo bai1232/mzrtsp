@@ -38,12 +38,21 @@ class FlvSender : public std::enable_shared_from_this<FlvSender> {
 public:
     using Ptr = std::shared_ptr<FlvSender>;
 
-    /// 写出目标（HTTP 侧由 `HttpResponse::sender()` / `endStreamFn()` 适配）
+    /// 写出目标（HTTP 侧由 `HttpResponse::sender()` / `endStreamFn()` / `abortFn()` 适配）
     struct Sink {
         /// @return false = 连接已坏（不要再写）
         std::function<bool(const char *data, size_t len)> write;
         /// 流正常结束时的收尾：发 chunked 结束块 + 等排空再关连接
         std::function<void()> end;
+        /**
+         * 【M6-c】异常终止：**主动断开**（`Aborted` / `SinkFailed` 时调用，最多一次）
+         * @note 为什么不复用 `end`：`end` 的语义是"流正常结束"（发结束块，客户端会认为
+         *       收到了完整数据）。而 `Aborted`/`SinkFailed` 意味着**流是残缺的** ——
+         *       用 `end` 收尾等于替客户端把"丢帧/被掐断"这件事掩盖掉。
+         *       所以这里要求一个**硬断连**出口（HTTP 侧 = Session::shutdown，不发结束块）：
+         *       客户端会明确报"传输被截断"，这才是事实。
+         */
+        std::function<void()> abort;
     };
 
     enum class Result : uint8_t {
@@ -57,7 +66,8 @@ public:
     /// @return nullptr = 流参数不满足 FLV 封装（原因已记日志，见 `FlvMuxer::resultName`）
     static Ptr create(const Sink &sink, FlvMuxer::Streams streams, Subscriber::Ptr subscriber);
 
-    /// 发 FLV Header + AVC/AAC sequence header（FR-3.1：**立即**发，不等第一帧）
+    /// 发 FLV Header + AVC/AAC sequence header（FR-3.1：**立即**发，不等第一帧），
+    /// 然后**立刻搬一次队列**（中途接入的 GOP 缓存 / "源已结束"都要马上处理，见 .cpp 说明）
     Result start();
     /// 把订阅者队列里的包全部封成 tag 写出去；源 EOS 时顺带收尾。**由 drain 回调调用**
     Result onDrain();
@@ -87,6 +97,8 @@ public:
 private:
     FlvSender(const Sink &sink, FlvMuxer::Streams streams, Subscriber::Ptr subscriber);
     Result fail(Result result, const std::string &message);
+    /// 通知"连接不该继续了"（幂等：最多调用一次 sink.abort）
+    void notifyAbort();
     /// @return false = 写失败（已置 `_aborted`）
     bool flushBuffer(std::string *buffer);
 
@@ -99,6 +111,7 @@ private:
     bool _started = false;
     bool _finished = false;
     bool _aborted = false;
+    bool _abort_notified = false;
     std::string _last_error;
     uint64_t _packets = 0;
     uint64_t _bytes = 0;

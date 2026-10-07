@@ -156,6 +156,19 @@ else()
 endif()
 
 # ============================================================================
+# 应用可执行文件（M6-c，FR-7.2 的落地）：零参数启动的完整 HTTP-FLV 服务器
+#
+# 目标名不能与静态库同名（CMake 不允许两个 target 重名），所以 target 叫 mzmedia_app，
+# **输出文件名**才是 mzmedia —— 用户看到的、脚本里调用的都是 build/bin/mzmedia。
+# （M6-b 的 examples/flv_http_server 已在本批并入这里，见 docs/DESIGN_M6.md §3.7）
+# ============================================================================
+if(TARGET mzmedia)
+    add_executable(mzmedia_app src/main.cpp)
+    set_target_properties(mzmedia_app PROPERTIES OUTPUT_NAME mzmedia)
+    target_link_libraries(mzmedia_app PRIVATE mzmedia)
+endif()
+
+# ============================================================================
 # 子目录
 # ============================================================================
 # examples/ 在第 4 批才创建，此处做存在性判断，加入后自动生效
@@ -173,6 +186,7 @@ endif()
 # ============================================================================
 if(TARGET mzmedia)
     install(TARGETS mzmedia ARCHIVE DESTINATION lib)
+    install(TARGETS mzmedia_app RUNTIME DESTINATION bin)
     install(DIRECTORY src/ DESTINATION include/mzmedia FILES_MATCHING PATTERN "*.h")
 endif()
 

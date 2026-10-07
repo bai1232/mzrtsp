@@ -36,10 +36,11 @@ uint32_t readU24(const std::string &s, size_t offset) {
            static_cast<uint32_t>(static_cast<uint8_t>(s[offset + 2]));
 }
 
-/// 假 sink：把字节收进一个字符串，并记录 end 被调了几次
+/// 假 sink：把字节收进一个字符串，并记录 end / abort 被调了几次
 struct FakeSink {
     std::string bytes;
     int end_calls = 0;
+    int abort_calls = 0;
     int write_calls = 0;
     /// 失败注入：fail_enabled 为真且已写过 fail_after 次之后，write 返回 false
     bool fail_enabled = false;
@@ -56,6 +57,7 @@ struct FakeSink {
             return true;
         };
         sink.end = [this]() { ++end_calls; };
+        sink.abort = [this]() { ++abort_calls; };
         return sink;
     }
 };
@@ -254,6 +256,7 @@ MZ_TEST(flv_sender_eos_finishes_once) {
     MZ_ASSERT_EQ(sender->onDrain(), FlvSender::Result::Ok);
     MZ_ASSERT_TRUE(sender->finished());
     MZ_ASSERT_EQ(sink.end_calls, 1);
+    MZ_ASSERT_EQ(sink.abort_calls, 0); // 正常结束走 end，绝不能走 abort（两者语义不同）
 
     // 幂等：再 drain 不会重复收尾、也不会再写
     const size_t bytes = sink.bytes.size();
@@ -290,6 +293,13 @@ MZ_TEST(flv_sender_broken_subscriber_aborts) {
     // broken 的含义是"关键帧已经进不去" → 继续发只会让对端花屏，明确断开
     MZ_ASSERT_EQ(sender->onDrain(), FlvSender::Result::Aborted);
     MZ_ASSERT_FALSE(sender->finished()); // 与"正常结束"区分开
+    MZ_ASSERT_EQ(sink.end_calls, 0);     // **不能**用"正常结束"收尾（那会掩盖丢帧）
+    // M6-c：Aborted 要**真的断连** —— 通知 sink.abort（HTTP 侧据此硬关连接）
+    MZ_ASSERT_EQ(sink.abort_calls, 1);
+    // 幂等的是"断连通知"（只发一次），**不是**返回码：
+    // 订阅者仍然是 broken，所以再 drain 依然如实报 Aborted（不是 Ok —— 那会像是"又能发了"）
+    MZ_ASSERT_EQ(sender->onDrain(), FlvSender::Result::Aborted);
+    MZ_ASSERT_EQ(sink.abort_calls, 1);
     MZ_ASSERT_EQ(sink.end_calls, 0);
 }
 
@@ -316,9 +326,11 @@ MZ_TEST(flv_sender_stops_when_sink_fails) {
     // 连接已坏：onDrain 报 SinkFailed 并置 aborted，之后再 drain 不再写
     MZ_ASSERT_EQ(sender->onDrain(), FlvSender::Result::SinkFailed);
     MZ_ASSERT_TRUE(sender->aborted());
+    MZ_ASSERT_EQ(sink.abort_calls, 1); // 写不出去 → 也要真的断连（不能只记一个 Result）
     const int calls = sink.write_calls;
     MZ_ASSERT_EQ(sender->onDrain(), FlvSender::Result::Ok);
     MZ_ASSERT_EQ(sink.write_calls, calls);
+    MZ_ASSERT_EQ(sink.abort_calls, 1); // 断连只发一次
 }
 
 MZ_TEST(flv_sender_foreign_packet_is_reported) {
@@ -341,4 +353,59 @@ MZ_TEST(flv_sender_foreign_packet_is_reported) {
     (void) source.pushPacket(videoPacket(99, true, 16, 0, 0));
     MZ_ASSERT_EQ(sender->onDrain(), FlvSender::Result::BadStreams);
     MZ_ASSERT_TRUE(!sender->lastError().empty());
+}
+
+MZ_TEST(flv_sender_start_drains_already_ended_source) {
+    // ★ M6-c 修的 bug（验收脚本 §9 抓到）：源在订阅之前就已经结束（EOS）时，
+    //   `MediaSource::subscribe()` 会给新队列 markEndOfStream()，但那一刻 drain 回调还没注册
+    //   → 没有任何唤醒 → 这一路连接会**一直挂着不动**（客户端：连上了、头也发了、然后永远黑屏）。
+    StreamInfo video = makeVideo();
+    MediaSource source;
+    MZ_ASSERT_TRUE(source.endOfStream()); // 源已经结束（无订阅者时返回 true = 状态确实变了）
+
+    auto subscriber = source.subscribe();
+    MZ_ASSERT_NOT_NULL(subscriber.get());
+    if (!subscriber) {
+        return;
+    }
+    MZ_ASSERT_TRUE(subscriber->queue().endOfStream()); // 晚到的订阅者立刻知道"不会再有数据"
+
+    FakeSink sink;
+    auto sender = FlvSender::create(sink.make(), FlvMuxer::Streams{&video, nullptr}, subscriber);
+    MZ_ASSERT_NOT_NULL(sender.get());
+    if (!sender) {
+        return;
+    }
+
+    MZ_ASSERT_EQ(sender->start(), FlvSender::Result::Ok);
+    MZ_ASSERT_TRUE(sender->finished());  // start() 里的那一次搬队列就应当收尾
+    MZ_ASSERT_EQ(sink.end_calls, 1);
+    MZ_ASSERT_GT(sink.bytes.size(), 13u); // 头仍然要发出去（FR-3.1）
+}
+
+MZ_TEST(flv_sender_start_drains_seeded_gop) {
+    // 中途接入：源已经有数据（GOP 缓存会灌给新订阅者）→ start() 应当立刻把它发出去，
+    // 而不是等下一次 push（那会让"源推完就停"的场景永远等不到首帧）
+    StreamInfo video = makeVideo();
+    MediaSource source;
+    (void) source.pushPacket(videoPacket(0, true, 32, 0, 0)); // 关键帧进 GOP 缓存
+
+    auto subscriber = source.subscribe();
+    MZ_ASSERT_NOT_NULL(subscriber.get());
+    if (!subscriber) {
+        return;
+    }
+    MZ_ASSERT_EQ(subscriber->queue().packets(), 1u); // 拿到了灌进来的关键帧
+
+    FakeSink sink;
+    auto sender = FlvSender::create(sink.make(), FlvMuxer::Streams{&video, nullptr}, subscriber);
+    MZ_ASSERT_NOT_NULL(sender.get());
+    if (!sender) {
+        return;
+    }
+    const FlvSender::Result started = sender->start();
+    MZ_ASSERT_EQ(started, FlvSender::Result::Ok);
+    MZ_ASSERT_EQ(sender->packetsMuxed(), 1u);        // 那一个关键帧已经封进去了
+    MZ_ASSERT_EQ(subscriber->queue().packets(), 0u); // 队列被搬空
+    MZ_ASSERT_FALSE(sender->finished());             // 还没 EOS：流继续
 }

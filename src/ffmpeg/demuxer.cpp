@@ -148,6 +148,23 @@ bool Demuxer::opened() const {
     return _fmt != nullptr;
 }
 
+bool Demuxer::close() {
+    if (!opened()) {
+        return false;
+    }
+    _fmt.reset();
+    _pkt.reset();
+    _streams.clear();
+    _pts_guard.clear();
+    _dts_guard.clear();
+    _pkt_stream_index = -1;
+    _pkt_pts_ms = 0;
+    _pkt_dts_ms = 0;
+    _eof = false;
+    _path.clear();
+    return true;
+}
+
 const std::string &Demuxer::path() const {
     return _path;
 }

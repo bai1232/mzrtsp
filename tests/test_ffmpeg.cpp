@@ -453,3 +453,192 @@ MZ_TEST(ffmpeg_samples_found_from_nested_cwd) {
     }
     (void) ::system(("rm -rf " + probe).c_str());
 }
+
+// ---------------------------------------------------------------------------
+// M6-c：Annex-B → AVCC + avcC 构造（纯函数；样本相关的两例在最后）
+// ---------------------------------------------------------------------------
+
+MZ_TEST(ffmpeg_avcc_looks_like_annexb) {
+    const uint8_t sc3[] = {0x00, 0x00, 0x01, 0x65};
+    const uint8_t sc4[] = {0x00, 0x00, 0x00, 0x01, 0x65};
+    const uint8_t avcc[] = {0x01, 0x42, 0xC0, 0x1E, 0xFF};  // avcC 首字节固定为 1
+    MZ_ASSERT_TRUE(looksLikeAnnexB(sc3, sizeof(sc3)));
+    MZ_ASSERT_TRUE(looksLikeAnnexB(sc4, sizeof(sc4)));
+    MZ_ASSERT_FALSE(looksLikeAnnexB(avcc, sizeof(avcc)));
+    MZ_ASSERT_FALSE(looksLikeAnnexB(nullptr, 0));
+    MZ_ASSERT_FALSE(looksLikeAnnexB(sc3, 2));   // 太短：不足以判断
+    const uint8_t zeros[] = {0x00, 0x00, 0x00, 0x00};
+    MZ_ASSERT_FALSE(looksLikeAnnexB(zeros, sizeof(zeros))); // 全 0 不是起始码
+}
+
+MZ_TEST(ffmpeg_avcc_convert_known_bytes) {
+    // 输入：00 00 00 01 [65 AA BB] 00 00 01 [41 CC]  → 两个 NAL（3 字节 + 2 字节）
+    const uint8_t annexb[] = {0x00, 0x00, 0x00, 0x01, 0x65, 0xAA, 0xBB,
+                              0x00, 0x00, 0x01, 0x41, 0xCC};
+    const uint8_t expect[] = {0x00, 0x00, 0x00, 0x03, 0x65, 0xAA, 0xBB,
+                              0x00, 0x00, 0x00, 0x02, 0x41, 0xCC};
+    std::vector<uint8_t> out;
+    MZ_ASSERT_TRUE(annexBToAvcc(annexb, sizeof(annexb), &out));
+    MZ_ASSERT_EQ(out.size(), sizeof(expect));
+    if (out.size() == sizeof(expect)) {
+        MZ_ASSERT_EQ(::memcmp(out.data(), expect, sizeof(expect)), 0);
+    }
+    // 尾部多余的一个 0 字节（4 字节起始码的残留）要被吃掉，不能算进 NAL
+    const uint8_t trailing[] = {0x00, 0x00, 0x01, 0x41, 0xCC, 0x00};
+    MZ_ASSERT_TRUE(annexBToAvcc(trailing, sizeof(trailing), &out));
+    MZ_ASSERT_EQ(out.size(), 6u);          // 4 字节长度 + 2 字节 NAL
+    MZ_ASSERT_EQ(out[3], 0x02u);
+}
+
+MZ_TEST(ffmpeg_avcc_convert_rejects_bad_input) {
+    std::vector<uint8_t> out;
+    // 没有起始码：**明确失败**，绝不能"原样拷一份冒充成功"（那正是花屏的成因）
+    const uint8_t no_start[] = {0x65, 0xAA, 0xBB, 0x41};
+    MZ_ASSERT_FALSE(annexBToAvcc(no_start, sizeof(no_start), &out));
+    MZ_ASSERT_EQ(out.size(), 0u);          // 失败时输出必须是空的
+    MZ_ASSERT_FALSE(annexBToAvcc(nullptr, 0, &out));
+    MZ_ASSERT_FALSE(annexBToAvcc(no_start, 0, &out));
+    MZ_ASSERT_FALSE(annexBToAvcc(no_start, sizeof(no_start), nullptr));
+    // 只有起始码、没有 NAL 内容：拿不出任何 NAL → 失败
+    const uint8_t only_sc[] = {0x00, 0x00, 0x01};
+    MZ_ASSERT_FALSE(annexBToAvcc(only_sc, sizeof(only_sc), &out));
+}
+
+MZ_TEST(ffmpeg_avcc_build_layout) {
+    const std::vector<uint8_t> sps = {0x67, 0x42, 0xC0, 0x1E, 0x11};
+    const std::vector<uint8_t> pps = {0x68, 0xCE, 0x3C, 0x80};
+    const std::vector<uint8_t> expect = {
+        0x01, 0x42, 0xC0, 0x1E,                    // configurationVersion / profile / compat / level
+        0xFF,                                      // reserved(6) + lengthSizeMinusOne=3 → 4 字节长度
+        0xE1,                                      // reserved(3) + numOfSequenceParameterSets=1
+        0x00, 0x05, 0x67, 0x42, 0xC0, 0x1E, 0x11,  // SPS 长度 + SPS
+        0x01,                                      // numOfPictureParameterSets=1
+        0x00, 0x04, 0x68, 0xCE, 0x3C, 0x80};       // PPS 长度 + PPS
+    std::vector<uint8_t> out;
+    MZ_ASSERT_TRUE(buildAvcC(sps.data(), sps.size(), pps.data(), pps.size(), &out));
+    MZ_ASSERT_EQ(out.size(), expect.size());
+    if (out.size() == expect.size()) {
+        MZ_ASSERT_EQ(::memcmp(out.data(), expect.data(), expect.size()), 0);
+    }
+}
+
+MZ_TEST(ffmpeg_avcc_build_rejects_bad_params) {
+    std::vector<uint8_t> out;
+    const uint8_t sps[] = {0x67, 0x42, 0xC0, 0x1E};
+    const uint8_t pps[] = {0x68, 0xCE};
+    const uint8_t not_sps[] = {0x68, 0x42, 0xC0, 0x1E}; // 类型是 PPS，不能当 SPS 用
+    const uint8_t not_pps[] = {0x67, 0xCE};
+    MZ_ASSERT_FALSE(buildAvcC(nullptr, 0, pps, sizeof(pps), &out));
+    MZ_ASSERT_FALSE(buildAvcC(sps, sizeof(sps), pps, sizeof(pps), nullptr));
+    MZ_ASSERT_FALSE(buildAvcC(sps, 3, pps, sizeof(pps), &out));         // SPS 太短（拿不到 profile/level）
+    MZ_ASSERT_FALSE(buildAvcC(not_sps, sizeof(not_sps), pps, sizeof(pps), &out));
+    MZ_ASSERT_FALSE(buildAvcC(sps, sizeof(sps), not_pps, sizeof(not_pps), &out));
+    MZ_ASSERT_FALSE(buildAvcC(sps, sizeof(sps), pps, 0, &out));          // 空 PPS
+    // 超过 16 位长度字段：明确失败（不能截断长度，那会让播放端按错长度切数据）
+    std::vector<uint8_t> huge(0x10000 + 1, 0x00);
+    huge[0] = 0x67;
+    huge[1] = 0x42;
+    huge[2] = 0xC0;
+    huge[3] = 0x1E;
+    MZ_ASSERT_FALSE(buildAvcC(huge.data(), huge.size(), pps, sizeof(pps), &out));
+}
+
+MZ_TEST(ffmpeg_avcc_roundtrip_on_raw_sample) {
+    // 真实裸流：整份文件 Annex-B → AVCC，再按 4 字节长度反解，必须**逐个 NAL 对上**
+    const std::string path = samplePath("sample.h264");
+    MZ_ASSERT_FALSE(path.empty());
+    const std::string raw = readWholeFile(path);
+    if (raw.empty()) {
+        MZ_FAIL("裸流样本为空");
+        return;
+    }
+    const uint8_t *data = reinterpret_cast<const uint8_t *>(raw.data());
+    std::vector<H264Nal> nals;
+    const size_t nal_count = splitAnnexBNals(data, raw.size(), &nals);
+    MZ_ASSERT_GT(nal_count, 0u);
+    if (nal_count == 0) {
+        return;
+    }
+
+    std::vector<uint8_t> avcc;
+    MZ_ASSERT_TRUE(annexBToAvcc(data, raw.size(), &avcc));
+    size_t expected_size = 0;
+    for (const auto &nal : nals) {
+        expected_size += 4 + nal.size;
+    }
+    MZ_ASSERT_EQ(avcc.size(), expected_size);
+
+    size_t pos = 0;
+    size_t count = 0;
+    while (pos + 4 <= avcc.size()) {
+        const size_t len = (static_cast<size_t>(avcc[pos]) << 24) |
+                           (static_cast<size_t>(avcc[pos + 1]) << 16) |
+                           (static_cast<size_t>(avcc[pos + 2]) << 8) |
+                           static_cast<size_t>(avcc[pos + 3]);
+        if (len == 0 || pos + 4 + len > avcc.size()) {
+            MZ_FAIL("AVCC 长度字段与数据不匹配（长度前缀写错了）");
+            return;
+        }
+        const uint8_t type = static_cast<uint8_t>(avcc[pos + 4] & 0x1Fu);
+        MZ_ASSERT_TRUE(type >= 1 && type <= 12); // H.264 的合法 nal_unit_type
+        pos += 4 + len;
+        ++count;
+    }
+    MZ_ASSERT_EQ(pos, avcc.size());       // 没有剩余字节
+    MZ_ASSERT_EQ(count, nal_count);       // NAL 个数一致
+    std::printf("    [ INFO ] 裸流转 AVCC：%zu 个 NAL / %zu 字节\n", count, avcc.size());
+}
+
+MZ_TEST(ffmpeg_avcc_build_from_raw_sample_sps_pps) {
+    // 从真实裸流里抽 SPS/PPS 构造 avcC，并**逐字段核对**（不靠"看起来对"）
+    const std::string path = samplePath("sample.h264");
+    MZ_ASSERT_FALSE(path.empty());
+    const std::string raw = readWholeFile(path);
+    if (raw.empty()) {
+        MZ_FAIL("裸流样本为空");
+        return;
+    }
+    const uint8_t *data = reinterpret_cast<const uint8_t *>(raw.data());
+    std::vector<uint8_t> sps;
+    std::vector<uint8_t> pps;
+    if (!extractSpsPps(data, raw.size(), &sps, &pps)) {
+        MZ_FAIL("SPS/PPS 提取失败");
+        return;
+    }
+    std::vector<uint8_t> avcc;
+    MZ_ASSERT_TRUE(buildAvcC(sps.data(), sps.size(), pps.data(), pps.size(), &avcc));
+    MZ_ASSERT_EQ(avcc.size(), 11 + sps.size() + pps.size());
+    if (avcc.size() != 11 + sps.size() + pps.size()) {
+        return;
+    }
+    MZ_ASSERT_EQ(avcc[0], 0x01u);                       // configurationVersion
+    MZ_ASSERT_EQ(avcc[1], sps[1]);                      // AVCProfileIndication
+    MZ_ASSERT_EQ(avcc[2], sps[2]);                      // profile_compatibility
+    MZ_ASSERT_EQ(avcc[3], sps[3]);                      // AVCLevelIndication
+    MZ_ASSERT_EQ(avcc[4], 0xFFu);                       // lengthSizeMinusOne = 3
+    MZ_ASSERT_EQ(avcc[5], 0xE1u);                       // 1 个 SPS
+    MZ_ASSERT_EQ(avcc[6], 0x00u);
+    MZ_ASSERT_EQ(avcc[7], static_cast<uint8_t>(sps.size()));
+    MZ_ASSERT_EQ(avcc[8], 0x67u);                       // 嵌入的确实是 SPS
+    MZ_ASSERT_TRUE(::memcmp(avcc.data() + 8, sps.data(), sps.size()) == 0);
+    const size_t pps_off = 8 + sps.size();
+    MZ_ASSERT_EQ(avcc[pps_off], 0x01u);                 // 1 个 PPS
+    MZ_ASSERT_EQ(avcc[pps_off + 1], 0x00u);
+    MZ_ASSERT_EQ(avcc[pps_off + 2], static_cast<uint8_t>(pps.size()));
+    MZ_ASSERT_EQ(avcc[pps_off + 3], 0x68u);
+    MZ_ASSERT_TRUE(::memcmp(avcc.data() + pps_off + 3, pps.data(), pps.size()) == 0);
+
+    // 交叉验证：解封装层给出的 extradata 是 Annex-B（所以**必须**转换，不能直接塞进 FLV）
+    Demuxer demuxer;
+    if (!demuxer.open(path)) {
+        MZ_FAIL("打不开裸流样本");
+        return;
+    }
+    const StreamInfo *video = demuxer.firstVideo();
+    MZ_ASSERT_NOT_NULL(video);
+    if (video == nullptr || !video->extradata) {
+        MZ_FAIL("裸流的视频流没有 extradata");
+        return;
+    }
+    MZ_ASSERT_TRUE(looksLikeAnnexB(video->extradata->data(), video->extradata->size()));
+}

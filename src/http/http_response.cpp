@@ -253,6 +253,15 @@ const HttpResponse::EndStreamFn &HttpResponse::endStreamFn() const {
     return _end_stream;
 }
 
+bool HttpResponse::setAbortFn(AbortFn fn) {
+    _abort_stream = std::move(fn);
+    return static_cast<bool>(_abort_stream);
+}
+
+const HttpResponse::AbortFn &HttpResponse::abortFn() const {
+    return _abort_stream;
+}
+
 bool HttpResponse::setChunkedAsync() {
     if (!_chunked) {
         return false; // 没进 chunked 模式：声明异步流没有意义

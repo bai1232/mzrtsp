@@ -9,6 +9,10 @@
  *
  * 为什么 broken 要主动断：`Subscriber::broken()` 的含义是"不可丢的包（视频关键帧）
  * 已经进不去队列了" —— 继续发出去的流会缺关键帧，播放端只会花屏。断掉更诚实。
+ *
+ * 【M6-c】"断掉"从"只记一个 Result"变成**真的断**：`fail()` 在 `Aborted`/`SinkFailed`
+ *   时会调用 `sink.abort()`（最多一次），由 HTTP 侧执行硬关连接 —— 在此之前只发了日志，
+ *   客户端会一直挂在半截流上（M6-b 遗留，M6-c 补齐）。
  * ============================================================================
  */
 
@@ -73,7 +77,22 @@ const char *FlvSender::resultName(Result result) {
 FlvSender::Result FlvSender::fail(Result result, const std::string &message) {
     _last_error = message;
     WarnP("FlvSender: %s（%s）", resultName(result), message.c_str());
+    // M6-c：连接已经不能用（写失败）或不该继续（订阅者 broken）→ 让 HTTP 侧**真的断开**。
+    // 不在这里吞掉：只发一个 Warn 而不关连接，客户端会一直挂在半截流上（最糟的那种"假活着"）
+    if (result == Result::SinkFailed || result == Result::Aborted) {
+        notifyAbort();
+    }
     return result;
+}
+
+void FlvSender::notifyAbort() {
+    if (_abort_notified) {
+        return; // 幂等：drain 可能被多调一次，断连只能发一次
+    }
+    _abort_notified = true;
+    if (_sink.abort) {
+        _sink.abort();
+    }
 }
 
 bool FlvSender::flushBuffer(std::string *buffer) {
@@ -102,7 +121,15 @@ FlvSender::Result FlvSender::start() {
         return fail(Result::SinkFailed, _last_error);
     }
     _started = true;
-    return Result::Ok;
+
+    // 【M6-c 修的 bug】立刻搬一次队列。两个理由：
+    //   1) 订阅时源**可能已经结束**：`MediaSource::subscribe()` 会给新订阅者的队列
+    //      `markEndOfStream()`，但那一刻 drain 回调还没注册（它由 create() 注册），
+    //      所以**不会有任何唤醒** —— 不主动搬一次，这一路连接就会挂着不动，
+    //      客户端看到的是"连上了、头也发了、然后永远黑屏"（最糟的假活着）。
+    //      这正是验收脚本 `scripts/flv_http_test.sh` §9 抓到的（源结束后再拉同一路）；
+    //   2) 中途接入拿到的 GOP 缓存应当立刻发出去（首帧延迟，NFR-1）。
+    return onDrain();
 }
 
 FlvSender::Result FlvSender::onDrain() {

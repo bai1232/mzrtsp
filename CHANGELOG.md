@@ -377,6 +377,55 @@
 - 门禁：串行 ctest **20/20**、ASAN **20/20**、TSAN **299 用例 0 报告**（`flv` 18 / `ntimed` 38 均 0 报告）、
   单进程全量 **226/226**、零警告
 
+#### M6-c 应用入口 + 浏览器播放页 + 裸流输入 + 循环播放（**v0.1.0 端到端可播**）
+
+- **`src/main.cpp`（新）→ `build/bin/mzmedia`**：零参数启动（**FR-7.2**，默认 `0.0.0.0:8080` + `./samples`，
+  横幅直接打印播放页 / 拉流 / 统计 URL）；`--port` / `--media-root` / `--web-root` / `--loop` / `--speed` /
+  `--log-level`（**FR-7.1** / **FR-7.3**）/ `--help`；**未知参数报错退出**（不静默忽略）。
+  它只做接线：路由、配置、生命周期 —— 不认识 FLV 字节，也不碰 `Demuxer`
+- **浏览器播放页**：`HttpServer` 的内建 `kTestPage` 升级为**播放器页**（`<video>` + 名字输入 + 播放/停止 +
+  状态 + 错误区 + `/api/stats` 每 2s 刷新）；`flv.js` **1.6.2 入库**
+  （`third_party/flv.js/`：`flv.min.js` + `LICENSE`(Apache-2.0) + `README.md`(来源/版本/MD5)），
+  由 `GET /flv.min.js` 提供 → **离线可用**；flv.js 取不到时页面**明确写出原因**（不是"点了没反应"）
+- **Annex-B → AVCC + avcC 构造（FR-2.1 补齐）**：`h264_util` 新增 `looksLikeAnnexB()` /
+  `annexBToAvcc()` / `buildAvcC()`（纯函数）；转换落在 `DemuxerProducer`（解封装层）——
+  转完与 MP4 输入**完全同形**，`FlvMuxer` 一行未改。缺 SPS/PPS 或包内无起始码 → **明确失败**（不猜、不原样拷）
+- **循环播放 `--loop`（默认关）**：`Demuxer` 新增 `close()` 供重开；`DemuxerProducer::Config::loop`
+  → 读到 EOF 重开同一路径，**偏移累加**（末帧 dts + 帧长**向上取整** + 1ms 间隙）→ 时间轴连续且严格递增；
+  每趟校验流参数（被换掉的文件 → 明确失败）、空趟不再重开（防死循环）
+- **`Sink::abort` + `HttpResponse::abortFn()`**：`Aborted`/`SinkFailed` 由 HTTP 侧**硬关连接**
+  （不发结束块）——`end` = 正常结束、`abort` = 流残缺，两个语义不混
+- **`SourceManager`**：`muxerStreamsFor()` 取代 `demuxerFor()`（返回**源自己持有的快照**，
+  Annex-B 时已是 avcC）；`/api/stats` 增加每源 `producer{packets,annex_b_video,annex_b_packets,loops,loop_offset_ms,loop_failures}`
+  与 `idle_deferred`
+- **验收实测（49/49 通过，脚本重写）**：播放页与 `/flv.min.js` 可取（**与入库文件逐字节一致**、版本 1.6.2）；
+  MP4 → **55,623 字节**合法 FLV；**H264 裸流也能拉**（`ffprobe` + `ffmpeg` + python 逐 tag 复查 AVCC 结构）；
+  **NFR-1 首帧 20ms 级**（TTFB 3.3ms）；响应头 / 404（含非法扩展名与"缺 `.flv` 后缀"）；
+  断开后 `subscribers=0`；**源结束后再拉 12ms 正常结束**；`--loop --speed 4` 拉 3 秒 → **11 秒媒体时长 /
+  297 帧 / loops=6 / 时间戳跨趟单调 / 解码无 error**
+- 测试：`tests/test_ffmpeg.cpp` +7（avcC/Annex-B 纯函数，含真样本往返）、
+  `tests/test_demuxer_producer.cpp` +6（新分组 **`producer`**）、`flv` +2、`srcmgr` +2 → 全库 **243 用例**
+- **过程中被抓到的两个真问题（都是"接起来才暴露"，单测全绿、脚本一跑就红）**：
+  ① **源读完之后再拉同一路，连接一直挂着不动**（晚到订阅者的队列已被 `markEndOfStream()`，
+  但那一刻 drain 回调还没注册 → 永远没有唤醒）→ `FlvSender::start()` 发完头**立刻搬一次队列**；
+  ② **循环播放每 2 秒被 ffmpeg 报一次 `non monotonically increasing dts`**（整数毫秒表达不了
+  AAC 的 23.22ms 帧长，第二趟首包与第一趟末包撞在同一毫秒）→ 帧长向上取整 + 1ms 间隙
+- **读代码时发现并修掉的一个真问题**：`SourceManager` 的空闲释放**只看句柄数**，
+  而应用层 handler 一返回就放掉句柄 → **有人正在看的源也会在 60s 后被释放、观看者突然"播完"**
+  → 改为"有订阅者就推迟 + 按 `deferred_recheck_ms` 复查"（三个入口同一个守卫），
+  新增计数 `idle_deferred`，用例 `srcmgr_idle_release_waits_for_subscribers`
+- **验证了设计取舍（反证）**：曾为"循环重开时重置节流基准"加了 `ReadResult::PacketNewSegment`，
+  实测 `--loop --speed 4` 拉 3 秒加/不加都是约 12.0 秒媒体时长 → **无可观测差别 = 验证不了的复杂度，删除**
+- 文档：`DESIGN_M6`（新增 §3.6/§3.7 契约、§4.6/§4.7/§4.8 机制、§5.4 用例、13 条风险、9 条决策）、
+  `ARCHITECTURE`（App 层实际形态、`third_party` 特例、源释放判据）、`TESTING`（§3 集成改成跑脚本、
+  §3.1 NFR-1 量法、§7 需求对照、§8.6 基线刷新）、`ROADMAP`（M6 行）、`README`（快速开始 +
+  依赖表述 + 许可证）、`third_party/flv.js/README.md`（新）
+- 门禁：串行 ctest **21/21**、ASAN **21/21**、TSAN **317 用例 0 报告**（新 `producer` 组 7 例 0 报告）、
+  单进程全量 **243/243**（61,254 断言）、零警告；`scripts/{http,flv_mux,flv_http}_test.sh` 全绿
+- 删除：`examples/flv_http_server.cpp`（升级为 `src/main.cpp`）
+- 遗留：**M6-d**（10 路并发 / 5 分钟验收 + 拿真实数据回填 M5 未决）、
+  MKV/TS 输入仍无样本实测、high profile 裸流的 avcC 扩展字段、`onMetaData`/AVC end-of-sequence 仍不发
+
 ### 说明
 - `v0.1.0` 尚未发布。按 `VERSIONING.md`，tag 只能打在**可独立构建且测试通过**的提交上。
 - M1（Core 层）已完成并推送；后续进入 M2（网络层：EventPoller / TcpServer / Session）。

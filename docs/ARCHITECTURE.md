@@ -30,6 +30,16 @@
 
 **依赖方向**：只允许上层依赖下层。`Media` 层**不得**直接调用 `Http`；输出通过抽象接口（`IMediaSink`）与 `Media` 交互，从而做到"新增输出格式不改核心"（成功标准 SC-2）。
 
+**App 层（v0.1 实际形态，M6-c）**：`src/main.cpp` = `bin/mzmedia`，只做**接线**：
+命令行 → `SourceManager::Config`、把 `/live/` 与 `/flv.min.js` 两条路由挂到 `HttpServer`、
+把 `FlvSender` 交给连接托管。它**不认识** FLV 字节、也不碰 `Demuxer`（只用 `SourceManager` 的两三个入口）。
+层内代码不允许反向依赖，检查方式：
+`grep -rn "network/\|http/" src/output/`（应为空）、`grep -rn "#include \"mzmedia.h\"" src/`（应为空）。
+
+**`third_party/` 是分层之外的特例**：里面只有浏览器播放器 `flv.js`（Apache-2.0），
+不参与 C++ 构建（只是被 `src/main.cpp` 当静态文件服务出去）—— 所以"分层/零依赖"的约束对它不适用，
+但它必须带 `LICENSE` 与来源说明（见 `third_party/flv.js/README.md`）。
+
 ## 2. 模块职责
 
 | 模块 | 核心类 | 职责 | 不做什么 |
@@ -112,8 +122,10 @@ FFmpeg 是 C 库，所有上下文都要手动释放。**必须**封装成 C++ �
 | 事件触发模式 | epoll **ET 默认**，提供 LT 开关 | ET 减少 `epoll_wait` 唤醒次数；代价是必须一次读到 `EAGAIN` |
 | 连接与线程 | 单 Reactor × N + 连接亲和 | 避免每连接加锁；代价是负载不均，用"最少连接数分配"缓解 |
 | 转码粒度 | **一源一份**输出，多客户端共享 | 10 客户端各转一份会耗尽 CPU；共享是真实流媒体服务器做法 |
-| 源释放 | lazy 启动 + 空闲 60s 释放 | 无人观看时不占 CPU/内存 |
-| 文件语义 | 直播式重放，不支持 seek | HTTP-FLV 是直播语义；seek 需重建时间轴，收益低 |
+| 源释放 | lazy 启动 + **无句柄且无订阅者**时释放（默认空闲 60s） | 无人观看时不占 CPU/内存。**只看句柄数是不够的**：应用层 handler 一返回就把句柄放了，而连接还连着（M6-c 修的 bug，见 `DESIGN_M6.md` §4.8） |
+| 应用入口 | `src/main.cpp` 只做**接线**（路由 / 配置 / 生命周期），零参数可启动 | 媒体逻辑一律在库里：app 拿不到 `Demuxer`/`FlvMuxer` 的内部知识，也不需要懂 FLV 字节（M6-c） |
+| 浏览器播放器 | `flv.js` **入库**（`third_party/`，Apache-2.0） | 浏览器原生不能播 FLV；引 CDN 会让"离线/演示环境"变成"服务坏了"。这是全仓唯一的第三方文件，C++ 侧仍然零第三方依赖 |
+| 文件语义 | 直播式重放，不支持 seek；`--loop` 用**连续时间轴**重开（不重置） | HTTP-FLV 是直播语义；seek 需重建时间轴，收益低。循环若把时间戳归零，播放端会看到回退（花屏）——所以偏移在解封装层累加（`DESIGN_M6.md` §4.6） |
 | 新增格式 | 通过 `IMediaSink` 抽象扩展 | 满足 SC-2"加格式不改核心" |
 | 依赖边界 | 网络自研，FFmpeg 只做编解码 | 并发模型与协议栈是能力展示点；编解码自研不现实 |
 
@@ -133,9 +145,11 @@ mzmedia/
 │   ├── mzmedia.h      # 伞头：使用方的单行包含入口（库内部禁止包含）
 │   └── main.cpp
 ├── tests/             # 单元测试（自研轻量断言宏）
-├── examples/          # 最小示例
-├── scripts/           # play.sh / verify.sh / bench.sh / longrun.sh
-├── media/             # 测试素材（软链，不入库）
+├── examples/          # 最小示例（每个库组件一个可运行 demo）
+├── third_party/
+│   └── flv.js/        # 浏览器播放器（唯一第三方文件，Apache-2.0，含 LICENSE 与来源说明）
+├── scripts/           # make_samples / http_test / flv_mux_test / flv_http_test / tsan
+├── samples/           # 测试素材（脚本现场生成，不入库）
 └── docs/
 ```
 

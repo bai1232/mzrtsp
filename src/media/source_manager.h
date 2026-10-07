@@ -50,9 +50,22 @@ public:
         /// @note **0 是合法值**：含义是"句柄一放就释放"（不缓存源）——它不是"无界"，
         ///       而是最保守的一档；也正因为有这一档，空闲释放的用例可以**完全确定性**
         uint32_t idle_release_ms = 60000;
+        /// 【M6-c】空闲到期但**还有人订阅**时的复查间隔（毫秒）
+        /// @note 为什么需要它：「句柄数为 0」不等于「没人看」—— 应用层 handler 一返回就把句柄放了，
+        ///       而连接还连着、订阅者还在推流。这时**不能**释放（会把源线程停掉，观看者突然"播完"），
+        ///       于是改为隔一段时间再看一眼。它必须 > 0：0 会退化成"async 里再 async"的忙等
+        uint32_t deferred_recheck_ms = 1000;
         Throttle::Config throttle;        // FR-3.5：默认开、1 倍速（压测/单测可调 speed）
         MediaSource::Limits source;       // 每源的队列 / GOP / 人数上限（推导值在 Limits 里）
-        DemuxerProducer::Config producer; // 解封装上限（流数 / 单包 / 超时）
+        DemuxerProducer::Config producer; // 解封装上限（流数 / 单包 / 超时 / 循环重开）
+    };
+
+    /// 输出层（FLV）要用的流信息快照（M6-c）
+    /// @note `video` 在 Annex-B 输入时**已经带现场构造的 avcC** —— 输出层不需要知道输入形状
+    struct MuxerStreams {
+        const StreamInfo *video = nullptr;
+        const StreamInfo *audio = nullptr;
+        bool annex_b_video = false; ///< 视频输入是 Annex-B（日志/诊断用）
     };
 
     /// @param poller 空闲计时用；传 nullptr → 退化为"句柄释放即回收"（不静默变成"永不释放"）
@@ -70,10 +83,13 @@ public:
      */
     MediaSource::Ptr acquire(const std::string &path);
 
-    /// 该源解封装出的流信息（M6-b：输出层写 FLV 的 sequence header 要用）
-    /// @return nullptr = 没有这个源
-    /// @note 返回的指针在源被释放前有效；调用方应**立刻**取走需要的 `StreamInfo*`
-    const Demuxer *demuxerFor(const std::string &path) const;
+    /// 该源解封装出的流信息（M6-c：输出层写 FLV 的 sequence header 要用）
+    /// @return 两路都是 nullptr = 没有这个源
+    /// @note 返回的指针指向**源自己持有的快照**（不是 `Demuxer` 里的引用）：
+    ///       · 可以跨连接长期保存（循环重开也不会换掉它）；
+    ///       · 但**源必须先活着** —— 调用方用 `acquire()` 拿到的句柄或连接上的订阅者
+    ///         来保证这一点（NFR-6 的断开即退订就是从这里来的）。
+    MuxerStreams muxerStreamsFor(const std::string &path) const;
 
     /// 立刻释放某个源（不等空闲计时）；@return false = 没有这个源
     bool release(const std::string &path);
@@ -110,6 +126,10 @@ public:
     uint64_t totalIdleScheduleFailed() const {
         return _total_idle_schedule_failed.load();
     }
+    /// 因"还有人订阅"而推迟的空闲释放次数（M6-c）：每次复查到订阅者还在就 +1
+    uint64_t totalIdleDeferred() const {
+        return _total_idle_deferred.load();
+    }
 
 private:
     struct Entry {
@@ -128,6 +148,13 @@ private:
     /// **必须在轮询线程调用**（doDelayTask 的约定）
     void armIdleTimer(const std::string &path);
     void onIdleTimeout(const std::string &path);
+    /// 取条目（返回副本，供**不持锁**时用它的字段）；没有则 nullptr
+    std::shared_ptr<Entry> findEntry(const std::string &path) const;
+    /// 空闲释放的统一守卫（M6-c 修的真问题）：**有订阅者就不释放**
+    /// @return true = 已释放；false = 还有订阅者（已重新安排复查）
+    bool tryIdleRelease(const std::string &path, uint32_t idle_ms);
+    /// 还有订阅者时的复查调度（**必须在轮询线程调用**）
+    void scheduleIdleRecheck(const std::string &path, uint32_t delay_ms);
     /// 摘除条目（锁内）+ 停线程（锁外，join 可能耗时）
     void releaseEntry(const std::string &path, bool idle_triggered);
     static void stopEntry(const std::shared_ptr<Entry> &entry);
@@ -146,6 +173,7 @@ private:
     std::atomic<uint64_t> _total_released{0};
     std::atomic<uint64_t> _total_acquire_rejected{0};
     std::atomic<uint64_t> _total_idle_schedule_failed{0};
+    std::atomic<uint64_t> _total_idle_deferred{0};
     std::atomic<uint64_t> _handles{0};
 };
 
