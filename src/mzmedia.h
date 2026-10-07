@@ -79,3 +79,4 @@
 
 // M6 输出层（已接入）
 #include "output/flv_muxer.h"
+#include "output/flv_sender.h"

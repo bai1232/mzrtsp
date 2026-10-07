@@ -347,6 +347,36 @@
 - 遗留：`flv.js` 入库（M6-c，含许可证声明）、`onMetaData` / AVC end-of-sequence 是否发（M6-c 实测后定）、
   Annex-B→AVCC 转换（M6-c）
 
+#### M6-b HTTP-FLV 接线（`FlvSender` + `/live/` + 发完再关）
+- 新增 `src/output/flv_sender.h/.cpp`：**每连接一个**，把订阅者队列封成 FLV 写出去
+  - 写出目标抽象成 `Sink`（**不依赖 `http/`**）→ 用**假 sink** 做确定性单测（无网络/线程/时序）
+  - `create()` 内部 `FlvMuxer::prepare()` 并**自己注册 drain 回调**（只持弱引用：不成环、无需调用方再拿订阅者句柄）
+  - `onDrain()`：队列取空 → 封 tag → 攒到 32KB 写一块；**`broken()` → Aborted**（关键帧进不去，继续发只会花屏）、**EOS → `finished()` + `end()`**（幂等）
+- HTTP 侧三处能力（都为"异步流式"服务）：
+  - `HttpResponse::chunkWriter()`：带**分块帧头**的写出函数，且**只捕获 Sender 的拷贝**（handler 返回后仍可用）
+  - `HttpResponse::setChunkedAsync()`：声明异步流 → 框架不再兜底 `endChunked()`（否则会把流提前掐断）
+  - `HttpResponse::holdResource()` + `HttpSession::_held_resources`：把 `FlvSender` 挂到**连接**上，
+    连接关闭统一释放 → 退订（NFR-6），drain 回调的弱引用随之失效（不会在连接断后写 socket）
+- 新增 `Session::shutdownAfterFlush(max_wait_ms)`（"发完再关"，`DESIGN_M3` §9 未决 5 关闭）：
+  - 队列**排空即关**（挂在写路径的"队列空"分支，事件驱动）；到点仍排不空 → **强制关 + `flushCloseTimeoutCount()` + Warn**
+  - `max_wait_ms = 0` 被拒（0 不等于无界）；关闭时取消截止定时器
+- 新增 `SourceManager::demuxerFor(path)`（输出层要拿 `StreamInfo` 写 sequence header）
+- 新增 `examples/flv_http_server.cpp`（`--port` / `--media-root`；名字只收 `[A-Za-z0-9_-]` → 杜绝目录穿越）
+  与 `scripts/flv_http_test.sh`（**M6-b 验收**）
+- **验收实测（15/15 通过）**：`curl -N` 拿到 **55,623 字节**（与 M6-a 落盘产物**字节数一致**）、
+  `ffprobe` 认 h264 **320x240** + aac、解码 **50 帧**、`ffmpeg -f null -` 无 error；
+  `Content-Type: video/x-flv` / chunked / CORS 齐备；不存在与穿越均 404；断开后 `subscribers=0`
+- 测试：`tests/test_flv_sender.cpp` **8 用例**（归入 `flv` 分组）+ `ntimed_session_shutdown_after_flush`
+  （两个场景：**256KB 一个字节不丢后才 EOF**；只连不读 → 到点强制关）→ 全库 **226 用例**
+- **过程中被验收/用例抓到的三个真问题**：
+  ① 用裸 `sender()` 当 chunked 出口 → `curl: (56) Malformed encoding`（必须用 `chunkWriter()`）；
+  ② "发完再关"的钩子挂在写循环**之后** → 那个循环只在队列空/出错时退出 → **死代码**（改挂"队列空"分支）；
+  ③ `dumpStatsJson()` 不做惰性清理 → 源 EOS 后统计永远停在旧值、NFR-6 验收失败（改成先 prune）
+- 文档：`DESIGN_M6`（§3.4/§3.5 契约、§5.3 用例、§7 决策 8 条）、`DESIGN_M2` §9（发完再关）、
+  `DESIGN_M3` §9 未决 5 关闭、`ROADMAP`、`TESTING`（FR-4.1 + NFR-1）、本文件
+- 门禁：串行 ctest **20/20**、ASAN **20/20**、TSAN **299 用例 0 报告**（`flv` 18 / `ntimed` 38 均 0 报告）、
+  单进程全量 **226/226**、零警告
+
 ### 说明
 - `v0.1.0` 尚未发布。按 `VERSIONING.md`，tag 只能打在**可独立构建且测试通过**的提交上。
 - M1（Core 层）已完成并推送；后续进入 M2（网络层：EventPoller / TcpServer / Session）。

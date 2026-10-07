@@ -70,6 +70,11 @@ public:
      */
     MediaSource::Ptr acquire(const std::string &path);
 
+    /// 该源解封装出的流信息（M6-b：输出层写 FLV 的 sequence header 要用）
+    /// @return nullptr = 没有这个源
+    /// @note 返回的指针在源被释放前有效；调用方应**立刻**取走需要的 `StreamInfo*`
+    const Demuxer *demuxerFor(const std::string &path) const;
+
     /// 立刻释放某个源（不等空闲计时）；@return false = 没有这个源
     bool release(const std::string &path);
     /// 释放全部（关停路径用）；@return 释放的源数。**已在外面的句柄仍然有效**（见文件头）

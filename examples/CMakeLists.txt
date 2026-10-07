@@ -24,3 +24,7 @@ target_link_libraries(http_server PRIVATE mzmedia)
 # M6-a 起：FLV 封装示例（"demux → 封成 FLV → 落盘"，配 scripts/flv_mux_test.sh 用 ffprobe 校验）
 add_executable(flv_mux_demo flv_mux_demo.cpp)
 target_link_libraries(flv_mux_demo PRIVATE mzmedia)
+
+# M6-b 起：HTTP-FLV 服务器示例（配 scripts/flv_http_test.sh：curl 拉流 + ffprobe 校验）
+add_executable(flv_http_server flv_http_server.cpp)
+target_link_libraries(flv_http_server PRIVATE mzmedia)

@@ -10,7 +10,7 @@
 | 批次 | 内容 | 状态 |
 |---|---|---|
 | **M6-a**（本批） | `FlvMuxer`：**纯函数式** FLV 封装（FLV Header、AVC/AAC sequence header、视频/音频 tag、`CompositionTime`、per-client 时间戳基准） | ✅ |
-| M6-b | `FlvSender`：把一个订阅者的 `FrameQueue` 接到 HTTP chunked 响应；`/live/<name>.flv` 真路由；`Session::shutdownAfterFlush()` | 后续 |
+| **M6-b** | `FlvSender`（每连接一个：把订阅者队列封成 FLV 并写出）、`/live/<name>.flv` 接线（应用侧注册路由）、`HttpResponse` 的**异步流式 + 附件**、`Session::shutdownAfterFlush()` | ✅ |
 | M6-c | 最小 app（`src/main.cpp`，零参数启动 FR-7.2）+ 测试页播放器（**flv.js 入库**）+ 循环播放（`--loop`，默认关）+ `broken()` 真实断连 + `dumpStatsJson()` 接进 `/api/stats` | 后续 |
 | M6-d | 10 路并发 / 5 分钟播放验收脚本；**拿真实数据回填 M5 未决**（锁粒度 / 包数硬顶 / 唤醒合并 / `max_subscribers`） | 后续 |
 
@@ -20,8 +20,10 @@
 |---|---|
 | 编出来的 FLV **能被 `ffprobe` 认出**：h264 320x240 + aac、帧数与时长与源一致、`ffmpeg` 完整解码无错 | **M6-a ✅** |
 | 字节级布局正确（header/tag/sequence header/CompositionTime） | **M6-a ✅** |
-| 每个客户端**独立时间戳基准**（后接入者时间戳从 0 开始） | **M6-a ✅**（机制）+ M6-b（接线） |
-| `curl -N http://…/live/x.flv` 拿到合法 FLV；单客户端可播 | M6-b |
+| 每个客户端**独立时间戳基准**（后接入者时间戳从 0 开始） | **M6-a ✅**（机制）+ **M6-b ✅**（每连接一个 `FlvSender`） |
+| `curl -N http://…/live/x.flv` 拿到合法 FLV —— **经过 HTTP + chunked + 连接关闭之后仍然合法** | **M6-b ✅**：`scripts/flv_http_test.sh` **15/15**（h264 320x240 + aac、50 帧、`ffmpeg` 完整解码无错、55,623 字节与 M6-a 产物一致） |
+| 源 EOS → 发结束块 + **等排空再关**（一个字节不丢）；客户端一直不读 → 到点强制关并计数 | **M6-b ✅**：`ntimed_session_shutdown_after_flush`（256KB 全收到后才 EOF；只连不读 → 100ms 后以 `SendFailed` 关） |
+| 客户端断开 → 订阅者回收（NFR-6） | **M6-b ✅**：`/api/stats` 的 `subscribers` 回到 0（验收脚本第 5 项） |
 | `ffplay` 出画面 + 有声音；浏览器测试页能播 | M6-c |
 | 10 路并发各自播放 5 分钟无异常 | M6-d |
 
@@ -98,6 +100,55 @@ public:
 | 包不属于这两路流 / CompositionTime 超 24 位 | `InvalidPacket` |
 | tag 数据超 24 位长度上限 | `TooLarge` |
 
+### 3.4 `FlvSender`（`output/flv_sender.h`，M6-b）
+
+**每个连接一个**：把一个订阅者的队列封成 FLV 写出去。
+
+```cpp
+class FlvSender {
+public:
+    using Ptr = std::shared_ptr<FlvSender>;
+    struct Sink {
+        std::function<bool(const char *data, size_t len)> write; // false = 连接已坏
+        std::function<void()> end;                               // EOS：发结束块 + 等排空再关
+    };
+    enum class Result : uint8_t { Ok, BadStreams, SinkFailed, NotStarted, Aborted };
+
+    static Ptr create(const Sink &sink, FlvMuxer::Streams streams, Subscriber::Ptr subscriber);
+    Result start();    // FLV Header + AVC/AAC sequence header（FR-3.1：**立即**发，不等第一帧）
+    Result onDrain();  // 队列取空 → 封 tag → 缓冲到 32KB 写一块；EOS 收尾
+    bool finished() const;  bool aborted() const;
+    uint64_t packetsMuxed() const; uint64_t bytesWritten() const; uint32_t lastTimestampMs() const;
+};
+```
+
+- **不依赖 `http/`**：写出目标是 `Sink`（`write` + `end`）→ 可以用**假 sink** 做确定性单测
+  （不需要网络、不需要线程、不依赖时序）。
+- `create()` 内部完成 `FlvMuxer::prepare()`，并**自己注册 drain 回调**（回调只持弱引用：
+  既不成环，也不需要调用方再拿订阅者句柄 —— 订阅者已经移交给它了）。
+- `onDrain()` 的两个收尾判断：**`broken()` → `Aborted`**（关键帧都进不去，继续发只会让对端花屏）、
+  **EOS → `finished()` + 调 `end()`**（幂等，重复 drain 不会重复收尾）。
+- 生命周期由**连接**托管：调用方 `resp.holdResource(sender)` —— 连接一断就释放 → 退订（NFR-6），
+  drain 回调里的弱引用随之失效，**不会在连接断掉之后还去写 socket**。
+
+### 3.5 HTTP 接线（M6-b）：`/live/<name>.flv` 由**应用侧**注册
+
+- 路由：`server.setPrefixRoute("/live/", …)`。内置的 `501` 占位是在 `HttpServer::start()` 里带
+  `findHandler` 守卫注册的，所以应用侧在 `start()` 之前注册就能覆盖它 —— **`http` 层不必依赖 `media`**。
+- 名字映射（**外部输入，必须校验**）：只接受 `[A-Za-z0-9_-]+`（**不放行 `/` 与 `.`** → 杜绝目录穿越），
+  拼成 `<media-root>/<name>.mp4`；名字非法 / 文件不存在 → 404。
+- 响应：`Content-Type: video/x-flv` + `beginChunked()` + `setChunkedAsync()` + `setKeepAlive(false)`。
+  **顺序讲究**：先建 `FlvSender`（它内部校验编码/初始化数据），**再**发响应头 ——
+  否则会出现"已经回了 200、才发现这路流封不了"的半成品响应。
+- 两个出口都由 `HttpSession` 注入，**不依赖 `HttpResponse` 对象**（handler 返回后仍能用）：
+
+  | 出口 | 用途 | 踩过的坑 |
+  |---|---|---|
+  | `chunkWriter()` | 带**分块帧头**的写出函数，接 `FlvSender::Sink::write` | 用裸 `sender()` 会把 FLV 字节直接灌进 chunked 流 → 客户端报 `curl: (56) Malformed encoding`（验收脚本第一次跑就抓到） |
+  | `endStreamFn()` | 发结束块 `0\r\n\r\n` + `Session::shutdownAfterFlush(5000)` | —— |
+
+- `holdResource()`：把 `FlvSender` 挂到连接上，会话析构时统一释放（NFR-6）。
+
 ## 4. 关键机制
 
 ### 4.1 每个客户端一份的时间戳基准（`ARCHITECTURE.md` §4）
@@ -164,6 +215,21 @@ FLV 的 timestamp 要求从 0 附近开始递增，而各客户端接入时刻�
 **为什么这一步不能省**：FLV 写错的表现是"能连上、播放器一片黑"，没有异常也没有报错。
 单元测试只能证明"我按自己理解的规范拼了字节"；只有 `ffprobe`/`ffmpeg` 认了，才能说"这是真的 FLV"。
 
+### 5.3 M6-b：每连接的发送器与 HTTP 接线
+
+| # | 用例 / 脚本 | 位置 | 覆盖维度 | 断言要点 |
+|---|---|---|---|---|
+| 1 | `flv_sender_start_writes_header_and_sequence_headers` | 单测 `flv` | 正常 | `start()` **一次**写出去 header + 两个 sequence header（首帧延迟最小）；第一个 tag 是视频 sequence header |
+| 2 | `flv_sender_create_rejects_bad_streams` | 单测 `flv` | 非法 | HEVC / sink 缺 `write` / subscriber 为空 → `create` 返回 nullptr |
+| 3 | `flv_sender_rejects_drain_before_start` | 单测 `flv` | 空 | 没 `start()` 就 drain → `NotStarted`，且一个字节都不写 |
+| 4 | `flv_sender_drain_muxes_all_packets_in_order` | 单测 `flv` | 正常 | 3 个包（视频/音频/视频）按序成 tag、时间戳 0/10/40、队列取空、字节数与 tag 长度自洽 |
+| 5 | `flv_sender_eos_finishes_once` | 单测 `flv` | 断开 | 没有 EOS 就不结束；EOS → `finished()` + `end()` 一次；再 drain 幂等 |
+| 6 | `flv_sender_broken_subscriber_aborts` | 单测 `flv` | 满 | 关键帧进不去队列 → `Aborted`（与"正常结束"分开），**不调** `end()` |
+| 7 | `flv_sender_stops_when_sink_fails` | 单测 `flv` | 断开 | 写失败 → `SinkFailed` + `aborted()`，之后不再写 |
+| 8 | `flv_sender_foreign_packet_is_reported` | 单测 `flv` | 非法 | 外来流 → `BadStreams`（**不静默丢**） |
+| 9 | `ntimed_session_shutdown_after_flush` | 单测 `ntimed` | 断开 | 客户端一直读 → **256KB 一个字节不少**、然后 EOF、关闭原因 None；只连不读 → 100ms 后以 `SendFailed` 强制关、会话计数归零 |
+| 10 | `scripts/flv_http_test.sh` | 脚本（**M6-b 验收**） | 端到端 | **15 项全过**：curl 拉到 **55,623 字节**合法 FLV（`ffprobe` + `ffmpeg` 双重校验）、`Content-Type: video/x-flv`、chunked、CORS、404（不存在 / 穿越 / 非法名）、断开后 `subscribers=0` |
+
 ## 6. 风险清单
 
 | # | 风险 | 触发条件 | 应对 |
@@ -193,6 +259,13 @@ FLV 的 timestamp 要求从 0 附近开始递增，而各客户端接入时刻�
 | 循环播放默认值 | **关**，`--loop` 打开（M6-c） | 排除"默认开"（验收时分不清是循环还是卡住；且"源会 EOS"这条路径要能被走到） |
 | 测试页播放端（M6-c） | **flv.js 入库**（用户已定） | 排除 CDN（离线不可用）；排除自研 MSE 播放器（要自己写 FLV demux + fMP4 封装，工作量与收益不匹配） |
 | M6-a 的验收工具 | `scripts/flv_mux_test.sh` + example | 排除"只在单元测试里断言字节"（自说自话）；`ffprobe` 是**外部**标准 |
+| 【M6-b】写出目标抽象成 `Sink` | `FlvSender` 不依赖 `http/` | 排除"直接吃 `HttpResponse`/`Session`"（只能靠整条链路测，且 output→http 耦合没必要）；好处是可以用假 sink 做确定性单测 |
+| 【M6-b】路由由**应用侧**注册 | `setPrefixRoute("/live/", …)` | 排除"把 media 逻辑塞进 `HttpServer`"（`http` 会依赖 `media`，破坏分层）；已确认内置 501 在 `start()` 里注册、可被覆盖 |
+| 【M6-b】两个出口都**不依赖 `HttpResponse` 对象** | `chunkWriter()` / `endStreamFn()` 由会话注入（只捕获 Sender 的拷贝） | 排除"在 handler 里捕获 `resp`"（handler 一返回 `resp` 就没了 → 悬垂）；排除"用裸 `sender()` 当 chunked 出口"（**实测**：客户端报 `Malformed encoding`） |
+| 【M6-b】异步流式要**显式声明** | `resp.setChunkedAsync()` → 框架不再兜底 `endChunked()` | 排除"按 keepAlive 猜"（启发式迟早猜错）；兜底只对"同步发完"的处理器有意义，对异步流会把流提前掐断 |
+| 【M6-b】流式资源的生命周期 | `resp.holdResource(sender)`，由会话在连接关闭时释放 | 排除"handler 里捕获 `shared_ptr`"（与订阅者成环 → 永不释放，NFR-6 不达标）；排除"应用层自建连接表"（handler 拿不到 session 标识） |
+| 【M6-b】"发完再关"挂在哪 | 写路径的**"队列空"分支** + 截止定时器兜底 | 排除"直接 `shutdown`"（丢尾部数据）；排除"挂在写循环之后"（那个循环**只在队列空/出错时退出** → 钩子变成**死代码**，本次实测踩到、被新用例抓出） |
+| 【M6-b】`dumpStatsJson()` 要**惰性清理** | 统计前先 `pruneExpiredLocked()` | 排除"只靠流量触发清理"（源 EOS 之后没有流量 → 统计永远停在旧值；NFR-6 的验收正是拿 `subscribers` 当判据） |
 
 ## 8. 未决事项
 

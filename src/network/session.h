@@ -92,6 +92,18 @@ public:
      */
     bool shutdown(const SockException &err = SockException());
 
+    /**
+     * 「发完再关」（M6-b）：等发送队列**排空**后再关闭连接
+     * @param max_wait_ms 最长等多久；**0 被拒**（0 不等于无界）；超时则强制关 + 计数
+     * @return false = 已在关闭流程 / 参数非法 / 投递失败（都会记日志）
+     * @note 线程安全（内部 sync 投递到 poller 线程）
+     * @note 用途：HTTP-FLV 播完后主动收尾；也可给任何"还有排队数据就关"的路径用
+     *       （直接 shutdown 会把已入队的数据丢掉 = 静默丢数据）
+     */
+    bool shutdownAfterFlush(uint32_t max_wait_ms = 5000);
+    /// 「发完再关」因超时被强制关闭的次数（观测）
+    uint64_t flushCloseTimeoutCount() const;
+
     bool isShutdown() const;
     /// 关闭原因；**只在 poller 线程读**（TcpServer 的移除通知里、以及用例里）
     const SockException &lastError() const;
@@ -177,6 +189,10 @@ private:
     void onWriteEvent();
     /// 真正执行关闭（只在 poller 线程）
     void shutdownImpl(const SockException &err);
+    /// 「发完再关」的推进：发送队列已排空就关；只在 poller 线程调用
+    void maybeCloseAfterFlush();
+    /// 「发完再关」超时：强制关 + 计数（定时器回调，poller 线程）
+    void onFlushDeadline();
     /// 出错/关闭的唯一入口：幂等 + 记日志 + shutdownImpl + onError
     void emitError(const SockException &err);
     /// **挂/摘 EPOLLOUT 的唯一入口**：不配对会导致 LT 下 100% CPU 或 ET 下永远发不出去
@@ -215,6 +231,13 @@ private:
     std::atomic<size_t> _max_send_buffer{kDefaultMaxSendBuffer};
     /// 发送队列积压字节数（原子镜像：观测接口要能跨线程读，不能直接读 Buffer）
     std::atomic<size_t> _pending_send_bytes{0};
+
+    /// 「发完再关」（M6-b）：待排空标记 + 截止时刻 + 超时计数
+    std::atomic<bool> _flush_close_pending{false};
+    std::atomic<uint64_t> _flush_close_deadline_ms{0};
+    std::atomic<uint64_t> _flush_close_timeout_count{0};
+    /// 截止时刻的定时器（只在 poller 线程创建/取消）
+    EventPoller::DelayTask::Ptr _flush_deadline_task;
 };
 
 } // namespace mzmedia

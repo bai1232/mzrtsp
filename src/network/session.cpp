@@ -160,6 +160,12 @@ void Session::shutdownImpl(const SockException &err) {
         _idle_task->cancel();
         _idle_task.reset();
     }
+    // 「发完再关」的截止定时器也要停：否则关闭后还会回调一次（白跑一趟 + 计数污染）
+    if (_flush_deadline_task) {
+        _flush_deadline_task->cancel();
+        _flush_deadline_task.reset();
+    }
+    _flush_close_pending.store(false);
     _send_queue->release();
     _pending_send_bytes.store(0);
 
@@ -292,6 +298,10 @@ void Session::onWriteEvent() {
             if (_read_paused) {
                 setReadPaused(false);   // 队列空了：恢复收（也让内核缓冲里的数据继续进来）
             }
+            // 「发完再关」（M6-b）：队列刚排空 —— 这就是关连接最好的时机
+            // （事件驱动，不必等空闲检查的周期，那个周期可能是 6 秒）
+            // 注意：它可能在这里发起 shutdown，所以调用之后立刻返回，不再碰本对象
+            maybeCloseAfterFlush();
             return;
         }
         if (_read_paused && _pending_send_bytes.load() < _max_send_buffer.load() / 4) {
@@ -590,6 +600,82 @@ uint64_t Session::lastSendMs() const {
 size_t Session::pendingSendBytes() const {
     // 读原子镜像，**不要**直接读 _send_queue（Buffer 不是线程安全的）
     return _pending_send_bytes.load();
+}
+
+// ---------------------------------------------------------------------------
+// 「发完再关」（M6-b）
+// ---------------------------------------------------------------------------
+
+bool Session::shutdownAfterFlush(uint32_t max_wait_ms) {
+    if (max_wait_ms == 0) {
+        // 0 不等于无界：没有截止时刻就会永远挂着（有界性不可协商）
+        WarnP("Session::shutdownAfterFlush 被拒：max_wait_ms 不能为 0");
+        return false;
+    }
+    if (_closing.load()) {
+        return false; // 已经在关，不用再排
+    }
+
+    bool ok = false;
+    try {
+        _poller->sync([this, max_wait_ms, &ok] {
+            if (_closing.load() || _flush_close_pending.exchange(true)) {
+                ok = false;
+                return;
+            }
+            _flush_close_deadline_ms.store(getCurrentMillisecond() + max_wait_ms);
+            // 截止时刻用**专用一次性定时器**：不能指望空闲检查的周期（可能是 6 秒）
+            _flush_deadline_task = _poller->doDelayTask(max_wait_ms, [this]() -> uint64_t {
+                onFlushDeadline();
+                return 0;
+            });
+            if (!_flush_deadline_task) {
+                WarnP("Session::shutdownAfterFlush：截止定时器创建失败（poller 已退出）→ 立即关闭");
+                _flush_close_pending.store(false);
+                shutdown(SockException(SockException::ErrType::None, 0, "发完再关（定时器失败）"));
+                ok = false;
+                return;
+            }
+            ok = true;
+            // 队列可能本来就是空的（例如 FLV 的最后一块已经写完）→ 立刻推进一次
+            maybeCloseAfterFlush();
+        });
+    } catch (const std::exception &e) {
+        ErrorP("Session::shutdownAfterFlush 投递失败：%s", e.what());
+        return false;
+    }
+    return ok;
+}
+
+uint64_t Session::flushCloseTimeoutCount() const {
+    return _flush_close_timeout_count.load();
+}
+
+void Session::maybeCloseAfterFlush() {
+    if (!_flush_close_pending.load() || _closing.load()) {
+        return;
+    }
+    if (_pending_send_bytes.load() > 0) {
+        return; // 还有排队数据：等下一次写事件（或截止定时器）
+    }
+    _flush_close_pending.store(false);
+    if (_flush_deadline_task) {
+        _flush_deadline_task->cancel();
+        _flush_deadline_task.reset();
+    }
+    shutdown(SockException(SockException::ErrType::None, 0, "发完再关"));
+}
+
+void Session::onFlushDeadline() {
+    if (!_flush_close_pending.load() || _closing.load()) {
+        return;
+    }
+    // 超时：强制关，但**吵出来**（计数 + 日志）—— 静默丢尾部数据不可接受
+    ++_flush_close_timeout_count;
+    WarnP("Session: 「发完再关」超时（仍有 %zu 字节未写出）→ 强制关闭",
+          _pending_send_bytes.load());
+    _flush_close_pending.store(false);
+    shutdown(SockException(SockException::ErrType::SendFailed, 0, "发完再关超时"));
 }
 
 } // namespace mzmedia

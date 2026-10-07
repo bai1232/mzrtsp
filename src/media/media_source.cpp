@@ -366,11 +366,15 @@ std::vector<Subscriber::Id> MediaSource::brokenSubscriberIds() const {
     return ids;
 }
 
-std::string MediaSource::dumpStatsJson() const {
+std::string MediaSource::dumpStatsJson() {
     // 契约：合法 JSON 对象**片段**（不含最外层花括号），键名用模块名做前缀
     std::string out;
     {
         std::lock_guard<std::mutex> lock(_mutex);
+        // **先惰性清理**：断开的订阅者是靠 shared_ptr 释放来发现的，
+        // 而源可能已经 EOS、不再有流量 → 不清的话统计会永远停在旧值
+        // （NFR-6 的验收就是拿这个数字当判据的）
+        pruneExpiredLocked();
         out = "\"max_subscribers\":" + std::to_string(_limits.max_subscribers) +
               ",\"subscribers\":" + std::to_string(_entries.size()) +
               ",\"queue_bytes\":" + std::to_string(_limits.queueMaxBytes()) +

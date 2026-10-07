@@ -118,6 +118,8 @@ set(MZMEDIA_SOURCES
         src/media/throttle.cpp
         # M6-a FLV 封装（FR-3.1 / 3.3 / 3.4）
         src/output/flv_muxer.cpp
+        # M6-b 每连接的 FLV 发送器
+        src/output/flv_sender.cpp
         )
 
 # 骨架阶段（第 1 批）没有任何源文件，此时不能创建 STATIC 库目标

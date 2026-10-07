@@ -218,7 +218,8 @@ public:
     std::string dumpStats() const;
 
     /// JSON 对象**片段**（不含最外层花括号）：`"media_source":{...}`（FR-6.1，供 /api/stats 拼接）
-    std::string dumpStatsJson() const;
+    /// @note 非 const：它会**惰性清理**已断开的订阅者（否则统计永远停在旧值）
+    std::string dumpStatsJson();
 
     /// 当前已置 `broken()` 的订阅者 id 列表
     /// @note M5-d **只做巡检**（进 stats、由连接层决定怎么处理）；真正的断连在 M6 接上输出层之后

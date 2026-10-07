@@ -127,4 +127,4 @@ while (!rest.empty()) { st = parser.parse(rest); if (st != Complete) break; 处�
 | 2 | 是否支持 POST / body（v0.1 只需要 GET） | M3-b 定：若支持，body 上限与 413 计数一起加 |
 | 3 | 测试页是否内联播放器（离线可用） | M3-b |
 | 4 | `/api/stats` 是否需要鉴权/只绑 127.0.0.1 | M3-c（默认不做鉴权，SPEC 未要求） |
-| 5 | `Session::shutdownAfterFlush()`（"发完再关"） | **推迟到 M6**：chunked 结束时不需要关连接（keep-alive 正常）；真正需要它的是"FLV 流结束要主动关"，届时实现并同步 `DESIGN_M2 §3.6` |
+| 5 | ~~`Session::shutdownAfterFlush()`（"发完再关"）~~ | ✅ **已完成（M6-b）**：`Session::shutdownAfterFlush(max_wait_ms)` 已实现（挂在写路径的"队列空"分支 + 截止定时器兜底），并同步到 `DESIGN_M2` §9 决策记录；HTTP 侧由 `HttpResponse::endStreamFn()` 触达 |

@@ -216,3 +216,63 @@ const char *HttpResponse::reasonPhrase(int code) {
 }
 
 } // namespace mzmedia
+
+namespace mzmedia {
+
+// ---------------------------------------------------------------------------
+// M6-b 新增：发送出口取回、异步流式、附件
+// ---------------------------------------------------------------------------
+
+const HttpResponse::Sender &HttpResponse::sender() const {
+    return _sender;
+}
+
+HttpResponse::ChunkWriter HttpResponse::chunkWriter() const {
+    // 关键：捕获 Sender 的**拷贝** —— 返回的 writer 不依赖 HttpResponse 对象，
+    // 所以能在 handler 返回之后（流式推送期间）继续用
+    Sender sender = _sender;
+    return [sender](const char *data, size_t len) -> bool {
+        if (data == nullptr || len == 0) {
+            return true; // 空块无副作用（结束块必须显式发）
+        }
+        if (!sender) {
+            return false;
+        }
+        char hex[32] = {0};
+        std::snprintf(hex, sizeof(hex), "%zx\r\n", len);
+        return sender(hex, std::strlen(hex)) && sender(data, len) && sender("\r\n", 2);
+    };
+}
+
+bool HttpResponse::setEndStream(EndStreamFn fn) {
+    _end_stream = std::move(fn);
+    return static_cast<bool>(_end_stream);
+}
+
+const HttpResponse::EndStreamFn &HttpResponse::endStreamFn() const {
+    return _end_stream;
+}
+
+bool HttpResponse::setChunkedAsync() {
+    if (!_chunked) {
+        return false; // 没进 chunked 模式：声明异步流没有意义
+    }
+    _chunked_async = true;
+    return true;
+}
+
+bool HttpResponse::chunkedAsync() const {
+    return _chunked_async;
+}
+
+void HttpResponse::holdResource(std::shared_ptr<void> resource) {
+    if (resource) {
+        _resources.push_back(std::move(resource));
+    }
+}
+
+std::vector<std::shared_ptr<void>> HttpResponse::takeResources() {
+    return std::move(_resources);
+}
+
+} // namespace mzmedia

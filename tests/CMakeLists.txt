@@ -43,6 +43,8 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_source_manager.cpp
         # ---- M6-a FLV 封装 ----
         ${CMAKE_CURRENT_SOURCE_DIR}/test_flv_muxer.cpp
+        # ---- M6-b 每连接的 FLV 发送器（用例名 flv_sender_*，同属 flv 分组）----
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_flv_sender.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS

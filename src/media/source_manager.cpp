@@ -179,6 +179,16 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path) {
     return makeHandle(fresh);
 }
 
+const Demuxer *SourceManager::demuxerFor(const std::string &path) const {
+    std::lock_guard<std::mutex> lock(_mutex);
+    const auto it = _entries.find(path);
+    if (it == _entries.end() || !it->second->producer) {
+        return nullptr;
+    }
+    // producer 与 entry 同生命周期；调用方拿到后应立刻取 StreamInfo，不要长期持有
+    return &it->second->producer->demuxer();
+}
+
 MediaSource::Ptr SourceManager::makeHandle(const std::shared_ptr<Entry> &entry) {
     // 句柄的写法：**自定义 deleter + 捕获强引用 keep**
     //   · keep 让 MediaSource 活到最后一个句柄释放（即使条目已被 releaseAll 摘掉，也不会悬垂）

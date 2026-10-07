@@ -28,6 +28,9 @@ namespace mzmedia {
 
 namespace {
 
+/// 「发完再关」的最长等待（M6-b）：够本地把最后一块写完，又不会让连接挂太久
+constexpr uint32_t kFlushCloseWaitMs = 5000;
+
 /// 内置测试页（SC-1 的落地）：**不依赖外部 CDN**，离线可用
 const char *kTestPage =
     "<!DOCTYPE html>\n"
@@ -168,6 +171,15 @@ private:
                 // send() 返回 0 = 已入队未写出（**不是失败**）；只有 -1 才算失败
                 return send(data, len) >= 0;
             });
+            // M6-b：异步流式响应的「结束并关闭」出口。
+            // 它**不依赖 HttpResponse 对象**（handler 一返回 resp 就没了），所以能挂到
+            // FlvSender 的 sink 上，在流结束时才调用：发结束块 + 等发送队列排空再关连接
+            resp.setEndStream([this]() -> bool {
+                if (send("0\r\n\r\n", 5) < 0) {
+                    return false; // 连接已坏
+                }
+                return shutdownAfterFlush(kFlushCloseWaitMs);
+            });
             try {
                 handler(_parser, resp);
             } catch (const std::exception &e) {
@@ -185,10 +197,19 @@ private:
         }
 
         resp.setKeepAlive(_parser.keepAlive());
+
+        // M6-b：附件交给**会话**托管 —— 流式响应的发送器/订阅者靠它活到连接结束
+        // （由会话在析构时统一释放：连接一断就退订，NFR-6）
+        for (auto &resource : resp.takeResources()) {
+            _held_resources.push_back(std::move(resource));
+        }
+
         if (resp.chunked()) {
             // 处理器自己把头和块发出去了：这里只兜底收尾
             // （忘了发结束块会让客户端一直等 —— 那是"静默的挂住"，必须吵出来）
-            if (!resp.chunkedEnded()) {
+            // 注意：**异步流式**（M6-b 的 FLV）不兜底 —— 它的结束块由处理器在流结束时自己发，
+            // 这里替它结束会把流提前掐断
+            if (!resp.chunkedEnded() && !resp.chunkedAsync()) {
                 WarnP("HttpServer: chunked 处理器未调用 endChunked()，这里补上");
                 resp.endChunked();
             }
@@ -213,6 +234,8 @@ private:
     }
 
     HttpServer *_owner;
+    /// M6-b：连接级附件（流式响应的发送器/订阅者）—— 会话析构时统一释放
+    std::vector<std::shared_ptr<void>> _held_resources;
     HttpParser _parser;
 };
 

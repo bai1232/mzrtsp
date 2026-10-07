@@ -167,6 +167,24 @@ private:
     std::string _blob;
 };
 
+/// 「发完再关」用：收到 1 字节就回一段固定数据，然后请求 shutdownAfterFlush
+class FlushCloseSession : public RecordingSession {
+public:
+    FlushCloseSession(const Socket::Ptr &sock, const EventPoller::Ptr &poller, std::atomic<int> *out,
+                      size_t bytes, uint32_t wait_ms)
+        : RecordingSession(sock, poller, out), _blob(bytes, 'F'), _wait_ms(wait_ms) {}
+
+protected:
+    void onRecv(const Buffer::Ptr &) override {
+        send(_blob.data(), _blob.size());      // 先入队（很可能写不完）
+        (void) shutdownAfterFlush(_wait_ms);   // 排空之后再关；到点没排空则强制关 + 计数
+    }
+
+private:
+    std::string _blob;
+    uint32_t _wait_ms;
+};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -503,4 +521,75 @@ MZ_TEST(ntimed_send_order_with_backlog) {
     ::close(cli);
     server->shutdown();
     poller->shutdown();
+}
+
+MZ_TEST(ntimed_session_shutdown_after_flush) {
+    // 场景 A：客户端**一直读** —— 数据一个字节都不能少，然后才关连接
+    {
+        auto poller = EventPoller::create("test-session-flush-a");
+        std::atomic<int> last_err{-1};
+        auto server = std::make_shared<TcpServer>(poller);
+        MZ_ASSERT_TRUE(server->setSessionCreator([&last_err](const Socket::Ptr &sock) -> Session::Ptr {
+            sock->setSendBufSize(8 * 1024); // 逼出"多次写 + EPOLLOUT 续写"
+            return std::make_shared<FlushCloseSession>(sock, EventPollerPool::Instance().getPoller(),
+                                                       &last_err, 256 * 1024, 3000);
+        }));
+        MZ_ASSERT_TRUE(server->setSessionTimeout(0, 0)); // 关掉超时，专测「发完再关」
+        MZ_ASSERT_TRUE(server->start(0));
+
+        const int cli = connectTo(server->port());
+        MZ_ASSERT_GT(cli, 0);
+        MZ_ASSERT_EQ(::send(cli, "x", 1, 0), 1);
+
+        size_t got = 0;
+        bool closed = false;
+        char buf[16384];
+        const uint64_t deadline = getCurrentMillisecond() + static_cast<uint64_t>(kTimeoutMs);
+        while (getCurrentMillisecond() < deadline) {
+            const ssize_t n = ::recv(cli, buf, sizeof(buf), 0);
+            if (n == 0) {
+                closed = true; // 对端关闭（= 我们排空后主动关的）
+                break;
+            }
+            if (n < 0) {
+                break; // 超时/出错
+            }
+            got += static_cast<size_t>(n);
+        }
+        MZ_ASSERT_EQ(got, 256u * 1024u); // ★ 一个字节都没丢
+        MZ_ASSERT_TRUE(closed);          // ★ 而且是"排空之后"才关的
+        MZ_ASSERT_EQ(last_err.load(), static_cast<int>(SockException::ErrType::None));
+
+        ::close(cli);
+        server->shutdown();
+        poller->shutdown();
+    }
+
+    // 场景 B：客户端**只连不读** —— 到点强制关，并且**记为失败**（静默丢尾部数据不可接受）
+    {
+        auto poller = EventPoller::create("test-session-flush-b");
+        std::atomic<int> last_err{-1};
+        auto server = std::make_shared<TcpServer>(poller);
+        MZ_ASSERT_TRUE(server->setSessionCreator([&last_err](const Socket::Ptr &sock) -> Session::Ptr {
+            sock->setSendBufSize(8 * 1024);
+            return std::make_shared<FlushCloseSession>(sock, EventPollerPool::Instance().getPoller(),
+                                                       &last_err, 1u << 20, 100);
+        }));
+        MZ_ASSERT_TRUE(server->setSessionTimeout(0, 0)); // 只有"发完再关"的截止时刻在起作用
+        MZ_ASSERT_TRUE(server->start(0));
+
+        const int cli = connectTo(server->port());
+        MZ_ASSERT_GT(cli, 0);
+        MZ_ASSERT_EQ(::send(cli, "x", 1, 0), 1);
+
+        const auto hit_timeout = [&last_err]() -> uint64_t {
+            return last_err.load() == static_cast<int>(SockException::ErrType::SendFailed) ? 1u : 0u;
+        };
+        MZ_ASSERT_TRUE(waitFor(hit_timeout, 1, kTimeoutMs));
+        MZ_ASSERT_EQ(server->sessionCount(), 0u);
+
+        ::close(cli);
+        server->shutdown();
+        poller->shutdown();
+    }
 }
