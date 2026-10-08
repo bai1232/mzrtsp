@@ -39,7 +39,7 @@ class SockException : public std::runtime_error {
 public:
     enum class ErrType {
         None = 0,       // 正常关闭（本地 shutdown 或对端 EOF）
-        PeerClosed,     // 对端关闭（read 返回 0）
+        PeerClosed,     // 对端关闭/挂断（read 返回 0，或 epoll 报 EPOLLHUP/EPOLLERR）
         Timeout,        // 读空闲 / 写阻塞超时（FR-4.4）
         RecvOverflow,   // 接收缓冲超限被断开
         SendOverflow,   // 发送队列超限（慢客户端，FR-5.2 的队列上限）
@@ -72,6 +72,9 @@ private:
  * 线程模型：**只在 poller 线程使用**（accept/read/write 都在事件回调里）；
  *           `close()` 也应在 poller 线程调用（Session::shutdown 负责这件事）。
  * SIGPIPE：`send()` 一律带 MSG_NOSIGNAL，因此**不需要**在进程里忽略 SIGPIPE。
+ *
+ * @note "对端消失"的 errno 判定在 `core/util.h` 的 `isPeerGoneErrno()`（M6-d：
+ *       `Socket` / `Buffer` / `Session` 三处都要用，放这里会让低层被迫包含本头）。
  */
 class Socket {
 public:

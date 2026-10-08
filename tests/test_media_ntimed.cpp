@@ -152,6 +152,38 @@ MZ_TEST(ntimed_media_notify_coalesced_and_drained_on_poller_thread) {
     }
     MZ_ASSERT_EQ(received.load(), queued + 1);
 
+    // 【M6-d】聚合观测：`/api/stats` 必须能看到"唤醒次数 / 合并次数 / 真正取走的包数"
+    //   —— 这是回填 `DESIGN_M5` §8 未决 #9（唤醒合并够不够）**唯一**的数据来源。
+    //   用带分隔符的子串断言（否则 `"notify":2` 会误匹配 `"notify":20`）。
+    const std::string json = source->dumpStatsJson();
+    MZ_ASSERT_TRUE(json.find("\"wakeup\":{") != std::string::npos);
+    MZ_ASSERT_TRUE(json.find("\"notify\":" + std::to_string(sub->notifyCount()) + ",") !=
+                  std::string::npos);
+    MZ_ASSERT_TRUE(json.find("\"coalesced\":" + std::to_string(sub->notifyCoalescedCount()) + ",") !=
+                  std::string::npos);
+    MZ_ASSERT_TRUE(json.find("\"popped\":" + std::to_string(received.load()) + "}") !=
+                  std::string::npos);
+    // 一次唤醒搬多少包：101 个包 / 2 次唤醒 → 数量级上远大于 1（合并唤醒确实在工作）
+    // 注意两侧类型要对齐（`received` 是 int，`notifyCount()` 是 uint64）——
+    // 混着比较会触发 `-Wsign-compare`，而本项目要求"零警告、可开 -Werror"
+    // （**实测教训**：增量构建没报、清洁构建报了，所以提交前必须跑一次 clean build）
+    MZ_ASSERT_GT(static_cast<uint64_t>(received.load()), sub->notifyCount() * 10);
+    // 片段必须括号配平（能直接拼进 /api/stats 的最外层对象）
+    int depth = 0;
+    bool balanced = true;
+    for (const char c : json) {
+        if (c == '{') {
+            ++depth;
+        } else if (c == '}') {
+            --depth;
+            if (depth < 0) {
+                balanced = false;
+            }
+        }
+    }
+    MZ_ASSERT_TRUE(balanced);
+    MZ_ASSERT_EQ(depth, 0);
+
     poller->shutdown();
 }
 

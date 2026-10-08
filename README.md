@@ -119,9 +119,11 @@ curl -s http://127.0.0.1:8080/api/stats | head -c 400
 ### 验证（每个脚本都会打印"通过 N 项 / 失败 N 项"）
 
 ```bash
-cd build && ctest                        # 21 个分组（243 个用例），串行跑
+cd build && ctest                        # 21 个分组（245 个用例），串行跑
 ./bin/mzmedia_unittest producer           # 只跑某组：分组名是**用例名的子串**
 ../scripts/flv_http_test.sh               # M6-c 端到端验收：49 项（HTTP + ffprobe + 浏览器资源 + 循环）
+../scripts/concurrent_test.sh --quick     # M6-d 并发/回收：10 路 × 20s（硬门禁）
+../scripts/concurrent_test.sh             # M6-d 长跑：10 路 × 5 分钟（NFR-2/3/4/6 + 性能基线）
 ../scripts/flv_mux_test.sh                # M6-a：8 项（FLV 封装 → ffprobe）
 ../scripts/http_test.sh                   # M3：HTTP 层
 ../scripts/tsan.sh                        # TSAN：严格组 0 报告

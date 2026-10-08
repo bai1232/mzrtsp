@@ -314,6 +314,14 @@ M6-c 的补法（见 §3.6）：转换放在 `DemuxerProducer`（解封装层）
 顺带明确一条**使用契约**：`muxerStreamsFor()` 返回的 `StreamInfo*` 指向源自己持有的快照，
 可以跨连接长期保存（重开也不换），但**源必须先活着** —— 上面这条守卫正是它的前提。
 
+### 4.9 M6-d 抓到的三个真问题
+
+| # | 现象 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | **5 分钟跑在 t=61s 时 10 路连接全部断开**（3~5 秒的验收永远看不到） | HTTP-FLV 是服务端**单向推流**，客户端不发数据 → FR-4.4 的"读空闲 60s"把正在观看的连接掐掉 | 异步流式响应（`setChunkedAsync()`）**关掉该连接的读空闲检测**；写阻塞超时 + TCP keepalive 仍兜底。用例 `ntimed_http_stream_survives_recv_idle`（**修前必红**：把读空闲压到 300ms，1.5s 后 recv 拿到 EOF） |
+| 2 | 一台 5 路被 kill 的客户端在日志里留下 **10 条 `[E]`** → NFR-3 的"错误日志 0 条"没法测 | "对端消失"被当成服务器故障，而且在**四处**各错一次（`Session::emitError` 的级别、`Socket::send/recv` 的日志、`Buffer::readFromFd` 的日志、`onEvent` 的分支顺序） | `isPeerGoneErrno()`（`core/util`，纯函数）+ `Session::closeLogLevel()`（**public static**，可测）+ 三处日志分级；**类型与计数一律不变**（既有 onError 断言与计数不受影响） |
+| 3 | `EPOLLHUP/EPOLLERR` 时**先判错就 return** → 缓冲区里对端剩下的数据被丢掉，且原因被硬编码成 `recv-failed (errno=0)` | `EventPoller::toEvent()` 明明同时给了 `EventRead`（注释写着"让回调先把缓冲区读干净再关闭"），`Session::onEvent()` 却先判错误事件 | 顺序改为 **先写 → 再读 → 最后判错误事件**；真"挂断且无数据可读"才报 `PeerClosed`（不再假报 `RecvFailed(errno=0)`）。**这条没有确定性单测**（依赖内核事件组合，且 `onEvent()` 是 private）——证据是 poller 注释与代码的矛盾 + 并发脚本 Error 计数 10 → 0，补测留 M7 |
+
 ## 5. 测试计划（M6-a）
 
 ### 5.1 单元测试（分组 `flv`，10 个用例 / 515 断言，进 TSAN 严格组）
@@ -419,6 +427,36 @@ M6-c 的补法（见 §3.6）：转换放在 `DemuxerProducer`（解封装层）
 第 9 条修前 ffmpeg 每秒报一次 `non monotonically increasing dts` ——
 两者都不是"崩了"，而是"看起来在跑，其实不对"，正是最难靠 review 发现的那类。
 
+### 5.5 M6-d：并发 / 长跑（`scripts/concurrent_test.sh`）
+
+**一个脚本、两层判据**（刻意分开：功能性设硬门禁，性能只记基线 —— 5 分钟的 RSS 斜率噪声大，
+拿它当门禁会变成随机翻红）：
+
+| 类别 | 判据 | 说明 |
+|---|---|---|
+| **功能性（硬门禁）** | 每一路都拿到**完整且可解码**的码流（h264 + 帧数在预期区间 + `ffmpeg -f null -` 无 error） | 5×curl（纯拉流）+ 5×ffmpeg（边拉边真解码），**错开 200ms 接入** |
+| | 断开后 `subscribers == 0`、fd 回落到基线（±2） | NFR-6 |
+| | 服务端**错误日志 0 条**（`[E]`/`[F]`）；Warn 只报数 | NFR-3（对端消失记 Warn，见 §4.9） |
+| | `--kill-half`：被 kill 的路 `auto_unsub` 增长，其余路**不受影响** | TESTING §6 的专项 |
+| | `--overload N`：接受的正好是 `max_subscribers - 已占用`，其余 `rejected` 增长 | FR-5.1 的上限真的在生效（脚本不硬编码 16） |
+| **性能（只记基线）** | 服务端 CPU（单核%）、RSS 斜率（含折算 MB/h）、fd 曲线 | NFR-3 / NFR-4 |
+| | `wakeup`：`notify`/`coalesced`/`popped` 与"一次唤醒搬多少包" | 回填 `DESIGN_M5` §8 未决 #9 |
+| | 源端包/s、丢帧计数、订阅者曲线 | 回填 #7（包数洪泛）与 #8（锁粒度） |
+| | 音/视频时间轴跨度 + **音画偏移峰值** | 回填 #13（按混合 dts 对齐会不会漂） |
+
+跑法：`--quick`（10 路 × 20s，回归门禁）／默认 `--duration 300`（10 路 × 5 分钟）／
+`--duration 3600`（1 小时，NFR-3 原文，留 M7 发版前执行）。
+客户端被 `--max-time`/`-t` 掐断时尾部可能留半个 tag → 脚本先"切到最后一个完整 tag"再校验，
+并报出丢弃字节数（不静默）。
+
+**M6-d 实测结果**（10 路 × 300s，`--loop` + 2 秒样本 = 150 次循环重开；详细表格见 `TESTING.md` §5）：
+
+- 功能性 **8/8（含 `--overload`）→ 快速版 10/10**：每路码流完整可解（视频 7426 / 预期 7500）、
+  断开后订阅者归零且 fd 回落到基线、**错误日志 0 条**、超额连接"接受 6 / 拒绝 2"；
+- 性能：服务端 **CPU 单核 4.11%**（十路合计）、RSS 稳态段 232s **+24 kB（折算 0.36 MB/h）**、
+  丢帧 0、唤醒 **1.4 包/次**、源端 ≈68 包/s、音画偏移峰值 **2.0 ms**；
+- 回填结论（`DESIGN_M5` §8）：#1 保持 16、#7 不加包数硬顶、#8 不升级锁粒度、#9 唤醒合并够、#13 节流基准不改。
+
 ## 6. 风险清单
 
 | # | 风险 | 触发条件 | 应对 |
@@ -436,6 +474,9 @@ M6-c 的补法（见 §3.6）：转换放在 `DemuxerProducer`（解封装层）
 | 11 | 【M6-c】源结束后晚到连接挂死 | EOS 早于 drain 回调注册 | `start()` 立刻搬一次队列；用例 + 验收脚本 §8（§4.7 bug 1） |
 | 12 | 【M6-c】有人在看却把源释放了 | 只按"句柄数"判空闲 | `subscriberCount()>0` 就推迟 + 复查；用例 `srcmgr_idle_release_waits_for_subscribers`（§4.8） |
 | 13 | 【M6-c】`--loop` 遇到被替换/截断的文件 | 运行期文件变了 | 每趟校验流参数；空趟不再重开（§3.6） |
+| 14 | 【M6-d】**单向响应被"读空闲 60s"掐断**（长直播/大文件下载） | 客户端不发数据 → 读空闲到点 | 已修：异步流式响应（`setChunkedAsync()`）豁免读空闲；写阻塞 + keepalive 兜底。**通用化留 M7**（§8 未决 11） |
+| 15 | 【M6-d】"对端消失"被记成 Error → NFR-3 的"错误日志 0 条"失去意义 | 客户端被杀/断网/RST | 已修：`isPeerGoneErrno()` + `closeLogLevel()`（四处收口）→ 记 Warn；用例锁住级别映射（§4.9 问题 2） |
+| 16 | 【M6-d】`EPOLLHUP` 时丢掉缓冲区里的数据 | 对端挂断时还有未读数据 | 已修：`onEvent` 改为先读后判（§4.9 问题 3）。**风险**：这条**没有确定性用例**（M7 补，见 §8 未决 12）—— 若被改回去，只能靠并发脚本的日志计数发现 |
 
 ## 7. 决策记录（为什么这么选 / 排除了什么）
 
@@ -472,6 +513,13 @@ M6-c 的补法（见 §3.6）：转换放在 `DemuxerProducer`（解封装层）
 | 【M6-c】`--speed` 暴露给命令行 | 暴露（默认 1.0） | 它是 `FR-3.5` 的既有能力，且是**循环/长流验收的加速旋钮**（脚本 §9 用 4 倍速在 3 秒内验证 6 次循环）；排除"只留给单测"（那样端到端验收就得跑满时长） |
 | 【M6-c】空闲释放的判据 | **句柄数 = 0 且订阅者数 = 0**（否则推迟 + 复查） | 排除"只看句柄数"（就是 §4.8 的 bug）；排除"订阅者一断就立刻释放"（句柄与订阅者是两条独立生命周期，硬绑会让"重连同一路"时源被反复关停） |
 | 【M6-c】测试分组 | 新增 `producer` 组（依赖样本、单线程、无等待 → 进 TSAN 严格组） | 排除"塞进 `media` 组"（`media` 目前**不需要样本**，混进去会让"没跑 make_samples 就整组红"的范围无谓扩大）；排除"塞进 `srcmgr`"（那是"真起线程 + 定时器"的组，依赖面不同） |
+| 【M6-d】验收脚本的数量 | **一个参数化脚本**（`concurrent_test.sh`，默认 5 分钟 + `--quick`） | 排除"并发脚本 + 长跑脚本"两份（采样/起停逻辑会重复 90%，改一处忘一处）；`--duration 3600` 就是同一份脚本跑 1 小时 |
+| 【M6-d】判据分层 | **功能性设硬门禁、性能只记基线** | 排除"给 RSS/CPU 设死阈值"：5 分钟斜率噪声大（实测同机同负载 0.36 ~ 20 MB/h 都有），会造成随机翻红；性能基线写进 `TESTING` 供 M7 的 1 小时跑对比 |
+| 【M6-d】客户端构成 | **5×curl（纯拉流）+ 5×ffmpeg（边拉边真解码）**，错开 200ms 接入 | 排除"全 curl"（拿不到"码流正确"的证据）；排除"全 ffmpeg"（10 路解码抢 CPU，污染 CPU/RSS 观测）；错开接入顺带压"订阅时序 + GOP 缓存" |
+| 【M6-d】客户端被掐断的尾包 | 校验前**先切到最后一个完整 tag**（并报出丢弃字节数） | 排除"直接 ffprobe"（半个 tag 会被当畸形文件 → 假红）；排除"不掐断"（循环流不会自己结束，必须靠 `--max-time`/`-t`） |
+| 【M6-d】`/api/stats` 的 `wakeup` 语义 | 聚合**当前在册**订阅者（不是累计） | 排除"累计计数"（要跨模块在 `Subscriber` 通知时回写源，为一个观测值增加写路径）；代价是"源释放后归零"→ 脚本改成**从采样最后一刻取值**并在注释里写明 |
+| 【M6-d】读空闲的豁免方式 | 按**显式声明**（`setChunkedAsync()`）豁免该连接 | 排除"按 `keepAlive=false` 猜"（启发式）；排除"把 60s 调大"（治标，且会削弱 M2 的空闲回收）。通用化留 M7（§8 未决 11） |
+| 【M6-d】"对端消失"的分级 | 纯函数 `isPeerGoneErrno()` + `Session::closeLogLevel()`，**只改级别不改类型/计数** | 排除"改 `ErrType`（新增 `PeerGone`）"（会动 M2 的计数契约与既有断言）；排除"直接降级所有 send/recv 失败"（`ENOBUFS` 这类是我们的问题，必须留 Error） |
 
 ## 8. 未决事项
 
@@ -483,10 +531,13 @@ M6-c 的补法（见 §3.6）：转换放在 `DemuxerProducer`（解封装层）
 | 4 | Annex-B → AVCC 转换（裸流输入） | ✅ **M6-c 完成**（`FR-2.1`）：解封装层转换 + avcC 现场构造 + 单测 + `ffprobe`/`ffmpeg`/python 三重验收 |
 | 5 | `FlvSender` 的发送节奏：一次 drain 多少 tag（与 M5 唤醒合并的关系） | ✅ M6-b/M6-c：一次 drain 取空队列、32KB 一块；M6-d 在"10 路 / 5 分钟"下拿真实数据回填 |
 | 6 | `Session::shutdownAfterFlush()` 的实现方式（等队列排空再关） | ✅ **M6-b**（`DESIGN_M3` §9 未决 5），M6-c 增加 `abortFn()`（硬断连）作为"异常终止"出口 |
-| 7 | 5 分钟 / 10 路并发下的真实参数（锁粒度、包数硬顶、唤醒合并、`max_subscribers`） | **M6-d**（回填 `DESIGN_M5` §8） |
-| 8 | 【M6-c 新增】`avcC` 是否写 high profile 的扩展字段（chroma_format 等） | 不写（播放端从 SPS 自己读）。实测 `sample.h264`（baseline）可用；**high profile 的裸流没有样本可验**，M6-d 若补样本再决定 |
+| 7 | 5 分钟 / 10 路并发下的真实参数（锁粒度、包数硬顶、唤醒合并、`max_subscribers`） | ✅ **M6-d 完成**：`DESIGN_M5` §8 已逐条回填（#7 不加包数硬顶、#8 不升级锁粒度、#9 唤醒合并够、#13 节流基准不改、#1 保持 16） |
+| 8 | 【M6-c 新增】`avcC` 是否写 high profile 的扩展字段（chroma_format 等） | 不写（播放端从 SPS 自己读）。实测 `sample.h264`（baseline）可用；**high profile 的裸流没有样本可验** → 留 M7 补样本再定 |
 | 9 | 【M6-c 新增】`--loop` 与"文件被替换"的交互 | 已按"参数变了就明确失败"处理；是否要"检测到变化自动重开"留 M7 定 |
-| 10 | 【M6-c 新增】第 8 条那个 bug 也说明：**"源 EOS 后再接入"** 这条路径值得再补一个"GOP 缓存为空"的用例（当前样本只有 1 个关键帧，缓存里总有东西） | M6-d（与 10 路并发一起） |
+| 10 | 【M6-c 新增】"源 EOS 后接入"这条路径值得再补一个"**GOP 缓存为空**"的用例（当前样本只有 1 个关键帧，缓存里总有东西） | M7（与 M6-d 的 10 路并发一起看：`seed_failed` 计数在 5 分钟跑里始终为 0） |
+| 11 | 【M6-d 新增】单向响应的读空闲语义**通用化**（不只异步流式：大文件下载、将来的 HLS 长连接） | M7 单独决策：是"显式声明豁免"（现状）还是"最近有发送活动就不算读空闲" |
+| 12 | 【M6-d 新增】`onEvent()` 的"先写 → 再读 → 判错误"顺序**补确定性用例**（可选做法：把它提到 `protected`，或加一个只有测试用的事件注入钩子） | M7（本批已修但只有间接证据，见 §4.9 问题 3） |
+| 13 | 【M6-d 新增】NFR-3 原文是 **1 小时**（RSS < 5MB/h、fd 无泄漏、ASAN 无报错） | M7 发版前：`./scripts/concurrent_test.sh --duration 3600` + ASAN 构建各跑一遍 |
 
 ## 9. 假设与影响面（`AI_COLLAB.md` §1 的②③）
 
@@ -523,3 +574,18 @@ M6-c 的补法（见 §3.6）：转换放在 `DemuxerProducer`（解封装层）
 - **删除**：`examples/flv_http_server.cpp`（升级成 `src/main.cpp`；留在 `examples/` 会让人以为它只是示例）。
 - **不动**：`core/`、`network/` 的现有代码；`media/` 只动 `source_manager` 与 `demuxer_producer`
   （都是"新增能力"，`MediaSource`/`FrameQueue`/`GopCache`/`Throttle`/`SourcePump` 行为未变）。
+
+### M6-d 的影响面（补充）
+
+- 新增：`scripts/concurrent_test.sh`（10 路 × 5 分钟 / `--quick` 两层判据）。
+- 改动（都是"修 M6-d 抓到的真问题"，见 §4.9）：`src/core/util.h/.cpp`（`isPeerGoneErrno()`）、
+  `src/network/session.h/.cpp`（`closeLogLevel()` + `emitError` 记 `err.what()` + `onEvent` 先读后判 +
+  运行期可改空闲阈值）、`src/network/socket.h/.cpp`（`send/recv` 失败分级）、
+  `src/network/buffer.cpp`（`readFromFd` 失败分级）、`src/http/http_server.cpp`（异步流式豁免读空闲 +
+  `abortFn` 记 Warn）、`src/media/media_source.h/.cpp`（`wakeup` 聚合 + 删掉过期的"独立时间戳基准"占位注释）、
+  `tests/test_media_ntimed.cpp`、`tests/test_network_session.cpp`、`tests/test_http_server.cpp`。
+- 文档：`docs/DESIGN_M6.md`（§4.9/§5.5/§6/§7/§8/§9）、`docs/DESIGN_M5.md`（§1 + §8 全量回填）、
+  `docs/TESTING.md`（§5/§6 重写 + 基线表 + §7 引用）、`docs/ROADMAP.md`、`README.md`、
+  `docs/RETROSPECTIVE.md`（§2.7 + 简历素材 + 快照）、`CHANGELOG.md`。
+- **不动**：`FlvMuxer`/`FlvSender`/`SourcePump`/`FrameQueue`/`GopCache`/`Throttle`（10 路实测证明它们不需要改，
+  M5 未决 #7/#8/#9/#13 的结论都是"不改"）。

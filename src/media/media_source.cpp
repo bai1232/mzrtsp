@@ -394,6 +394,30 @@ std::string MediaSource::dumpStatsJson() {
             }
         }
         out += "]";
+        // 【M6-d】唤醒合并的观测（回填 DESIGN_M5 §8 未决 #9 需要真实数据）：
+        //   每次唤醒搬了多少包 = popped / notify；coalesced 是"已有未决唤醒 → 合并"的次数。
+        //   注意三点（否则数字会被读错）：
+        //   · 这三个是**跨订阅者的聚合**：单个订阅者的唤醒次数对容量规划没有意义；
+        //   · 只统计**当前在册**的订阅者 —— 订阅者注销后它的部分就没了（源只持 weak_ptr），
+        //     所以要在**连接存活期间**采样（`scripts/concurrent_test.sh` 每 5 秒采一次）；
+        //   · 键名 `notify_rejected` 刻意与 media 的 `rejected`（订阅被拒）**区分开**：
+        //     同名会让 `/api/stats` 的取值脚本抓错（M6-d 写脚本时踩到）。
+        uint64_t notify = 0;
+        uint64_t coalesced = 0;
+        uint64_t notify_rejected = 0;
+        uint64_t popped = 0;
+        for (const auto &entry : _entries) {
+            if (Subscriber::Ptr sub = entry.sub.lock()) {
+                notify += sub->notifyCount();
+                coalesced += sub->notifyCoalescedCount();
+                notify_rejected += sub->notifyRejectedCount();
+                popped += sub->queue().stats().popped;
+            }
+        }
+        out += ",\"wakeup\":{\"notify\":" + std::to_string(notify) +
+               ",\"coalesced\":" + std::to_string(coalesced) +
+               ",\"notify_rejected\":" + std::to_string(notify_rejected) +
+               ",\"popped\":" + std::to_string(popped) + "}";
         out += ",\"counters\":{\"delivered\":" + std::to_string(_total_delivered.load()) +
                ",\"dropped\":" + std::to_string(_total_dropped_to_make_room.load()) +
                ",\"dropped_incoming\":" + std::to_string(_total_dropped_incoming.load()) +
@@ -410,6 +434,17 @@ std::string MediaSource::dumpStats() const {
     // 最小版（FR-6.1）：一行、可 grep、可从任意线程调用。
     // 完整 StatsCenter 与 /api/stats 接线见 M5-d。
     std::lock_guard<std::mutex> lock(_mutex);
+    // 唤醒聚合（与 dumpStatsJson 的 wakeup 同源；诊断时最常看的"一次唤醒搬多少包"就在这里）
+    uint64_t notify = 0;
+    uint64_t coalesced = 0;
+    uint64_t popped = 0;
+    for (const auto &entry : _entries) {
+        if (Subscriber::Ptr sub = entry.sub.lock()) {
+            notify += sub->notifyCount();
+            coalesced += sub->notifyCoalescedCount();
+            popped += sub->queue().stats().popped;
+        }
+    }
     return "media_source{limits: bitrate=" + std::to_string(_limits.max_bitrate_bps) +
            "bps latency=" + std::to_string(_limits.latency_budget_ms) +
            "ms gop=" + std::to_string(_limits.max_gop_ms) +
@@ -417,7 +452,10 @@ std::string MediaSource::dumpStats() const {
            " gop_bytes=" + std::to_string(_limits.gopMaxBytes()) +
            " max_subs=" + std::to_string(_limits.max_subscribers) +
            " out_budget=" + std::to_string(_limits.outputBitrateBudgetBps()) +
-           "bps | counters: delivered=" + std::to_string(_total_delivered.load()) +
+           "bps | wakeup: notify=" + std::to_string(notify) +
+           " coalesced=" + std::to_string(coalesced) +
+           " popped=" + std::to_string(popped) +
+           " | counters: delivered=" + std::to_string(_total_delivered.load()) +
            " dropped=" + std::to_string(_total_dropped_to_make_room.load()) +
            " dropped_incoming=" + std::to_string(_total_dropped_incoming.load()) +
            " rejected=" + std::to_string(_total_rejected.load()) +

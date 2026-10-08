@@ -199,4 +199,20 @@ std::string loadFile(const std::string &path, std::string *error = nullptr);
  */
 bool saveFile(const std::string &path, const std::string &data);
 
+/**
+ * 【M6-d】errno 是否表示"**对端已经消失**"（不是本机故障）
+ *
+ * `send()` 拿到 `EPIPE`/`ECONNRESET`、`recv()`/`read()` 拿到 `ECONNRESET` ——
+ * 这些是**客户端被杀、关页面、断网**的正常后果。直播/长连接服务里客户端来走是常态，
+ * 把它们记成 `Error` 会让 NFR-3 的"错误日志 0 条"永远不成立，而且训练读者忽略 Error
+ * （M6-d 的并发脚本实测：5 路客户端被 kill → 10 条 Error，见 `docs/DESIGN_M6.md` §5.5）。
+ *
+ * 放在 `core/util` 而不是 `network/socket.h` 的原因：**判定纯靠 errno、不涉及任何网络类型**，
+ * 而它有三个使用点（`Socket::send/recv` 的日志、`Buffer::readFromFd` 的日志、
+ * `Session::closeLogLevel` 的级别判定）—— 让网络层的三个文件都去包含 `Socket` 头不划算。
+ *
+ * @return true = 对端消失（记 Warn）；false = 其它 errno（保持 Error，那是真问题）
+ */
+bool isPeerGoneErrno(int err);
+
 } // namespace mzmedia

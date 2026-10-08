@@ -426,6 +426,50 @@
 - 遗留：**M6-d**（10 路并发 / 5 分钟验收 + 拿真实数据回填 M5 未决）、
   MKV/TS 输入仍无样本实测、high profile 裸流的 avcC 扩展字段、`onMetaData`/AVC end-of-sequence 仍不发
 
+#### M6-d 并发 / 长跑验收 + 回填 M5 未决（**M6 收尾**）
+
+- 新增 `scripts/concurrent_test.sh`（**一个参数化脚本**）：`--clients/--duration/--quick/--kill-half/
+  --overload/--speed/--no-loop/--media-root/--port`；客户端 **5×curl（纯拉流）+ 5×ffmpeg（边拉边真解码）**、
+  **错开 200ms 接入**；每 5s 采样 RSS/fd/服务端 CPU/`/api/stats`；客户端被掐断的尾包**先切到完整 tag 再校验**
+- **判据分两层**（刻意的）：**功能性硬门禁**（每路码流完整可解 / 同时在线 = N 路 / 断开后 100% 回收 /
+  错误日志 0 条 / `--kill-half` 不影响其余 / `--overload` 的接受与拒绝数对得上 `max_subscribers`）；
+  **性能只记基线**（5 分钟的 RSS 斜率噪声大，拿它当门禁会随机翻红）
+- `/api/stats` 增加 `media_source.wakeup{notify, coalesced, notify_rejected, popped}`（聚合**当前在册**订阅者）
+  —— 这是回填 `DESIGN_M5` §8 #9（唤醒合并够不够）**唯一**的数据来源；键名特意与 `counters.rejected`（订阅被拒）
+  区分开（写脚本时踩到过同名抓错值）
+- **修三个真问题**（细节见 `docs/DESIGN_M6.md` §4.9、`RETROSPECTIVE.md` §2.7）：
+  ① **5 分钟跑在 t=61s 时 10 路连接全部断开** —— HTTP-FLV 是服务端**单向推流**，客户端不发数据，
+     FR-4.4 的"读空闲 60s"把正在观看的连接掐掉（3~5 秒的验收永远看不到，NFR-3 的 1 小时更不可能）
+     → 异步流式响应（`setChunkedAsync()`）**关掉该连接的读空闲检测**（写阻塞超时 + TCP keepalive 仍兜底），
+     用例 `ntimed_http_stream_survives_recv_idle`（**变异验证**：把豁免拿掉必红）；
+     同时把 `Session::setRecvIdleTimeout/setSendBlockedTimeout` 改成**允许运行期修改**（检查周期不随之变密）
+  ② **"对端消失"被当成服务器故障，而且四处各错一次**（`Session::emitError` 的级别、`Socket::send/recv`、
+     `Buffer::readFromFd`、`onEvent` 的分支顺序）→ 一台 5 路被 kill 的客户端留下 **10 条 `[E]`**，
+     NFR-3 的"错误日志 0 条"从此不可测 → `core/util` 新增纯函数 `isPeerGoneErrno()`
+     （`EPIPE/ECONNRESET/ECONNABORTED/ENOTCONN/ETIMEDOUT`）+ `Session::closeLogLevel()`
+     （**public static**，可测）+ 三处日志分级；**类型与计数一律不变**（既有 onError 断言与计数不受影响）
+  ③ **`EPOLLHUP/EPOLLERR` 时先判错就 return** → 缓冲区里对端剩下的数据被丢掉，且原因被硬编码成
+     `recv-failed (errno=0)`（排障毫无信息）→ `onEvent` 顺序改为 **先写 → 再读 → 最后判错误事件**；
+     真"挂断且无数据可读"才报 `PeerClosed`。顺带 `emitError` 的日志补上 `err.what()`
+     （**这条没有确定性单测**：依赖内核事件组合且 `onEvent` 是 private，证据是 poller 注释与代码的矛盾 +
+     并发脚本 Error 计数 10→0，补测留 M7）
+- **回填 `docs/DESIGN_M5.md` §8**（拿真实数据逐条定，含"数据不足就不改"）：#1 `max_subscribers=16` **保持**
+  （实测恰好接受到 16、第 17 路被拒 503）；#7 **不加**包数硬顶（源端仅 ≈68 包/s）；#8 **不升级**
+  `FrameQueue` 锁粒度（10 路时服务端单核 CPU 4.11%，锁竞争证据不存在）；#9 唤醒合并**够**
+  （1.4 包/唤醒、33% 被合并）；#13 节流基准**不改**（音画偏移峰值 2.0ms，远小于一帧 40ms）；
+  #5/#6/#10/#14 标注已完成
+- **验收实测（10 路 × 300s，`--loop` + 2 秒样本 = 150 次循环重开）**：10/10 路码流完整可解
+  （视频 7426 帧 / 预期 7500）；服务端 **CPU 单核 4.11%**（整机 1.03%；NFR-4 是"单路 <5%"，这是十路合计）；
+  RSS 稳态段 232s **仅 +24 kB → 折算 0.36 MB/h**（NFR-3 要求 <5MB/h；折算口径，1 小时真跑留 M7）；
+  fd 运行期恒为 30、断开后回到基线 19；丢帧 0；错误日志 **0 条**（Warn 12 条 = 对端消失）；
+  `--overload 8`：接受 6 / 拒绝 2（`max_subscribers=16` 真的在生效）
+- 测试：`ntimed_session_close_log_level`（23 断言：级别映射 + "只改级别不改类型"）、
+  `ntimed_http_stream_survives_recv_idle`（单向推流不被读空闲掐）、`ntimed_media_*` 扩充（`wakeup` 聚合 +
+  括号配平）→ 全库 **245 用例**；`concurrent_test.sh` 加入验证清单（`--quick` 10 项全绿）
+- 文档：`DESIGN_M6`（§4.9 三个真问题、§5.5 用例与判据、风险 14~16、未决 11~13）、
+  `DESIGN_M5`（§1 状态行 + §8 全部回填）、`TESTING`（§5/§6 改成跑脚本 + 实测基线表 + ASAN 长跑）、
+  `ROADMAP`、`README`（验证清单）、`RETROSPECTIVE` §2.7、本文件
+
 ### 说明
 - `v0.1.0` 尚未发布。按 `VERSIONING.md`，tag 只能打在**可独立构建且测试通过**的提交上。
 - M1（Core 层）已完成并推送；后续进入 M2（网络层：EventPoller / TcpServer / Session）。

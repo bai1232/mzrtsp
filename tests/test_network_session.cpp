@@ -15,6 +15,7 @@
 
 #include "test_main.h"
 
+#include "core/logger.h"  // M6-d：Session::closeLogLevel 返回 LogLevel
 #include "core/util.h"
 #include "network/session.h"
 #include "network/tcp_server.h"
@@ -592,4 +593,47 @@ MZ_TEST(ntimed_session_shutdown_after_flush) {
         server->shutdown();
         poller->shutdown();
     }
+}
+
+MZ_TEST(ntimed_session_close_log_level) {
+    // M6-d：**正常断开不该记 Error**。
+    // 背景（实测）：并发脚本里 10 路客户端播完自己断开 → 服务端日志出现 10 条
+    // `[E] Session[...] 关闭：peer-closed`，于是 NFR-3 的"错误日志 0 条"这条验收
+    // 立刻失去意义（而且会训练读者忽略 Error）。
+    // 判据做成 public static 纯函数就是为了这条用例能断言它（日志散在 emitError 里没法测）。
+    using ErrType = SockException::ErrType;
+    // 正常收尾 → Info
+    MZ_ASSERT_EQ(Session::closeLogLevel(SockException(ErrType::None)), LogLevel::Info);
+    MZ_ASSERT_EQ(Session::closeLogLevel(SockException(ErrType::PeerClosed)), LogLevel::Info);
+    MZ_ASSERT_EQ(Session::closeLogLevel(SockException(ErrType::Shutdown)), LogLevel::Info);
+    // 异常一律**保持 Error**（不顺手改语义：那会让"错误日志"变成主观判断）
+    MZ_ASSERT_EQ(Session::closeLogLevel(SockException(ErrType::Timeout)), LogLevel::Error);
+    MZ_ASSERT_EQ(Session::closeLogLevel(SockException(ErrType::RecvOverflow)), LogLevel::Error);
+    MZ_ASSERT_EQ(Session::closeLogLevel(SockException(ErrType::SendOverflow)), LogLevel::Error);
+    MZ_ASSERT_EQ(Session::closeLogLevel(SockException(ErrType::Rejected)), LogLevel::Error);
+    MZ_ASSERT_EQ(Session::closeLogLevel(SockException(ErrType::AcceptError)), LogLevel::Error);
+    MZ_ASSERT_EQ(Session::closeLogLevel(SockException(ErrType::SendFailed)), LogLevel::Error);
+    MZ_ASSERT_EQ(Session::closeLogLevel(SockException(ErrType::RecvFailed)), LogLevel::Error);
+
+    // 【同一概念的另外半边】"对端消失"也不是服务器故障：客户端被杀/关页面/断网时
+    // send 会拿 EPIPE、recv 会拿 ECONNRESET。实测（并发脚本 kill 一半客户端）：
+    // 5 路被 kill → 10 条 Error（send-failed + recv-failed + 应用层 abortFn）。
+    MZ_ASSERT_TRUE(isPeerGoneErrno(EPIPE));
+    MZ_ASSERT_TRUE(isPeerGoneErrno(ECONNRESET));
+    MZ_ASSERT_TRUE(isPeerGoneErrno(ECONNABORTED));
+    MZ_ASSERT_TRUE(isPeerGoneErrno(ENOTCONN));
+    MZ_ASSERT_FALSE(isPeerGoneErrno(ENOBUFS)); // 缓冲区不够是**我们的**问题 → 必须留 Error
+    MZ_ASSERT_FALSE(isPeerGoneErrno(0));
+    MZ_ASSERT_EQ(Session::closeLogLevel(SockException(ErrType::SendFailed, EPIPE)), LogLevel::Warn);
+    MZ_ASSERT_EQ(Session::closeLogLevel(SockException(ErrType::SendFailed, ECONNRESET)),
+                 LogLevel::Warn);
+    MZ_ASSERT_EQ(Session::closeLogLevel(SockException(ErrType::RecvFailed, ECONNRESET)),
+                 LogLevel::Warn);
+    MZ_ASSERT_EQ(Session::closeLogLevel(SockException(ErrType::RecvFailed, 0)), LogLevel::Error);
+    MZ_ASSERT_EQ(Session::closeLogLevel(SockException(ErrType::SendFailed, ENOBUFS)),
+                 LogLevel::Error);
+    // 关键不变式：**只改日志级别，不改类型**（既有 onError 断言与计数依赖 type）
+    const SockException peer_gone(ErrType::SendFailed, EPIPE, "写不出去");
+    MZ_ASSERT_EQ(peer_gone.type(), ErrType::SendFailed);
+    MZ_ASSERT_EQ(peer_gone.errCode(), EPIPE);
 }

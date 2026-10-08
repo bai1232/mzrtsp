@@ -188,11 +188,37 @@ void Session::emitError(const SockException &err) {
     if (_closing.exchange(true)) {
         return;   // 已经在关闭：不重复通知
     }
-    // 统一在这里记日志：子类覆盖 onError 也不会丢掉"有人报过错"这件事
-    ErrorP("Session[%s:%u] 关闭：%s (errno=%d)",
-           _sock ? _sock->peerIP().c_str() : "-", static_cast<unsigned>(_sock ? _sock->peerPort() : 0),
-           err.typeName(), err.errCode());
+    // 统一在这里记日志：子类覆盖 onError 也不会丢掉"有人报过错"这件事。
+    // 【M6-d】级别由 closeLogLevel() 决定 —— 正常断开（对端关了/我们自己关了）不该记 Error：
+    //   10 路客户端正常断开就是 10 条 Error，NFR-3 的"错误日志 0 条"会立刻失去意义，
+    //   更糟的是训练读者忽略 Error（M6-d 的并发脚本实测抓到的，见 DESIGN_M6 §5.5）。
+    Logger::print(closeLogLevel(err), __FILE__, __LINE__, __func__,
+                  "Session[%s:%u] 关闭：%s (errno=%d %s)",
+                  _sock ? _sock->peerIP().c_str() : "-",
+                  static_cast<unsigned>(_sock ? _sock->peerPort() : 0), err.typeName(),
+                  err.errCode(), err.what());
     shutdownImpl(err);
+}
+
+LogLevel Session::closeLogLevel(const SockException &err) {
+    // 只把两件事从 Error 降级，其余一律保持 Error（顺手改别的语义会让"错误日志"变成主观判断）：
+    //   ① **正常收尾**（None / PeerClosed / Shutdown）：本地关了、对端看完了；
+    //   ② **对端消失**（send/recv 失败但 errno 是 EPIPE/ECONNRESET/…）：客户端被杀、断网、关页面。
+    //      实测（M6-d 并发脚本）：5 路客户端被 kill → 日志里 10 条 Error（send-failed + recv-failed
+    //      + 应用层的 abortFn），于是 NFR-3 的"错误日志 0 条"没法测。
+    // 注意**类型与计数都不变**（仍是 SendFailed/RecvFailed），只改日志级别 →
+    // 既有的 onError 断言、TcpServer 计数、用例全部不受影响。
+    switch (err.type()) {
+    case SockException::ErrType::None:       // 本地 shutdown / 正常收尾
+    case SockException::ErrType::PeerClosed: // 对端关闭（流看完了、客户端走了）
+    case SockException::ErrType::Shutdown:   // 本地正在/已经关闭
+        return LogLevel::Info;
+    case SockException::ErrType::SendFailed:
+    case SockException::ErrType::RecvFailed:
+        return isPeerGoneErrno(err.errCode()) ? LogLevel::Warn : LogLevel::Error;
+    default:
+        return LogLevel::Error;
+    }
 }
 
 bool Session::isShutdown() const {
@@ -211,10 +237,6 @@ void Session::onEvent(int event) {
     if (_closing.load()) {
         return;   // 正在关闭：不再处理任何事件
     }
-    if ((event & EventPoller::EventError) != 0) {
-        emitError(SockException(SockException::ErrType::RecvFailed, 0, "epoll 报告错误事件"));
-        return;
-    }
     // 先写后读：先把积压发出去腾出空间，再收新数据（对回显/代理类服务更友好）
     if ((event & EventPoller::EventWrite) != 0) {
         onWriteEvent();
@@ -222,8 +244,24 @@ void Session::onEvent(int event) {
             return;
         }
     }
+    // 【M6-d 修的 bug】**先读，再判错误事件**。
+    // `EventPoller::toEvent()` 在 EPOLLHUP/EPOLLERR 时刻意**同时**给出 EventRead，注释写着
+    // "让回调有机会先把缓冲区读干净再关闭" —— 但这里原来先判 EventError 就 return 了，
+    // 于是对端挂断时（半关/被杀/发完请求就关）**缓冲区里剩下的数据被直接丢掉**：
+    //   · 对端挂断那条路径全部记成 `recv-failed (errno=0)`（errno 根本没有来源）→ 10 路客户端
+    //     正常断开就是 10 条 Error，NFR-3 的"错误日志 0 条"没法测（并发脚本实测）；
+    //   · 顺序反了之后，读路径会给出真实原因（EOF → PeerClosed；RST → RecvFailed + 真 errno）。
     if ((event & EventPoller::EventRead) != 0) {
         onReadEvent();
+        if (_closing.load()) {
+            return;   // 读路径已经按真实原因关掉了（这条日志更准确）
+        }
+    }
+    if ((event & EventPoller::EventError) != 0) {
+        // 走到这里说明：有挂断/错误事件，但缓冲区里没有可读数据也没读到 EOF。
+        // `PeerClosed`（对端关闭/挂断）才是事实 —— 原来报 `RecvFailed(errno=0)` 是错的原因。
+        emitError(SockException(SockException::ErrType::PeerClosed, 0,
+                                "epoll 报告对端挂断（EPOLLHUP/ERR）"));
     }
 }
 
@@ -507,20 +545,23 @@ void Session::onIdle(uint32_t idle_ms) {
 // ---------------------------------------------------------------------------
 
 bool Session::setRecvIdleTimeout(uint32_t ms) {
-    if (_idle_task) {
-        WarnP("Session::setRecvIdleTimeout 在 start() 之后调用：不生效（检查周期已建立）");
-        return false;
-    }
+    // 【M6-d】允许**运行期**修改（原来一律拒绝）。理由与限制都写清楚：
+    //   · `checkIdle()` 每次都**实时读**这个原子量 → 改动在下一个检查周期生效；
+    //   · 检查周期本身在 `startIdleChecker()` 时算定，**不会**因为调小阈值而变密；
+    //   · `ms = 0` 表示停用该方向检测（HTTP-FLV 就靠它：服务端单向推流的连接
+    //     不能被"读空闲"掐掉，否则看 60 秒就断 —— 实测见 DESIGN_M6 §5.5）。
+    const bool started = static_cast<bool>(_idle_task);
     _recv_idle_ms.store(ms);
+    if (started && ms > 0 && ms < _idle_period_ms) {
+        // 只陈述事实，不拒绝：调用方需要知道"生效最多晚一个周期"
+        WarnP("Session::setRecvIdleTimeout(%u) 小于检查周期 %u：生效最多晚一个周期", ms,
+              _idle_period_ms);
+    }
     return true;
 }
 
 bool Session::setSendBlockedTimeout(uint32_t ms) {
-    if (_idle_task) {
-        WarnP("Session::setSendBlockedTimeout 在 start() 之后调用：不生效");
-        return false;
-    }
-    _send_blocked_ms.store(ms);
+    _send_blocked_ms.store(ms); // 同上：实时读 → 下一个周期生效
     return true;
 }
 

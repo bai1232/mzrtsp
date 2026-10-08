@@ -284,7 +284,12 @@ private:
             // M6-c：**异常终止**出口。流是残缺的（订阅者 broken / 写失败）时，不能发结束块
             // —— 那等于替客户端掩盖"数据丢了"。直接关连接，客户端会明确报传输被截断
             resp.setAbortFn([this]() -> bool {
-                ErrorP("HttpServer: 流式响应异常终止 → 直接关闭连接（不发结束块）");
+                // 走到这里有且只有两种原因：客户端断开导致写出失败（`SinkFailed`）、
+                // 或订阅者 broken（`Aborted`，按 FR-5.2 的丢帧策略处理）。
+                // 两者都**不是服务器故障**：前者是客户端走了，后者的真信号在 FlvSender 的告警
+                // 与 /api/stats 的 dropped/broken 计数里。所以记 Warn ——
+                // 记 Error 会让 NFR-3 的"错误日志 0 条"永远不成立（M6-d 并发脚本实测）。
+                WarnP("HttpServer: 流式响应异常终止 → 直接关闭连接（不发结束块）");
                 shutdown(SockException(SockException::ErrType::Shutdown, 0,
                                        "stream aborted (broken/failed)"));
                 return true;
@@ -314,6 +319,14 @@ private:
         }
 
         if (resp.chunked()) {
+            // 【M6-d 修的 bug】异步流式响应 = **服务端单向推流**，客户端不会再发数据。
+            // 读空闲检测（FR-4.4 默认 60s）会把正在观看的连接掐掉 —— 实测 5 分钟并发验收
+            // 在 **t=61s** 时 10 路连接全部被关（M6-c 的 3~5 秒验收看不到它，NFR-3 的 1 小时更不可能）。
+            // 关掉读侧检测 ≠ 放弃检测：**写阻塞超时（30s）+ TCP keepalive** 仍负责发现死连接
+            // （死客户端不再读 → 发送队列积压 → send_blocked 触发）。
+            if (resp.chunkedAsync()) {
+                (void) setRecvIdleTimeout(0);
+            }
             // 处理器自己把头和块发出去了：这里只兜底收尾
             // （忘了发结束块会让客户端一直等 —— 那是"静默的挂住"，必须吵出来）
             // 注意：**异步流式**（M6-b 的 FLV）不兜底 —— 它的结束块由处理器在流结束时自己发，

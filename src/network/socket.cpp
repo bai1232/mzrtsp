@@ -13,6 +13,7 @@
 #include "network/socket.h"
 
 #include "core/logger.h"
+#include "core/util.h"
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -329,7 +330,13 @@ ssize_t Socket::send(const void *data, size_t len, int flags) {
     const ssize_t n = ::send(_fd, data, len, flags | MSG_NOSIGNAL);
     if (n < 0 && !isEagain(errno)) {
         // EAGAIN 不是错误（调用方要去等 EPOLLOUT），不能打日志：否则一个慢客户端就能刷屏
-        ErrorP("Socket::send 失败 (fd=%d, errno=%d %s)", _fd, errno, std::strerror(errno));
+        // 【M6-d】对端消失（EPIPE/ECONNRESET）记 Warn：客户端被杀/关页面是常态，不是服务器故障
+        const int err = errno;
+        if (isPeerGoneErrno(err)) {
+            WarnP("Socket::send 对端已消失 (fd=%d, errno=%d %s)", _fd, err, std::strerror(err));
+        } else {
+            ErrorP("Socket::send 失败 (fd=%d, errno=%d %s)", _fd, err, std::strerror(err));
+        }
     }
     return n;
 }
@@ -340,7 +347,12 @@ ssize_t Socket::recv(void *buf, size_t len, int flags) {
     }
     const ssize_t n = ::recv(_fd, buf, len, flags);
     if (n < 0 && !isEagain(errno)) {
-        ErrorP("Socket::recv 失败 (fd=%d, errno=%d %s)", _fd, errno, std::strerror(errno));
+        const int err = errno;
+        if (isPeerGoneErrno(err)) {
+            WarnP("Socket::recv 对端已消失 (fd=%d, errno=%d %s)", _fd, err, std::strerror(err));
+        } else {
+            ErrorP("Socket::recv 失败 (fd=%d, errno=%d %s)", _fd, err, std::strerror(err));
+        }
     }
     return n;
 }

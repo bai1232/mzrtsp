@@ -690,3 +690,61 @@ MZ_TEST(ntimed_http_api_stats_extra_provider) {
 
     ::close(cli);
 }
+
+MZ_TEST(ntimed_http_stream_survives_recv_idle) {
+    // ★ M6-d 修的 bug（**5 分钟**并发验收才抓到，3~5 秒的验收永远看不到）：
+    //   HTTP-FLV 是服务端**单向推流**，客户端全程不发一个字节；而 FR-4.4 的"读空闲 60s"
+    //   会在第 60 秒把正在观看的连接掐掉 —— 实测 10 路 × 5 分钟的跑法在 t=61s 全部断开。
+    //   修法：**异步流式响应**（`setChunkedAsync()`）关掉该连接的读空闲检测
+    //   （写阻塞超时 + TCP keepalive 仍然兜底，见 DESIGN_M6 §5.5）。
+    //   本用例把读空闲压到 300ms：修前连接必被关（recv 返回 0 = EOF），修后保持打开（EAGAIN）。
+    ServerFixture fx;
+    MZ_ASSERT_TRUE(fx.setup([](HttpServer &server) {
+        MZ_ASSERT_TRUE(server.setSessionTimeout(300, 0)); // 读空闲 300ms、写阻塞不检测
+        MZ_ASSERT_TRUE(server.setRoute("/drip", [](const HttpParser &, HttpResponse &resp) {
+            if (!resp.beginChunked()) {
+                resp.setStatus(500);
+                return;
+            }
+            (void) resp.setChunkedAsync();   // ★ 声明"异步流式"：框架别兜底结束、读空闲也别管我
+            (void) resp.sendChunk("x\n", 2);
+        }));
+    }));
+
+    const int cli = connectTo(fx.server->port());
+    MZ_ASSERT_GT(cli, 0);
+    MZ_ASSERT_TRUE(sendAll(cli, "GET /drip HTTP/1.1\r\n\r\n"));
+
+    // 读掉响应头（此后客户端**一个字节都不发**）
+    std::string head;
+    char buf[512];
+    const uint64_t deadline = getCurrentMillisecond() + 1000;
+    while (getCurrentMillisecond() < deadline && head.find("\r\n\r\n") == std::string::npos) {
+        const ssize_t n = ::recv(cli, buf, sizeof(buf), 0);
+        if (n <= 0) {
+            break;
+        }
+        head.append(buf, static_cast<size_t>(n));
+    }
+    MZ_ASSERT_TRUE(head.find("200") != std::string::npos);
+    MZ_ASSERT_TRUE(head.find("chunked") != std::string::npos);
+
+    // 把已经到达的字节**全部排空**：响应头与第一块可能分两个包到达，
+    // 残留的那一块会让后面的探测读到数据（曾经因此在全量上下文里变成假红）。
+    // 排空之后客户端**一个字节都不发** → 之后读到的任何东西都只可能是"服务端推了"或"连接被关"。
+    sleepMs(100);
+    while (::recv(cli, buf, sizeof(buf), MSG_DONTWAIT) > 0) {
+    }
+
+    // 空闲检查周期会被 clamp 到 ≥1s（见 session.cpp 的 idleCheckPeriod）→ 等 1.5s 才跨过第一个检查点
+    sleepMs(1500);
+    // 非阻塞探测（不依赖 SO_RCVTIMEO 的语义）：
+    //   修前 = 0（连接被读空闲关掉，EOF）→ 本用例为红；修后 = -1 + EAGAIN（连接还开着）
+    errno = 0;
+    const ssize_t n = ::recv(cli, buf, sizeof(buf), MSG_DONTWAIT);
+    MZ_ASSERT_TRUE(n < 0);
+    if (n < 0) {
+        MZ_ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK);
+    }
+    ::close(cli);
+}

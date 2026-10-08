@@ -35,6 +35,11 @@
 
 namespace mzmedia {
 
+// 前向声明：`closeLogLevel()` 的返回值需要它。刻意**不**在这里 include `core/logger.h` ——
+// 这个头被 `http/`、`network/` 广泛包含，为了一个枚举把日志实现拖进来不划算
+// （`enum class` 指定了底层类型，前向声明与定义兼容）。
+enum class LogLevel : int;
+
 class Session : public std::enable_shared_from_this<Session> {
 public:
     using Ptr = std::shared_ptr<Session>;
@@ -107,6 +112,15 @@ public:
     bool isShutdown() const;
     /// 关闭原因；**只在 poller 线程读**（TcpServer 的移除通知里、以及用例里）
     const SockException &lastError() const;
+
+    /**
+     * 【M6-d】关闭时该按什么级别记日志
+     * @note 正常收尾（`None` / `PeerClosed` / `Shutdown`）→ `Info`；其余（超时 / 溢出 / send-recv 失败 / …）→ `Error`
+     * @note 做成 **public static 纯函数**是为了**可测**：日志级别散落在 `emitError()` 里就没法断言，
+     *       而"NFR-3 错误日志 0 条"这条验收完全依赖它（10 路客户端正常断开 = 10 条 Error 的话，
+     *       这条需求就没法测了）。用例：`ntimed_session_close_log_level`
+     */
+    static LogLevel closeLogLevel(const SockException &err);
 
     // ------------------------------------------------------------------
     // 发送

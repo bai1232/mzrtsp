@@ -108,6 +108,43 @@
   然后做**反证**（拿掉它，`--loop --speed 4` 拉 3 秒，加/不加都是约 12.0 秒媒体时长）→ 无可观测差别，
   于是**删掉**。这验证了 `AI_COLLAB` 那条纪律的价值：**验证不了的复杂度就是负债**（留着的话，半年后没人敢删）。
 
+### 2.7 ✅ M6-d：一个概念在**四处**各错一次 ——"对端消失"被当成服务器故障（2026-10-08）
+
+**怎么发现的**：M6-d 的并发脚本有一条"服务端错误日志 0 条"（NFR-3 的原文）。第一次跑 `--quick --kill-half`：
+10 路客户端，其中 5 路被 kill → 日志里 **10 条 `[E]`**。逐条看，全是同一个概念在四处的不同表现：
+
+| # | 位置 | 现象 | 为什么错 |
+|---|---|---|---|
+| 1 | `Session::emitError()` | 正常断开（`peer-closed`）也打 Error | 客户端播完/走了是**常态**，不是故障 |
+| 2 | `Socket::send/recv` | `EPIPE`/`ECONNRESET` 打 Error | 对端被杀/RST 的必然结果 |
+| 3 | `Buffer::readFromFd` | 读失败（`ECONNRESET`）打 Error | 同上；读到 RST 而已 |
+| 4 | `Session::onEvent()` | `EPOLLHUP/ERR` **先判错误就 return** | 见下（这条最严重） |
+
+第 4 条是一次"读代码才发现"的**真 bug**：`EventPoller::toEvent()` 在 `EPOLLHUP|EPOLLERR` 时刻意
+**同时**给出 `EventRead`，注释写着"让回调有机会先把缓冲区读干净再关闭"；但 `Session::onEvent()`
+**先判 `EventError` 就 return** —— 于是对端挂断时缓冲区里剩下的数据**被直接丢掉**，
+而且原因被硬编码成 `recv-failed (errno=0)`（errno 根本没有来源，排障时毫无信息）。
+
+**修法（一个概念，四处收口）**：
+1. `core/util.h` 新增纯函数 `isPeerGoneErrno(errno)`（`EPIPE`/`ECONNRESET`/`ECONNABORTED`/`ENOTCONN`/`ETIMEDOUT`）；
+2. `Session::closeLogLevel()`（**public static 纯函数**，可测）把"正常收尾 + 对端消失"降为 `Info`/`Warn`，
+   **类型与计数一律不变**（`SendFailed`/`RecvFailed` 照旧 → 既有 onError 断言与计数不受影响）；
+3. `Socket::send/recv`、`Buffer::readFromFd` 的日志按同一个判定分 `Warn`/`Error`；
+4. `onEvent()` 改成 **先写 → 再读 → 最后才判错误事件**（读路径会给出真实原因：EOF → `PeerClosed`；
+   RST → `RecvFailed` + **真 errno**），真正的"挂断且无数据可读"才落到 `PeerClosed`；
+5. `emitError()` 的日志补上 `err.what()`（原来只打 type+errno，同一句 `recv-failed (errno=0)`
+   无法区分是四条路径里的哪一条）。
+
+**验证**：`--quick --kill-half` 的 Error 从 **10 → 4 → 1 → 0**（每修一处降一次），Warn 26 条
+（对端消失的诚实信号）；`ntimed_session_close_log_level` 用例 23 条断言锁住级别映射与
+"只改级别不改类型"的不变式。
+
+**没做到的部分（诚实记录）**：第 4 条的"先读后判"**没有确定性单测** ——
+它依赖内核的事件组合（`EPOLLHUP` 与可读数据同现），`SO_LINGER=0` 造 RST 会把接收缓冲里
+的数据一起丢掉、半关闭（`shutdown(SHUT_WR)`）又不会产生 `EPOLLHUP`；而 `onEvent()` 是 private，
+用例无法直接驱动它。目前的证据是：poller 注释与代码的矛盾（明确的设计意图）+ 并发脚本的
+日志计数从 10 降到 0。**这条要留到 M7 一起想（要么把 onEvent 提到 protected，要么加一个事件注入的测试钩子）。**
+
 ## 3. 测量工具与误判（**复用价值最高的一节**）
 
 > 这一节的价值高于 §2：§2 复用的是"某个坑的修法"，这一节复用的是**方法**。
@@ -212,6 +249,8 @@
 | 9 | 补齐 **H264 裸流**输入：Annex-B → AVCC + 现场构造 avcC | H.264 语法（起始码 / NAL / 防竞争字节）/ MP4 与 FLV 的封装差异 | 纯函数 7 用例逐字节 + 端到端三重判定（`ffprobe` / `ffmpeg` / python 逐 tag 复解 AVCC 结构） |
 | 10 | 用**反证**删掉自己刚写的"优化"：循环重开时重置节流基准 | 复杂度预算 / 可验证性 | 加/不加都是约 12.0 秒媒体时长（`--loop --speed 4` 拉 3 秒）→ 无可观测差别 → 删除并记录 |
 | 11 | 抓出三类**单测全绿但串起来会红**的缺陷（挂住 / 时间戳回退 / 该释放的不释放） | 端到端验证 / 生命周期归属 / 整数时间戳精度 | 修前：`curl rc=28` 挂满超时、ffmpeg 每 2s 报 dts 回退、源 60s 后被释放；修后各有用例 + 脚本回归（§2.6） |
+| 12 | 用 **10 路 × 5 分钟**的真实负载回填媒体层五个"待定参数"，结论是**五个都不改** | 容量规划 / 用数据否掉自己的优化冲动 | 服务端 **CPU 单核 4.11%**（十路合计）、RSS 稳态 **0.36 MB/h**、唤醒 **1.4 包/次**、源端 68 包/s、音画偏移 **2.0ms** → 锁粒度/包数硬顶/节流基准都"数据不支持改动"（§2.7、`DESIGN_M5` §8） |
+| 13 | 定位并修复"**长连接被自己的空闲检测掐断**"：10 路在 t=61s 全部断开 | HTTP 单向推流 vs 双向空闲检测 / 把"显式声明"当协议契约 | 修前 `subscribers` 在 61s 归零；修后 5 分钟全程 10 路；用例 + **变异验证**（拿掉豁免必红） |
 
 ---
 
@@ -219,21 +258,20 @@
 
 ### 7.1 未做（具体，不是免责声明）
 
-> 快照时间：**M6-c 完成**（v0.1.0 已端到端可播；M1–M6-c 全部完成并推送）
+> 快照时间：**M6-d 完成**（v0.1.0 端到端可播，10 路 × 5 分钟验收通过；M1–M6-d 全部完成并推送）
 
-- **M6-d**：10 路并发 / 5 分钟播放验收脚本 + 拿真实数据回填 `DESIGN_M5` §8 的未决
-  （锁粒度、包数硬顶、唤醒合并、`max_subscribers`）
-- **M7**：集成验收、文档补齐、性能数据采集、`v0.1.0` 打 tag
+- **M7**：集成验收、文档补齐、性能数据采集、**1 小时长跑（NFR-3 原文，含 ASAN 版本）**、`v0.1.0` 打 tag
 - **MKV / TS 输入**（`FR-2.2`）：代码走的是同一条"extradata 判断"路径，但**没有样本实测**
   → 目前算"未验证"，不算"支持"
 - high profile 裸流的 avcC 扩展字段（chroma_format 等）未写、也无 high profile 样本实测
-- `onMetaData` / AVC end-of-sequence tag 仍**不发**（M6-c 实测 flv.js/ffplay 都不需要）
+- `onMetaData` / AVC end-of-sequence tag 仍**不发**（实测 flv.js/ffplay 都不需要）
+- **单向响应的读空闲语义通用化**（本批只豁免"显式声明异步流式"的连接；大文件下载等仍会被 60s 读空闲掐）
+- **`onEvent()` 事件顺序（先读后判错误）缺确定性用例**（M6-d 已修，但只有间接证据）
 - POST / body 不支持（一律 405）
 - `timer_precision` 的计时门禁在**单进程全量上下文**下会红（另案，§2.4 遗留；规矩见 `docs/TESTING.md` §2.2）；
   ASAN 下的容差也尚未按 TSAN 的先例放宽
 - 文档债：`ARCHITECTURE.md` §2 模块职责仍写成"规划"（`stats/`、`IMediaSink`、`Remuxer`/`Transcoder` 尚未落地）；
-  SPEC 的 FR/NFR 条目在 ROADMAP/TESTING 里的引用已补全（M6-c），但 `DESIGN_M3`/`DESIGN_M4` 的 §9 未决项
-  有一两条状态没回填
+  `DESIGN_M3`/`DESIGN_M4` 的 §9 未决项还有一两条状态没回填
 
 ### 7.2 假设
 

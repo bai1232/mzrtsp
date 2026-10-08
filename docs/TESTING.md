@@ -142,40 +142,48 @@ ffmpeg -v error -i /tmp/raw.flv -f null -
 `flv.min.js` / `flvjs.createPlayer` / `/live/`，且 `GET /flv.min.js` 与入库文件**逐字节一致** ——
 这能证明"浏览器要的东西确实能取到"，但**不能**证明真实渲染（那需要人看一眼）。
 
-## 5. 稳定性（1 小时长跑）
+## 5. 稳定性与并发（`scripts/concurrent_test.sh`）
 
 ```bash
-# 用 ASAN 构建，暴露内存与 fd 问题
-cmake -B build-asan -DMZMEDIA_ENABLE_ASAN=ON -DCMAKE_BUILD_TYPE=Debug
-cmake --build build-asan -j
-
-# 长跑 + 每 60s 采样 RSS 与 fd 数
-./build-asan/bin/mzmedia -f media/sample.mp4 -p 8080 &
-for i in $(seq 1 60); do
-  pid=$(pgrep -f "bin/mzmedia" | head -1)
-  echo "$(date +%T) rss=$(awk '/VmRSS/{print $2}' /proc/$pid/status)kB fd=$(ls /proc/$pid/fd | wc -l)"
-  curl -s http://127.0.0.1:8080/api/stats >> /tmp/stats.log
-  sleep 60
-done
+./scripts/concurrent_test.sh --quick         # 10 路 × 20s：回归门禁（功能性硬判据）
+./scripts/concurrent_test.sh                 # 10 路 × 5 分钟：NFR-2/3/4/6 + 性能基线（M6-d 验收）
+./scripts/concurrent_test.sh --kill-half     # 专项：中途 kill 一半，其余路必须不受影响
+./scripts/concurrent_test.sh --overload 8    # 专项：压 max_subscribers（第 17 路起必须被拒）
+./scripts/concurrent_test.sh --duration 3600 # 1 小时（NFR-3 原文）→ M7 发版前执行
 ```
 
-**通过标准（NFR-3）**：RSS 增长 < 5MB/h、fd 数稳定不增长、ASAN 无报错、日志无 `Error`。
+**判据分两层**（性能不设死阈值 —— 5 分钟的 RSS 斜率噪声大，拿它当门禁会随机翻红）：
 
-## 6. 压测（并发，NFR-2）
+| 类别 | 判据 |
+|---|---|
+| **功能性（硬门禁）** | 每路都拿到**完整可解码**的码流（h264 + 帧数在预期区间 + `ffmpeg -f null -` 无 error）；运行期间**同时在线 = N 路**（NFR-2）；断开后订阅者归零/源被释放、fd 回落（NFR-6）；服务端**错误日志 0 条**（NFR-3）；`--kill-half` 后其余路不受影响且被 kill 的自动退订；`--overload` 的接受/拒绝数与 `max_subscribers` 一致 |
+| **性能（只记基线）** | 服务端 CPU（单核%）、RSS 斜率（含折算 MB/h）、fd 曲线、`wakeup`（`notify`/`coalesced`/`popped`）、源端包/s、丢帧计数、音画偏移峰值 |
+
+**M6-d 实测基线**（10 路 × 300s，`--loop` + 2 秒样本 = **150 次循环重开**，4 核机器）：
+
+| 指标 | 实测 | 对照要求 |
+|---|---|---|
+| 每路码流 | 10/10 完整可解（视频 7426 帧 / 预期 7500，容差内） | NFR-2 ✅ |
+| 服务端 CPU | **单核 4.11%**（整机 1.03%） | NFR-4「单路 < 5% 单核」——这是**十路合计** ✅ |
+| RSS | 基线 25.1MB → 结束 35.1MB（订阅者队列/GOP 预分配）；**稳态段 232s 仅 +24 kB → 折算 0.36 MB/h** | NFR-3「< 5MB/h」✅（折算口径；1 小时真跑留 M7） |
+| fd | 运行期恒为 30；断开后回落到基线 19 | NFR-6 ✅ |
+| 丢帧 | `dropped=0`、`dropped_incoming=0`（10 路 1x 下队列余量充足） | FR-5.1/5.2 未触发（慢客户端场景由单测覆盖） |
+| 唤醒合并 | `notify` 30687 / `coalesced` 10249（33%）/ `popped` 41130 → **1.4 包/唤醒** | 回填 `DESIGN_M5` §8 #9：够用 |
+| 吞吐 | 源端 ≈68 包/s（每路 6.8 包/s） | 回填 #7（不需要包数硬顶）、#8（不需要升级锁粒度） |
+| 音画 | 视频跨度 299.960s、音频 299.981s、**偏移峰值 2.0 ms** | 回填 #13（混合 dts 对齐不漂；一帧 = 40ms） |
+| 错误日志 | `[E]`/`[F]` = 0 条（Warn 12 条，都是"对端消失"） | NFR-3 ✅ |
+
+> **怎么读这张表**：`--loop` 让源在 5 分钟里重开 150 次，所以 RSS 平坦同时证明了"直播推流不涨内存"
+> 和"循环重开不漏内存"；而 CPU 是在**客户端解码另占 CPU** 的情况下测的服务端进程时间 → 偏保守。
+> 完整原始采样在 `/tmp/mzmedia_concurrent/{samples.csv,perf.txt,server.log}`。
+
+### 5.1 长跑必须用 ASAN 再跑一遍（NFR-3 的"ASAN 无报错"）
 
 ```bash
-# 10 路同源并发，各自拉 60s
-for i in $(seq 1 10); do
-  timeout 60 ffmpeg -hide_banner -loglevel error \
-    -i http://127.0.0.1:8080/live/sample.flv -c copy -f null - &
-done
-wait
-curl -s http://127.0.0.1:8080/api/stats | python3 -m json.tool
+cmake -B build-asan -DMZMEDIA_ENABLE_ASAN=ON && cmake --build build-asan -j4
+MZMEDIA_SERVER=./build-asan/bin/mzmedia ./scripts/concurrent_test.sh --quick   # 先冒烟
+# M7 发版前：用 ASAN 版本跑 --duration 3600
 ```
-
-**通过标准**：10 路全部正常结束、无崩溃、11 路接入时按配置拒绝或排队、`/api/stats` 客户端数与预期一致。
-
-**专项用例**：接入 10 路后**故意 kill 其中 5 路**，确认源任务继续、剩余 5 路不受影响、资源回收（NFR-6）。
 
 ## 7. 需求 → 验证手段对照
 
@@ -183,8 +191,8 @@ curl -s http://127.0.0.1:8080/api/stats | python3 -m json.tool
 |---|---|
 | SC-1 浏览器能播 | 内置测试页 + flv.js（第 4 节） |
 | SC-2 加格式不改核心 | 代码走查：新增 sink 是否只实现 `IMediaSink` 且未改动 `media/`、`network/` |
-| SC-3 多客户端不崩 | 压测（第 6 节） |
-| SC-4 1 小时稳定 | 长跑（第 5 节） |
+| SC-3 多客户端不崩 | 并发/长跑脚本（第 5 节）：10 路并发，每路码流完整可解、无崩溃 |
+| SC-4 1 小时稳定 | 第 5 节（`--duration 3600`，**M7 发版前执行**；M6-d 已用 5 分钟版跑通全部判据） |
 | NFR-1 首帧 <1s | 浏览器 Performance 面板 / 日志打点（请求到首字节） |
 | NFR-4 remux CPU <5% | `top -H -p $(pgrep mzmedia)` 观察单路负载 |
 | NFR-5 转码 ≥1.0x | `/api/stats` 的 `speed` 字段 |
@@ -297,23 +305,23 @@ cmake -B build-tsan -DMZMEDIA_ENABLE_TSAN=ON -DCMAKE_CXX_COMPILER=g++-12
 
 ### 8.6 当前基线
 
-**M6-c 实测**（`./scripts/tsan.sh`，g++-12 运行时；**全绿，0 报告**）：
+**M6-d 实测**（`./scripts/tsan.sh`，g++-12 运行时；**全绿，0 报告**）：
 
 | 分组 | 用例数 | TSAN 报告 |
 |---|---|---|
 | 严格组（18 组）：`selftest` / `util` / `logger` / `queue` / `pool` / `semaphore` / `core` / `poller` / `timer` / `buffer` / `http` / `ntimed_http` / `ffmpeg` / `media` / `ntimed_media` / `srcmgr` / `flv` / `producer` | 278 | **0** |
-| 含超时等待的组：`qtimed` / `ptimed` / `ntimed` | 41 | **0**（g++-12 运行时已无第 8.2 节的误报） |
-| 合计（脚本统计） | **317** | 真问题 **0** |
+| 含超时等待的组：`qtimed` / `ptimed` / `ntimed` | 43 | **0**（g++-12 运行时已无 §8.2 的误报） |
+| 合计（脚本统计，含跨组重复计数） | **321** | 真问题 **0** |
 
 **同批其它门禁**（`VERSIONING.md` 发版清单里的项目）：
 
-| 门禁 | 命令 | M6-c 实测 |
+| 门禁 | 命令 | M6-d 实测 |
 |---|---|---|
-| 单元（串行） | `cd build && ctest --output-on-failure` | **21/21 分组通过**（243 用例；**不要**加 `-j`，见 §2.2） |
+| 单元（串行） | `cd build && ctest --output-on-failure` | **21/21 分组通过**（**245 用例**；**不要**加 `-j`，见 §2.2） |
 | 单元（ASAN） | `cmake -B build-asan -DMZMEDIA_ENABLE_ASAN=ON && cd build-asan && ctest` | **21/21 通过** |
-| 单进程全量 | `./build/bin/mzmedia_unittest` | **243/243 用例、61,254 条断言**（诊断用，不作为计时门禁） |
+| 单进程全量 | `./build/bin/mzmedia_unittest` | **245/245 用例、61,293 条断言**（诊断用，不作为计时门禁） |
 | 编译 | `cmake --build build` | **0 warning / 0 error**（`-Wall -Wextra`，无任何 `-Wno-`；ASAN 构建同样 0） |
-| 脚本验收 | `scripts/{http,flv_mux,flv_http}_test.sh` | **全绿**（M3 / 8 项 / **49 项**） |
+| 脚本验收 | `scripts/{http,flv_mux,flv_http,concurrent}_test.sh` | **全绿**（M3 / 8 项 / **49 项** / **10 路 × 5 分钟**） |
 
 > 分组按**用例名子串**匹配，因此个别用例会同时属于两个组
 > （如 `logger_queue_overflow_drop` 同时属于 `logger` 与 `queue`）。上表为去重后的数字。

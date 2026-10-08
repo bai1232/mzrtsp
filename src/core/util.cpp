@@ -394,4 +394,22 @@ bool saveFile(const std::string &path, const std::string &data) {
     return true;
 }
 
+bool isPeerGoneErrno(int err) {
+    // 只列"确定是对端没了"的几个：
+    //   EPIPE       写一个已经收到 FIN 的 socket（对端的 read 侧已关）
+    //   ECONNRESET  对端 RST（进程被杀、连接被中间设备重置）
+    //   ECONNABORTED / ENOTCONN / ETIMEDOUT  连接被中止 / 未连接 / 超时
+    // 刻意**不**把 EMFILE/ENOBUFS/EACCES 之类算进来 —— 那些是我们的问题，必须留 Error
+    switch (err) {
+    case EPIPE:
+    case ECONNRESET:
+    case ECONNABORTED:
+    case ENOTCONN:
+    case ETIMEDOUT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // namespace mzmedia

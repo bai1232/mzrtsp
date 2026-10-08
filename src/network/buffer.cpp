@@ -12,6 +12,7 @@
 #include "network/buffer.h"
 
 #include "core/logger.h"
+#include "core/util.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -256,7 +257,14 @@ ssize_t Buffer::readFromFd(int fd, size_t max_bytes, bool *eof, bool *hit_limit,
         if (err != nullptr) {
             *err = errno;
         }
-        ErrorP("Buffer::readFromFd read() 失败 (fd=%d, errno=%d %s)", fd, errno, std::strerror(errno));
+        // 【M6-d】对端消失（ECONNRESET/…）不是本机故障 → Warn（否则 NFR-3 的"错误日志 0 条"没法测）
+        if (isPeerGoneErrno(errno)) {
+            WarnP("Buffer::readFromFd 对端已消失 (fd=%d, errno=%d %s)", fd, errno,
+                  std::strerror(errno));
+        } else {
+            ErrorP("Buffer::readFromFd read() 失败 (fd=%d, errno=%d %s)", fd, errno,
+                   std::strerror(errno));
+        }
         return -1;
     }
 
