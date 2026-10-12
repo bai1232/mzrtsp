@@ -110,6 +110,13 @@ public:
     uint64_t totalBytes() const {
         return _bytes.load();
     }
+    /// 【M7 / FR-6.1】本源的**平均码率**（bit/s）= 累计字节 × 8 / 已运行秒数
+    /// @note 用**单调时钟**算时长；不足 1ms 时返回 0（不制造天文数字）；未打开时为 0
+    uint64_t bitrateBps() const;
+    /// 源打开时刻（单调时钟毫秒；0 = 还没打开）：`/api/stats` 里每源的 `uptime_ms` 用它算
+    uint64_t openedAtMs() const {
+        return static_cast<uint64_t>(_opened_at_ms.load());
+    }
     uint64_t skippedUnknownStreams() const {
         return _skipped_unknown.load();
     }
@@ -166,6 +173,8 @@ private:
     std::string _last_error;
     std::atomic<uint64_t> _packets{0};
     std::atomic<uint64_t> _bytes{0};
+    /// 源打开时刻（单调时钟毫秒）：`bitrateBps()` 的时长基准（0 = 还没打开）
+    std::atomic<int64_t> _opened_at_ms{0};
     std::atomic<uint64_t> _skipped_unknown{0};
     std::atomic<uint64_t> _ts_failures{0};
     std::atomic<uint64_t> _annexb_packets{0};

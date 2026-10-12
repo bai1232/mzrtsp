@@ -423,3 +423,51 @@ MZ_TEST(producer_loop_offsets_timestamps_monotonically) {
                 static_cast<long long>(producer.loopOffsetMs()),
                 static_cast<unsigned long long>(producer.loopCount()));
 }
+
+MZ_TEST(producer_bitrate_and_uptime_are_measured) {
+    // 【M7 / FR-6.1】`/api/stats` 要暴露"每源码率"与"运行时长"——
+    // 数据由 DemuxerProducer 提供，所以语义在这里锁死：
+    //   · 没打开 → 0（没有"码率"可言，不猜）
+    //   · 打开后 → `openedAtMs() > 0`，且读过包之后 `bitrateBps() > 0`
+    //   · 语义是"累计字节 / 已运行时长"的**平均**码率（所以读得比实时快时它会偏高，
+    //     1x 推送时它 ≈ 媒体码率）
+    DemuxerProducer not_opened;
+    MZ_ASSERT_EQ(not_opened.bitrateBps(), 0u);
+    MZ_ASSERT_EQ(not_opened.openedAtMs(), 0u);
+
+    const std::string path = samplePath("sample.mp4");
+    MZ_ASSERT_FALSE(path.empty());
+    if (path.empty()) {
+        return;
+    }
+    DemuxerProducer producer;
+    MZ_ASSERT_TRUE(producer.open(path));
+    MZ_ASSERT_GT(producer.openedAtMs(), 0u);
+
+    // 读满 30 个包（样本 2 秒，全速读约几毫秒 → 平均码率会明显高于媒体码率）
+    MediaPacket::Ptr packet;
+    std::string error;
+    for (int i = 0; i < 30; ++i) {
+        const SourcePump::ReadResult r = producer.read(&packet, &error);
+        MZ_ASSERT_EQ(r, SourcePump::ReadResult::Packet);
+        if (r != SourcePump::ReadResult::Packet) {
+            return;
+        }
+    }
+    const uint64_t bps = producer.bitrateBps();
+    // 注意**不要**断言"这一瞬间算出来是 0"：那是拿"30 个包读完是否 <1ms"当时序前提，
+    // 在 TSAN/ASAN 插桩下必然翻车（TSAN 实测就红了）。"elapsed < 1ms → 返回 0"只是为了
+    // 不做除零的防御分支，不做时序断言。
+    (void) bps;
+    // 等 2ms 之后就有了可信的时长基准 → 码率必须为正
+    sleepMs(2);
+    const uint64_t bps2 = producer.bitrateBps();
+    MZ_ASSERT_GT(producer.totalBytes(), 0u);
+    MZ_ASSERT_GT(bps2, 0u);
+    // 合理性上界：320x240/25fps 的样本不可能到 1 Gbps（这条挡住"时长算错"导致的爆炸值）
+    MZ_ASSERT_TRUE(bps2 < 1000000000u);
+    std::printf("    [ INFO ] 平均码率 %llu bit/s（累计 %llu 字节 / 已运行 %llu ms）\n",
+                static_cast<unsigned long long>(bps2),
+                static_cast<unsigned long long>(producer.totalBytes()),
+                static_cast<unsigned long long>(getCurrentMillisecond() - producer.openedAtMs()));
+}

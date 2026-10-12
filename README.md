@@ -9,9 +9,20 @@
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
 | 设计 | 规格、架构、能力矩阵、验收指标 | ✅ 已定稿 |
-| **v0.1.0** | MP4 / H264 裸流 → **HTTP-FLV**，remux 零拷贝，多客户端共享 | 🚧 开发中（**M1–M6-c 已完成**：端到端可播；M6-d 并发/长跑 + M7 收尾） |
+| **v0.1.0** | MP4 / H264 裸流 → **HTTP-FLV**，remux 零拷贝，多客户端共享 | ✅ **已发布**（tag `v0.1.0`；验收证据见 [docs/ACCEPTANCE_v0.1.0.md](docs/ACCEPTANCE_v0.1.0.md)） |
 | v0.2.0 | MKV / TS 输入、**HLS** 输出、转码 | ⏳ 计划 |
 | v0.3.0 | RTSP 输入、解码处理（滤镜/缩放/水印） | ⏳ 计划 |
+
+### v0.1.0 验收摘要（实测，完整矩阵见验收报告）
+
+| 指标 | 实测 | 要求 |
+|---|---|---|
+| 端到端 | `curl -N …/live/sample.flv` → **55,623 字节**合法 FLV（h264 320x240 + aac / 50 帧 / 解码无 error）；H264 **裸流**同样可拉 | SC-1 |
+| 首帧（NFR-1） | **20 ms 级**（TTFB 3.3 ms） | < 1s |
+| 并发（NFR-2/SC-3） | **10 路 × 5 分钟**：每路完整可解、丢帧 0、断开后 fd 回基准 | ≥10 路不崩 |
+| 稳定性（NFR-3/SC-4） | 5 分钟版稳态 RSS **0.36 MB/h**、错误日志 0 条；**1 小时版见验收报告 §3.3** | <5MB/h |
+| 服务端开销（NFR-4） | **单核 4.11%（十路合计）** ≈ 每路 0.4% | 单路 <5% |
+| 质量（NFR-7） | 清洁构建 **0 warning**；**247 用例 / 21 分组**；ASAN / TSAN 全绿 | 零警告 |
 
 ## 能力矩阵
 
@@ -97,7 +108,7 @@ cmake -B build && cmake --build build -j"$(nproc)"
 
 # 3) 启动服务：零参数 = 0.0.0.0:8080 + 媒体目录 ./samples
 ./build/bin/mzmedia
-#    常用选项：--port 9000 --media-root /data --loop --speed 4 --log-level debug --help
+#    常用选项：--port 9000 --media-root /data --loop --speed 4 --log-level debug --log-file logs/x.log --help
 
 # 4) 看画面（二选一）
 #    浏览器：打开 http://127.0.0.1:8080/ ，点「播放」（页面用的是**入库**的 flv.js，离线可用）
@@ -129,6 +140,15 @@ cd build && ctest                        # 21 个分组（245 个用例），串
 ../scripts/tsan.sh                        # TSAN：严格组 0 报告
 ```
 
+## 部署提示（v0.1.0）
+
+- **默认绑 `0.0.0.0` 且 `/api/stats` 无鉴权**（SPEC 未要求）：对外部署请放在反向代理/内网后面，或用防火墙限制来源。
+- **无 TLS**：纯 HTTP，播放页与拉流都是明文；CORS 按 `FR-4.3` 放开 `Access-Control-Allow-Origin: *`（flv.js 需要）。
+- **日志**默认写 `logs/mzmedia.log`（单文件 64MB、保留最近 5 个，**行缓冲**因此 `tail -f` 实时可见）；
+  注意磁盘空间与轮转（`--log-file` 可改路径，`--log-level` 可调级别）。
+- **端口**用 `--port`；媒体目录用 `--media-root`（`/live/<name>.flv` 在其中按名取文件）。
+- 进程收到 `SIGINT`/`SIGTERM` 会优雅退出（停服务器 → 释放订阅者 → 按空闲规则回收源 → flush 日志）。
+
 ## 文档
 
 | 文档 | 说明 |
@@ -136,6 +156,7 @@ cd build && ctest                        # 21 个分组（245 个用例），串
 | [docs/SPEC.md](docs/SPEC.md) | **需求规格（唯一规格来源）**：能力矩阵、流水线、功能/非功能需求、成功标准 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构设计：分层、线程模型、一源多消费者、资源管理 |
 | [docs/CODEC_MATRIX.md](docs/CODEC_MATRIX.md) | 输入 × 输出的可行性判定（何时 remux、何时必须转码） |
+| [docs/ACCEPTANCE_v0.1.0.md](docs/ACCEPTANCE_v0.1.0.md) | **v0.1.0 验收报告**：逐条 SC/NFR/FR → 状态 + 证据命令 + 实测数字 + 复现步骤 + 未达成清单 |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 里程碑任务分解与风险 |
 | [docs/TESTING.md](docs/TESTING.md) | 验收与测试方法（ffprobe 校验、并发、1 小时长跑） |
 | [docs/DESIGN_M2.md](docs/DESIGN_M2.md) | **网络层设计（M2）**：组件接口形状、机制、分批计划、风险清单、决策记录 |

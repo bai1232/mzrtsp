@@ -70,7 +70,10 @@ while (!rest.empty()) { st = parser.parse(rest); if (st != Complete) break; 处�
 | 错误响应 | `LineTooLong/UriTooLong`→414、`HeadersTooLarge/TooManyHeaders`→431、其余畸形→400、未知方法→405 | 让客户端能自助定位，且日志里有 `errorName()` |
 | chunked 流式（M3-c） | `Transfer-Encoding: chunked` + 持续 `send()`；**注意 `send()` 返回 0 不是失败**（已受理未写出） | 与 Session 发送队列/背压对接；FR-5.1/5.2 的帧级策略留 M5 |
 | Range | 只支持单区间 `bytes=a-b`；多区间 → **返回 200 并记一条 Warn** | 半吊子 206 比明确不支持更危险 |
-| `/api/stats` | JSON：暴露 M2 的计数（会话/accept/拒绝/空闲超时/收超限/发超限/丢弃）+ M3 的（请求数/4xx/5xx/超限拒绝数） | 可观测性是 FR-4.x/NFR-x 的验收基础 |
+| `/api/stats` | JSON：暴露 M2 的计数（会话/accept/拒绝/空闲超时/超收/发超限/丢弃）+ M3 的（请求数/4xx/5xx/超限拒绝数） | 可观测性是 FR-4.x/NFR-x 的验收基础 |
+| **`/api/stats` 的聚合来源**（M5-d/M6-c/M6-d 逐步长出） | 本层的计数 + `setExtraStatsProvider()` 拼进来的 `source_manager` / `media_sources[]` / 每源 `producer`（含 `bitrate_bps`）/ `wakeup` | `http` 不依赖 `media`：片段由 app 装配（`SourceManager::dumpStatsJson()`） |
+| **`uptime_ms` / `uptime_s`**（M7，`FR-6.1` 要求"运行时长"） | `HttpServer::start()` 记一次单调时钟；请求时做差 | 用**单调**时钟（不受 NTP 改时间影响）。成员是普通 `uint64_t` 而不是 atomic，**因为**：只写一次、且写点在 `_tcp->start()`（注册 epoll 事件）**之前** → 后续任何请求都经由 poller 的事件投递被唤醒，二者之间存在 happens-before；M7 的 TSAN 全量（323 用例）0 报告也印证了这一点 |
+| **文件日志**（M7，`FR-6.2`） | app 装 `ConsoleWriter` + `FileWriter`（默认 `logs/mzmedia.log`，64MB×5 滚动，`--log-file` 可改）；`FileWriter` **行缓冲**（写完一行立刻 `flush()`） | 修前实测"跑 2 秒的服务，日志文件是 **0 字节**"：写完攒在 `ofstream` 用户态缓冲里，进程被 kill 就整段丢，`tail -f` 也看不到实时日志。日志量低（几行/秒），一行一次 `write` 的代价换"日志一定在盘上"很值；退出前另有显式 `Logger::flush()` |
 
 ## 5. 分批与验收
 
@@ -121,10 +124,10 @@ while (!rest.empty()) { st = parser.parse(rest); if (st != Complete) break; 处�
 
 ## 9. 未决事项
 
-| # | 事项 | 何时定 |
+| # | 事项 | 何时定 / 结论 |
 |---|---|---|
-| 1 | 四个上限的初值是否合适（8/4/32KB/100） | M3-b 跑起来后按 `totalRejected` 与真实请求观察 |
-| 2 | 是否支持 POST / body（v0.1 只需要 GET） | M3-b 定：若支持，body 上限与 413 计数一起加 |
-| 3 | 测试页是否内联播放器（离线可用） | M3-b |
-| 4 | `/api/stats` 是否需要鉴权/只绑 127.0.0.1 | M3-c（默认不做鉴权，SPEC 未要求） |
+| 1 | 四个上限的初值是否合适（8/4/32KB/100） | ✅ **回填（M7）**：M3 的四个解析上限（请求行 8KB / 头 4KB×32 / 目标 100 等）在 M3-b…M6-d 的全部验收里从未触发（`malformed` 计数只在畸形用例里增长）→ **保持初值**；真要压它们需要专门的"超长请求"用例（现有 `http` 组已覆盖 414/431 的拒绝路径） |
+| 2 | 是否支持 POST / body | ✅ **已定（M3-b 起）**：**不支持**，一律 405 + `Allow: GET`。理由：v0.1 只需 GET；"半吊子支持 POST"要额外处理 body 上限/413/`Expect: 100-continue`，收益为零。**复查条件**：出现第一个需要写接口的需求（v0.3 的控制面？） |
+| 3 | 测试页是否内联播放器（离线可用） | ✅ **已完成（M6-c）**：内置页内联 `<video>` + 创建 flv.js 播放器；`flv.min.js` **入库**（`third_party/flv.js/`，Apache-2.0）由 `GET /flv.min.js` 提供 → 离线可播（验收脚本 §1 检查"与入库文件逐字节一致"） |
+| 4 | `/api/stats` 是否需要鉴权 / 只绑 127.0.0.1 | ✅ **已定**：**不做鉴权**（SPEC 未要求）；默认绑 `0.0.0.0`（`--port` 之外未提供绑定地址参数）。**风险记录**：`/api/stats` 会暴露媒体路径与统计 —— 生产部署时应放在反向代理/内网后面（写进 `SECURITY` 说明：README 的部署提示） |
 | 5 | ~~`Session::shutdownAfterFlush()`（"发完再关"）~~ | ✅ **已完成（M6-b）**：`Session::shutdownAfterFlush(max_wait_ms)` 已实现（挂在写路径的"队列空"分支 + 截止定时器兜底），并同步到 `DESIGN_M2` §9 决策记录；HTTP 侧由 `HttpResponse::endStreamFn()` 触达 |

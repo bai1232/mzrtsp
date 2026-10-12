@@ -5,6 +5,22 @@
 
 ## [Unreleased]
 
+（下一版内容；v0.2.0 计划见 [docs/ROADMAP.md](docs/ROADMAP.md)）
+
+## [0.1.0] - 2026-10-12
+
+> **v0.1.0 发布**：MP4 / H264 裸流 → **HTTP-FLV**（remux、零拷贝、一源多消费者），浏览器可直接播。
+> 完整验收证据（逐条 SC/NFR/FR → 命令 + 实测数字）见 **[docs/ACCEPTANCE_v0.1.0.md](docs/ACCEPTANCE_v0.1.0.md)**。
+>
+> | 指标 | 实测 |
+> |---|---|
+> | 端到端 | `curl -N …/live/sample.flv` → **55,623 字节**合法 FLV（h264 320x240 + aac，50 帧，解码无 error） |
+> | 首帧 | **20 ms 级**（TTFB 3.3 ms） |
+> | 并发 / 长跑 | **10 路 × 5 分钟**（每路完整可解、丢帧 0）；**1 小时**见验收报告 §3.3 |
+> | 服务端开销 | **单核 4.11%（十路合计）**；稳态 RSS **0.36 MB/h** |
+> | 质量门禁 | 清洁构建 **0 warning**；**247 用例 / 21 分组**；ASAN / TSAN 全绿 |
+> | 第三方 | C++ 侧零依赖；唯一第三方是入库的 **flv.js 1.6.2**（Apache-2.0，浏览器播放器） |
+
 ### Added
 - 项目立项：需求规格、架构设计、能力矩阵、路线图、测试与验收方案
 - `docs/VERSIONING.md`：版本与发布强制要求（每版必推 Git、必打 tag、语义化版本、可回滚）
@@ -381,7 +397,7 @@
 
 - **`src/main.cpp`（新）→ `build/bin/mzmedia`**：零参数启动（**FR-7.2**，默认 `0.0.0.0:8080` + `./samples`，
   横幅直接打印播放页 / 拉流 / 统计 URL）；`--port` / `--media-root` / `--web-root` / `--loop` / `--speed` /
-  `--log-level`（**FR-7.1** / **FR-7.3**）/ `--help`；**未知参数报错退出**（不静默忽略）。
+  `--log-level`（**FR-7.1** 里的"日志级别"）/ `--help`；**未知参数报错退出**（不静默忽略）。
   它只做接线：路由、配置、生命周期 —— 不认识 FLV 字节，也不碰 `Demuxer`
 - **浏览器播放页**：`HttpServer` 的内建 `kTestPage` 升级为**播放器页**（`<video>` + 名字输入 + 播放/停止 +
   状态 + 错误区 + `/api/stats` 每 2s 刷新）；`flv.js` **1.6.2 入库**
@@ -470,14 +486,36 @@
   `DESIGN_M5`（§1 状态行 + §8 全部回填）、`TESTING`（§5/§6 改成跑脚本 + 实测基线表 + ASAN 长跑）、
   `ROADMAP`、`README`（验证清单）、`RETROSPECTIVE` §2.7、本文件
 
+#### M7 发版（v0.1.0：验收证据 + 需求缺口补齐 + 打 tag）
+
+- 新增 **`docs/ACCEPTANCE_v0.1.0.md`**：逐条 **SC/NFR/FR** 的验收报告（状态 + 证据命令 + 实测数字 +
+  复现步骤 + **诚实的未达成/未验证清单**）
+- **补需求缺口（发版前对齐 SPEC）**：
+  · **FR-6.2 滚动文件日志落地**：`src/main.cpp` 装 `FileWriter`（默认 `logs/mzmedia.log`，64MB × 5 滚动；
+    `--log-file` 可改路径）。同时改**行缓冲**——修前实测"跑 2 秒的服务，日志文件是 **0 字节**"
+    （写完攒在 ofstream 用户态缓冲里，进程不 flush 就丢），`tail -f` 也看不到实时日志；
+    并在**退出前显式 `Logger::flush()`**，保证"最后几行"（往往是退出原因）不丢。
+    用例 `logger_file_writer_is_line_flushed`（**变异验证**：去掉行缓冲必红）
+  · **FR-6.1 补两个字段**：`/api/stats` 新增 `uptime_ms`/`uptime_s`；每源新增 `producer.bitrate_bps`
+    与 `producer.uptime_ms`（实测 `bitrate_bps=221458` ≈ 样本真实码率 222 kbps）。
+    用例 `ntimed_http_api_stats`（扩充）、`srcmgr_dump_stats_json_has_manager_and_sources`（扩充）、
+    `producer_bitrate_and_uptime_are_measured`（新增）；脚本 `flv_http_test.sh` 也检查"运行时长在增长"
+- **修一处文档事实错误**：M6-c 引用的 **`FR-7.3` 在 SPEC 里不存在**（"日志级别"是 `FR-7.1` 列的参数之一）
+  → 全仓修正；并做了一次**系统性核对**：`docs/` + `src/` + `tests/` + `scripts/` 里出现的所有 `FR/NFR/SC` 编号
+  与 SPEC 逐一对齐（现在**没有任何编造的 id**）
+- 文档补齐：`ARCHITECTURE` §2 模块职责改成**实际口径**（用 ⏳ 标出 `Remuxer`/`HlsWriter`/`StatsCenter` 尚未实现，
+  并补上 `HttpSession`/`FlvMuxer`/`SourcePump`/`Throttle` 等实际存在的类）、`DESIGN_M3` §9 未决 1~4 回填
+  （上限初值保持 / POST 不支持 / 测试页播放器已完成 **M6-c** / 不做鉴权）、README 增加部署提示与发版状态
+- 发布动作：`CHANGELOG` 折叠为 `[0.1.0] - 2026-10-12`；打 **annotated tag `v0.1.0`** 并推送（`VERSIONING.md` 强制要求）
+
 ### 说明
-- `v0.1.0` 尚未发布。按 `VERSIONING.md`，tag 只能打在**可独立构建且测试通过**的提交上。
-- M1（Core 层）已完成并推送；后续进入 M2（网络层：EventPoller / TcpServer / Session）。
+- **`v0.1.0` 已发布**（2026-10-12）：annotated tag `v0.1.0` 已推送到远程；验收证据见 [docs/ACCEPTANCE_v0.1.0.md](docs/ACCEPTANCE_v0.1.0.md)。
+  按 `VERSIONING.md`，tag 打在**可独立构建且测试通过**的提交上（回滚方式见该文件第四节）。
 
 ## 版本规划
 
 | 版本 | 主题 | 状态 |
 |---|---|---|
-| `v0.1.0` | MP4 / H264 裸流 → HTTP-FLV（remux，多客户端共享） | 🚧 开发中 |
+| `v0.1.0` | MP4 / H264 裸流 → HTTP-FLV（remux，多客户端共享） | ✅ **已发布** |
 | `v0.2.0` | MKV / TS 输入、HLS 输出、转码 | ⏳ 计划 |
 | `v0.3.0` | RTSP 输入、解码处理（滤镜/缩放/水印） | ⏳ 计划 |

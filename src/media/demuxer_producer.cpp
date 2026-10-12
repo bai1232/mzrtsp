@@ -44,6 +44,19 @@ std::string DemuxerProducer::lastError() const {
     return _last_error;
 }
 
+uint64_t DemuxerProducer::bitrateBps() const {
+    const int64_t opened = _opened_at_ms.load();
+    if (opened <= 0) {
+        return 0; // 还没打开：没有"码率"可言（不猜）
+    }
+    const int64_t elapsed_ms = static_cast<int64_t>(getCurrentMillisecond()) - opened;
+    if (elapsed_ms <= 0) {
+        return 0; // 不足 1ms：返回 0，避免除零造出天文数字
+    }
+    return static_cast<uint64_t>(_bytes.load()) * 8u * 1000u /
+           static_cast<uint64_t>(elapsed_ms);
+}
+
 bool DemuxerProducer::open(const std::string &path) {
     if (path.empty()) {
         setError("path 为空");
@@ -65,6 +78,7 @@ bool DemuxerProducer::open(const std::string &path) {
         return false;
     }
     _path = path;
+    _opened_at_ms.store(static_cast<int64_t>(getCurrentMillisecond()));
     _loop_offset_ms.store(0);
     _pass.assign(_demux.streams().size(), PassTrack{});
     return true;

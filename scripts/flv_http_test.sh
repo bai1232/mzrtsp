@@ -99,8 +99,10 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== 0) 起服务（端口 $PORT；--web-root 显式指到入库的 flv.js）=="
+APP_LOG="/tmp/mzmedia_app_files.log"
+rm -f "$APP_LOG"
 "$SERVER" --port "$PORT" --media-root "$MEDIA_DIR" --web-root "$ROOT/third_party/flv.js" \
-    > "$SRV_LOG" 2>&1 &
+    --log-file "$APP_LOG" > "$SRV_LOG" 2>&1 &
 SRV_PID=$!
 ready=no
 for _ in $(seq 1 80); do
@@ -157,6 +159,27 @@ if [ -z "$err" ]; then
     check_true "ffmpeg 完整解码无 error"
 else
     check_false_msg "ffmpeg 完整解码无 error" "$err"
+fi
+
+# FR-6.2：日志必须**同时**落到滚动文件（默认 logs/mzmedia.log；这里用 --log-file 指到临时路径验证）
+#   拉过流之后，文件里应当能看到"源已创建（懒启动）"这类关键事件（顺带覆盖 FR-6.3）
+if [ -s "$APP_LOG" ] && grep -q '源已创建' "$APP_LOG"; then
+    printf '  ✔ %-34s %s 字节\n' "FR-6.2 文件日志已写入（含关键事件）" "$(wc -c < "$APP_LOG")"
+    pass=$((pass + 1))
+else
+    check_false_msg "FR-6.2 文件日志已写入（含关键事件）" "见 $APP_LOG"
+fi
+# FR-6.1：/api/stats 的"运行时长"必须真的在走（不是写死的常量）
+# 注意 `uptime_ms` 在 JSON 里出现**两次**（http 段一次、每源 producer 段一次）→ 必须 `head -1`
+# （写脚本时踩过：多值会让 `[ ... -gt ... ]` 报 integer expression expected）
+up1="$(curl -s --max-time 3 "http://127.0.0.1:$PORT/api/stats" | tr -d ' ' | grep -o '"uptime_ms":[0-9]*' | head -1 | cut -d: -f2)"
+sleep 0.3
+up2="$(curl -s --max-time 3 "http://127.0.0.1:$PORT/api/stats" | tr -d ' ' | grep -o '"uptime_ms":[0-9]*' | head -1 | cut -d: -f2)"
+if [ -n "${up1:-}" ] && [ -n "${up2:-}" ] && [ "$up2" -gt "$up1" ]; then
+    printf '  ✔ %-34s %s → %s ms\n' "FR-6.1 运行时长在增长" "$up1" "$up2"
+    pass=$((pass + 1))
+else
+    check_false_msg "FR-6.1 运行时长在增长" "${up1:-缺} → ${up2:-缺}"
 fi
 
 echo "== 3) H264 裸流源（FR-2.1）：Annex-B → avcC + AVCC 转换 =="

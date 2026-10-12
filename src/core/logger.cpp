@@ -218,6 +218,13 @@ void FileWriter::write(const LogContext &ctx) {
         return;
     }
     _written += line.size();
+    // 【M7】**行缓冲**：写完一行立刻交给内核。
+    //   为什么不是"攒够再刷"：① 运维要能 `tail -f logs/mzmedia.log` 看实时状态，
+    //   攒在用户态缓冲里的日志等于看不见；② 进程被 SIGKILL / 崩溃时，用户态缓冲会整段丢掉
+    //   （实测：跑 2 秒的服务，日志文件是 **0 字节**）。
+    //   代价是每行一次 write 系统调用 —— 本项目日志量很低（几行/秒，Debug 才高），
+    //   换来的"日志一定在盘上"更值。真要压测日志吞吐，应改回批量并显式 flush。
+    _ofs.flush();
     if (_max_size > 0 && _written >= _max_size) {
         roll();
     }

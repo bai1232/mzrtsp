@@ -262,10 +262,14 @@ MZ_TEST(srcmgr_idle_timer_releases_after_window) {
 
     // 句柄释放后**不能立刻**回收，要等空闲窗口到点
     // 超时给得宽：空闲释放依赖"轮询线程被唤醒 + 定时器到点"，在 ASAN / 满载下会被拖慢
-    // （实测：ctest 满载时曾经超过 3s）。失败时打印统计，避免下次只剩一句"期望为真"。
-    const bool released = waitFor([&] { return manager->sourceCount() == 0; }, 10000);
+    // （实测：ctest 满载时曾经 >3s；M7 又见过一次 10s 都没到点，而**单跑该组 3/3 绿**）
+    // 失败时打印**管理器 + poller** 两侧统计：一眼能区分"定时器没建"和"建了但没跑到"
+    const bool released = waitFor([&] { return manager->sourceCount() == 0; }, 30000);
     if (!released) {
-        MZ_FAIL("空闲释放超时（10s），当前统计：" + manager->dumpStats());
+        MZ_FAIL("空闲释放超时（30s），当前统计：" + manager->dumpStats() +
+                " | poller{timerCount=" + std::to_string(poller->timerCount()) +
+                " delayBatch=" + std::to_string(poller->delayBatchCount()) +
+                " pendingTask=" + std::to_string(poller->pendingTaskCount()) + "}");
     }
     MZ_ASSERT_TRUE(released);
     MZ_ASSERT_EQ(manager->totalIdleReleased(), 1u);
@@ -307,11 +311,14 @@ MZ_TEST(srcmgr_acquire_cancels_idle_timer) {
     MZ_ASSERT_EQ(manager->sourceCount(), 1u);
     MZ_ASSERT_EQ(manager->totalIdleReleased(), 0u);
 
-    // 再放掉 → 这次才会被回收（超时同样给宽，理由见上一个用例）
+    // 再放掉 → 这次才会被回收（超时给宽 + 带 poller 诊断，理由见上一个用例）
     again.reset();
-    const bool released_after = waitFor([&] { return manager->sourceCount() == 0; }, 10000);
+    const bool released_after = waitFor([&] { return manager->sourceCount() == 0; }, 30000);
     if (!released_after) {
-        MZ_FAIL("空闲释放超时（10s），当前统计：" + manager->dumpStats());
+        MZ_FAIL("空闲释放超时（30s），当前统计：" + manager->dumpStats() +
+                " | poller{timerCount=" + std::to_string(poller->timerCount()) +
+                " delayBatch=" + std::to_string(poller->delayBatchCount()) +
+                " pendingTask=" + std::to_string(poller->pendingTaskCount()) + "}");
     }
     MZ_ASSERT_TRUE(released_after);
     MZ_ASSERT_EQ(manager->totalIdleReleased(), 1u);
@@ -414,6 +421,10 @@ MZ_TEST(srcmgr_dump_stats_json_has_manager_and_sources) {
     MZ_ASSERT_TRUE(json.find("\"media_source\":{") != std::string::npos);
     MZ_ASSERT_TRUE(json.find("\"subscribers\":0") != std::string::npos);
     MZ_ASSERT_TRUE(json.find("\"counters\":{") != std::string::npos);
+    // 【M7 / FR-6.1】每源"码率"与"运行时长"也必须能被看到（SPEC 明写的两个字段）
+    MZ_ASSERT_TRUE(json.find("\"bitrate_bps\":") != std::string::npos);
+    MZ_ASSERT_TRUE(json.find("\"uptime_ms\":") != std::string::npos);
+    MZ_ASSERT_TRUE(json.find("\"producer\":{") != std::string::npos);
 
     // 最粗的配平检查：花括号必须成对（片段要能直接嵌进 /api/stats 的对象里）
     const size_t open_braces = static_cast<size_t>(std::count(json.begin(), json.end(), '{'));

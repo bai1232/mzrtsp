@@ -17,6 +17,7 @@
 #include "http/http_server.h"
 
 #include "core/logger.h"
+#include "core/util.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -376,6 +377,7 @@ bool HttpServer::start(uint16_t port, const std::string &bind_ip) {
         WarnP("HttpServer::start 重复调用：忽略");
         return false;
     }
+    _started_at_ms = getCurrentMillisecond(); // FR-6.1 的"运行时长"从这里算
     // 默认路由：只在用户没占用该路径时安装（可预期）
     if (!findHandler("/")) {
         setRoute("/", [](const HttpParser &req, HttpResponse &resp) {
@@ -390,6 +392,11 @@ bool HttpServer::start(uint16_t port, const std::string &bind_ip) {
             std::string json;
             json.reserve(512);
             json += "{\"requests\":" + std::to_string(_total_requests.load());
+            // 【M7 / FR-6.1】运行时长（秒级足够；用单调时钟，不受系统改时间影响）
+            const uint64_t uptime_ms =
+                (_started_at_ms == 0) ? 0 : (getCurrentMillisecond() - _started_at_ms);
+            json += ",\"uptime_ms\":" + std::to_string(uptime_ms);
+            json += ",\"uptime_s\":" + std::to_string(uptime_ms / 1000);
             json += ",\"4xx\":" + std::to_string(_total_4xx.load());
             json += ",\"5xx\":" + std::to_string(_total_5xx.load());
             json += ",\"malformed\":" + std::to_string(_total_malformed.load());

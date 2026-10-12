@@ -63,3 +63,5 @@ git push --force-with-lease origin main
 - [ ] tag 已推送到远程：`git push origin vX.Y.Z`
 - [ ] 该 tag 的代码已验证可独立构建、测试通过（保证可回滚）
 - [ ] `CHANGELOG.md` 已更新本版内容
+- [ ] **`docs/ACCEPTANCE_vX.Y.Z.md` 已更新**：逐条 SC/NFR/FR 的"状态 + 证据命令 + 实测数字"（v0.1.0 见 `ACCEPTANCE_v0.1.0.md`）
+- [ ] tag 推送后，用 `git checkout vX.Y.Z && cmake -B build && cmake --build build -j && (cd build && ctest)` **复现一次**

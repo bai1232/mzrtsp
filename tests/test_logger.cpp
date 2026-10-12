@@ -514,3 +514,28 @@ MZ_TEST(logger_writer_exception_is_contained) {
     MZ_ASSERT_TRUE(good->containsMessage("second-after-throw"));
     MZ_ASSERT_EQ(good->size(), 2u);
 }
+
+MZ_TEST(logger_file_writer_is_line_flushed) {
+    // 【M7 修的 bug】FileWriter 原来只在滚动/显式 flush 时落盘 → 日志攒在 ofstream 的
+    // 用户态缓冲里：① 运维 `tail -f` 看不到实时日志；② 进程被 SIGKILL/崩溃时那段日志**整段丢掉**
+    // （实测：跑 2 秒的服务，日志文件是 0 字节）。
+    // 现在改成**行缓冲**：只要 write() 返回，内容就已经交给内核了 —— 本用例**故意不调 flush()**，
+    // 直接从磁盘读回来验证；修前这里必红。
+    LoggerGuard guard;
+    const std::string dir = "/tmp/mzmedia_logger_lineflush";
+    (void) ::system(("rm -rf " + dir).c_str());
+
+    Logger &logger = Logger::Instance();
+    const std::string path = dir + "/flush.log";
+    auto writer = std::make_shared<FileWriter>(path, 0, 0);
+    logger.add(writer);
+    logger.setLevel(LogLevel::Info);
+    logger.setAsync(false); // 同步模式：日志在 InfoL 语句处就写进 writer
+
+    InfoL << "line-flush-marker";
+    // 刻意 **不** 调 logger.flush() / writer->flush()
+    const std::string content = loadFile(path, nullptr);
+    MZ_ASSERT_TRUE(content.find("line-flush-marker") != std::string::npos);
+
+    (void) ::system(("rm -rf " + dir).c_str());
+}

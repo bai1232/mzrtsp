@@ -12,6 +12,7 @@
 #include "media/source_manager.h"
 
 #include "core/logger.h"
+#include "core/util.h"
 
 #include <utility>
 #include <vector>
@@ -533,6 +534,12 @@ std::string SourceManager::dumpStatsJson() const {
             const DemuxerProducer &p = *item.producer;
             out += ",\"producer\":{\"packets\":" + std::to_string(p.totalPackets());
             out += ",\"bytes\":" + std::to_string(p.totalBytes());
+            // 【M7 / FR-6.1】每源码率（bit/s）与已运行时长：SPEC 要求 /api/stats 暴露这两项
+            out += ",\"bitrate_bps\":" + std::to_string(p.bitrateBps());
+            out += ",\"uptime_ms\":" + std::to_string(p.openedAtMs() == 0
+                                                          ? 0
+                                                          : getCurrentMillisecond() -
+                                                                p.openedAtMs());
             out += ",\"skipped_unknown\":" + std::to_string(p.skippedUnknownStreams());
             out += ",\"ts_failures\":" + std::to_string(p.timestampFailures());
             out += ",\"annex_b_video\":" + std::string(p.annexBVideo() ? "true" : "false");

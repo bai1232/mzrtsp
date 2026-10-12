@@ -42,15 +42,19 @@
 
 ## 2. 模块职责
 
-| 模块 | 核心类 | 职责 | 不做什么 |
+> 口径：**v0.1.0 实际实现**（M6-d 收尾时对齐过一次）。⏳ 标记的是"列在架构里但尚未实现"的类，
+> 它们的落地批次写在括号里 —— 免得读者以为代码里已经有了。
+
+| 模块 | 核心类（实际存在） | 职责 | 不做什么 |
 |---|---|---|---|
-| Core | `Logger` `util` `Ticker` `TaskQueue` `ThreadPool` `Semaphore` | 日志、工具、线程与任务 | 不碰媒体、不碰网络 |
-| Network | `EventPoller` `TcpServer` `Session` `Buffer` `Socket` | epoll 事件循环、TCP 生命周期、粘包缓冲 | 不解析 HTTP/RTSP |
-| Http | `HttpServer` `HttpParser` `HttpConnection` | HTTP/1.1 解析与响应、路由、chunked/CORS/Range | 不碰 FFmpeg |
-| FFmpeg 封装 | `Demuxer` `Remuxer` `AvPtr` | 输入解封装、输出封装、FFmpeg 对象 RAII | 不做业务分发 |
-| Media | `MediaSource` `SourceManager` `FrameQueue` `GopCache` | 一源一份输出、订阅者管理、GOP 缓存、节流 | 不关心输出是 FLV 还是 TS |
-| Output | `FlvSender` `HlsWriter` | 具体输出格式的封装与发送 | 不管理源的生命周期 |
-| Stats | `StatsCenter` | 指标采集与 `/api/stats` | — |
+| Core | `Logger` `util` `Ticker` `OnceToken` `TaskCancelable` `ThreadGroup` `NoticeCenter` `TaskQueue` `ThreadPool` `Semaphore` | 日志（分级/异步/滚动文件）、工具、线程与任务 | 不碰媒体、不碰网络 |
+| Network | `EventPoller`（含 `EventPollerPool`）`PipeWrap` `Socket`/`SockException` `Buffer` `Session` `TcpServer` | epoll ET/LT 事件循环、跨线程投递、定时器、TCP 生命周期、粘包缓冲 | 不解析 HTTP/RTSP |
+| Http | `HttpServer` `HttpParser` `HttpResponse` `HttpSession` | HTTP/1.1 解析与响应、路由、chunked（含异步流式）、CORS、Range、内置播放页 | 不碰 FFmpeg（`/live/` 由 app 注册 → 反向依赖被杜绝） |
+| FFmpeg 封装 | `AvPtr` `Demuxer` `CodecMatrix` `h264_util` `TimeBase`；⏳ `Remuxer`/`Transcoder`（v0.2） | 输入解封装、编码可行性判定、H264 语法工具（Annex-B/avcC/SPS）、时间基换算、FFmpeg 对象 RAII | 不做业务分发；**不解码**（v0.1） |
+| Media | `MediaPacket` `FrameQueue` `GopCache` `Subscriber` `MediaSource` `SourcePump` `DemuxerProducer` `SourceManager` `Throttle` | 一源多消费者分发、订阅者生命周期、GOP 缓存、按墙钟节流、懒启动/空闲释放、输入形状转换（Annex-B→AVCC）与循环重开 | 不关心输出是 FLV 还是 TS（v0.2 的 TS） |
+| Output | `FlvMuxer`（纯函数）、`FlvSender`（每连接）；⏳ `HlsWriter`（v0.2） | 具体输出格式的封装与发送 | 不管理源的生命周期、不依赖 `http/`（写出目标是 `Sink` 抽象） |
+| **App** | `src/main.cpp` → `build/bin/mzmedia` | 命令行、组装、路由接线（`/live/`、`/flv.min.js`）、优雅退出 | 媒体逻辑一律在库里：app 不认识 FLV 字节、也不碰 `Demuxer` |
+| Stats | ⏳ `StatsCenter`（**尚未抽**） | 现在由各模块 `dumpStats()`/`dumpStatsJson()` + `HttpServer::setExtraStatsProvider()` 拼成 `/api/stats` | 等**第二个 provider** 出现再抽（`AI_COLLAB §3.6`；见 `DESIGN_M5` §8 未决 12） |
 
 ## 3. 线程模型
 

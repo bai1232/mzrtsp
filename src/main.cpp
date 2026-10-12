@@ -4,7 +4,10 @@
  * 形状来源：docs/DESIGN_M6.md §3.7；上位需求 `docs/SPEC.md`
  *   FR-7.2「可执行文件**零参数**启动，启动后打印可用的播放 URL」
  *   FR-7.1「支持命令行配置监听端口与媒体目录」（v0.1 用命令行参数，不引入配置文件）
- *   FR-7.3「日志级别可配」；NFR-1「首帧 < 1s」（验收见 scripts/flv_http_test.sh）
+ *   FR-7.1「命令行参数：监听端口、媒体文件路径、日志级别、是否循环、转码开关」
+ *   （v0.1 的落地：--port / --media-root / --log-level / --loop；转码开关属 v0.2）
+ *   FR-6.2「日志分级、异步、滚动文件（默认 logs/mzmedia.log）」
+ *   NFR-1「首帧 < 1s」（验收见 scripts/flv_http_test.sh）
  *
  * 用法（零参数即可跑起来）：
  *   ./bin/mzmedia                                    # 0.0.0.0:8080 + ./samples
@@ -61,6 +64,7 @@ const char *kUsage =
     "  --loop              循环推流：读到文件尾重开并把时间戳接着往后接（浏览器可长时间观看）\n"
     "  --speed <x>         推送倍速（默认 1.0；压测/调试用，> 1 会加快）\n"
     "  --log-level <l>     trace|debug|info|warn|error|fatal（默认 info）\n"
+    "  --log-file <path>   日志文件（默认 logs/mzmedia.log，64MB×5 滚动；FR-6.2）\n"
     "  --help              显示本帮助\n"
     "\n"
     "示例：\n"
@@ -175,6 +179,7 @@ int main(int argc, char **argv) {
     uint16_t port = 8080;
     std::string media_root = "samples";
     std::string web_root;
+    std::string log_file = "logs/mzmedia.log"; // FR-6.2 的默认值
     bool loop = false;
     double speed = 1.0;
     LogLevel level = LogLevel::Info;
@@ -212,6 +217,12 @@ int main(int argc, char **argv) {
                 std::fprintf(stderr, "--log-level 非法：%s\n", argv[i]);
                 return 2;
             }
+        } else if (key == "--log-file") {
+            log_file = value();
+            if (log_file.empty()) {
+                std::fprintf(stderr, "--log-file 不能为空\n");
+                return 2;
+            }
         } else if (key == "--help" || key == "-h") {
             std::fputs(kUsage, stdout);
             return 0;
@@ -223,7 +234,18 @@ int main(int argc, char **argv) {
     }
 
     Logger::Instance().add(std::make_shared<ConsoleWriter>());
-    Logger::Instance().setLevel(level); // FR-7.3
+    // FR-6.2：**默认滚动文件日志** `logs/mzmedia.log`（单文件 64MB、保留最近 5 个 —— FileWriter 的默认值）
+    //   · 父目录不存在会自动创建；
+    //   · 打开失败**不静默**：FileWriter 内部会向 stderr 告警一次，这里再显式提示并继续只用控制台
+    //     （"日志系统自己坏了"属于必须被看见的问题，不能悄悄降级）
+    auto file_writer = std::make_shared<FileWriter>(log_file);
+    if (!file_writer->isOpen()) {
+        std::fprintf(stderr,
+                     "警告：日志文件 %s 打开失败 → 本次只输出到控制台（检查目录权限/磁盘空间）\n",
+                     log_file.c_str());
+    }
+    Logger::Instance().add(file_writer);
+    Logger::Instance().setLevel(level); // FR-7.1（"日志级别"）；FR-6.2 的滚动文件见上
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
 
@@ -381,6 +403,7 @@ int main(int argc, char **argv) {
     std::printf("  统计      : http://127.0.0.1:%u/api/stats\n",
                 static_cast<unsigned>(server->port()));
     std::printf("  媒体目录  : %s%s\n", media_root.c_str(), isDir(media_root) ? "" : "（不存在！）");
+    std::printf("  日志文件  : %s\n", log_file.c_str());
     std::printf("  推送      : %gx%s\n", speed, loop ? "，循环推流" : "");
     std::printf("  命令行拉流: curl -N http://127.0.0.1:%u/live/sample.flv | ffplay -\n",
                 static_cast<unsigned>(server->port()));
@@ -393,5 +416,8 @@ int main(int argc, char **argv) {
 
     server->shutdown(); // 先关服务器（连接全断）→ 订阅者释放 → 源按空闲规则回收
     InfoP("已退出");
+    // 退出前把日志队列刷干净：异步模式下"最后几行"可能还在队列/用户态缓冲里，
+    // 不 flush 就会出现"日志文件里看不到退出原因"这种最要命的缺失（M7 实测踩到）
+    Logger::Instance().flush();
     return 0;
 }

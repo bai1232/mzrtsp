@@ -657,6 +657,19 @@ MZ_TEST(ntimed_http_api_stats) {
     MZ_ASSERT_TRUE(resp.body.find("\"4xx\":1") != std::string::npos);
     MZ_ASSERT_TRUE(resp.body.find("\"sessions\":") != std::string::npos);
     MZ_ASSERT_TRUE(resp.body.find("\"accepted\":") != std::string::npos);
+    // 【M7 / FR-6.1】"运行时长"必须在 /api/stats 里，而且是真的在走（不是写死的 0）
+    MZ_ASSERT_TRUE(resp.body.find("\"uptime_ms\":") != std::string::npos);
+    MZ_ASSERT_TRUE(resp.body.find("\"uptime_s\":") != std::string::npos);
+    sleepMs(30);
+    MZ_ASSERT_TRUE(sendAll(cli, "GET /api/stats HTTP/1.1\r\n\r\n"));
+    MZ_ASSERT_TRUE(readResponse(cli, &resp, 2000, &carry));
+    const size_t pos = resp.body.find("\"uptime_ms\":");
+    MZ_ASSERT_TRUE(pos != std::string::npos);
+    if (pos != std::string::npos) {
+        const uint64_t uptime = static_cast<uint64_t>(
+            std::atoll(resp.body.c_str() + pos + std::string("\"uptime_ms\":").size()));
+        MZ_ASSERT_GT(uptime, 0u);   // 睡了 30ms → 至少 1ms
+    }
     ::close(cli);
 }
 

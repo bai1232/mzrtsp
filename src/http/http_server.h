@@ -107,6 +107,8 @@ private:
     std::atomic<uint64_t> _total_4xx{0};
     std::atomic<uint64_t> _total_5xx{0};
     std::atomic<uint64_t> _total_malformed{0};
+    /// 【M7】进程/服务启动时刻（单调时钟毫秒）：`/api/stats` 的 `uptime_ms`（FR-6.1 要求"运行时长"）
+    uint64_t _started_at_ms = 0;
 };
 
 } // namespace mzmedia
