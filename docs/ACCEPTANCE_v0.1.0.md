@@ -87,7 +87,8 @@ cmake -B build && cmake --build build -j"$(nproc)" && ./scripts/make_samples.sh
 > **怎么读这张表**：`--loop` 让源在 1 小时里重开 1633 次（每次 `close()` + `open()` + 重建时间戳守卫），
 > 所以 RSS 平直同时证明了两件事 —— "直播推流不涨内存"与"循环重开不漏"。
 > "基线 25MB → 35MB"是**首次分配**（队列/GOP 上限被触碰），判据是**稳态段斜率**（2933 秒 +20 kB）。
-> **ASAN**：1 小时跑用发布构建；ASAN 构建另跑了 `--quick`（见 §6 第 12 项）。
+> **构建类型**：1 小时跑的是 **Debug 构建**（`build/`，本项目开发期默认类型）；**Release/RelWithDebInfo 未做长跑**，
+> ASAN 构建另跑了 `--quick`（见 §6 第 12 项）。
 
 ## 4. 功能需求（FR，逐条）
 
@@ -204,7 +205,7 @@ cd .. && ./scripts/tsan.sh                    # TSAN（严格组 0 报告）
 | 9 | **`max_subscribers` 默认 16、空闲释放 60s** | 由 M6-d 的真实负载验证"够用"（10 路目标 + 60% 余量）；不是"最优值" |
 | 10 | **`timer_precision` 在负载下间歇红** | 宿主唤醒噪声（裸基线超出量 0~14ms，门禁 `min(库) ≤ min(裸)+5ms`）；按 `TESTING` §2.2 的规矩"串行跑该组"判定 |
 | 11 | **`sessions` 上限（默认 64）没有专门的验收用例** | 上限逻辑在单测里覆盖（设为 1 时第 2 个连接被拒 + 计数）；但"64 条真实连接"没有压测（M6-d 的 10 路 × 协议连接数 ≈ 10，离 64 还有距离）→ 归入 M7 之后的压测扩展 |
-| 12 | **1 小时跑用的是发布构建**（Debug），ASAN 只用 `--quick`（10 路 × 20s）冒烟 | 1 小时 × ASAN 的墙钟成本 ≈ 1 小时且会更慢；折中方案：ASAN 版本跑 `--quick --kill-half --overload 8`（**10/10 通过**，覆盖 NFR-3 的"ASAN 无报错"与内存/连接回收路径）。**要更硬的证据**：`MZMEDIA_SERVER=./build-asan/bin/mzmedia ./scripts/concurrent_test.sh --duration 3600`（脚本已支持，未在本版执行） |
+| 12 | **1 小时跑用的是 Debug 构建**（`build/`，项目开发期默认；**Release / RelWithDebInfo 未跑长跑**），**ASAN 只用 `--quick`（10 路 × 20s）冒烟** | 折中原因：1 小时 × ASAN（或 Release 重新配置+构建+跑）的墙钟成本高。已做的：Debug 1 小时（验收主体，见 §3.3）+ ASAN `--quick --kill-half --overload 8`（**10/10 通过**，覆盖"ASAN 无报错"与内存/连接回收）。**要更硬的证据**（脚本已支持，本版未执行）：<br>`MZMEDIA_SERVER=./build-asan/bin/mzmedia ./scripts/concurrent_test.sh --duration 3600`<br>`cmake -B build-rel -DCMAKE_BUILD_TYPE=Release && cmake --build build-rel -j4 && MZMEDIA_SERVER=./build-rel/bin/mzmedia ./scripts/concurrent_test.sh --duration 3600` |
 
 ## 7. 发布信息与回滚
 

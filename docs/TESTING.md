@@ -182,7 +182,7 @@ ffmpeg -v error -i /tmp/raw.flv -f null -
 ```bash
 cmake -B build-asan -DMZMEDIA_ENABLE_ASAN=ON && cmake --build build-asan -j4
 MZMEDIA_SERVER=./build-asan/bin/mzmedia ./scripts/concurrent_test.sh --quick   # 先冒烟
-# ASAN 版本的长跑：M7 用 ASAN 跑了冒烟（--quick），1 小时用发布构建跑（见验收报告 §3.3）
+# ASAN 版本的长跑：M7 用 ASAN 跑了冒烟（--quick）；1 小时跑的是 **Debug 构建**（见验收报告 §3.3 与 §6 第 12 项）
 ```
 
 ## 7. 需求 → 验证手段对照
@@ -320,7 +320,7 @@ cmake -B build-tsan -DMZMEDIA_ENABLE_TSAN=ON -DCMAKE_CXX_COMPILER=g++-12
 | 编译 | `cmake --build build` | **0 warning / 0 error**（`-Wall -Wextra`，无任何 `-Wno-`；ASAN 构建同样 0） |
 | 单元（串行） | `cd build && ctest --output-on-failure` | **21/21 分组通过**（**247 用例**；**不要**加 `-j`，见 §2.2） |
 | 单元（ASAN） | `cmake -B build-asan -DMZMEDIA_ENABLE_ASAN=ON && cd build-asan && ctest` | **21/21 通过** |
-| 并发/长跑（发布构建） | `./scripts/concurrent_test.sh`（10 路 × 5 分钟）+ `--duration 3600`（1 小时） | 全绿；1 小时数据见 `ACCEPTANCE_v0.1.0.md` §3.3 |
+| 并发/长跑（**Debug** 构建） | `./scripts/concurrent_test.sh`（10 路 × 5 分钟）+ `--duration 3600`（1 小时） | 全绿；1 小时数据见 `ACCEPTANCE_v0.1.0.md` §3.3（Release 长跑未做，见该文件 §6 第 12 项） |
 | 并发（**ASAN** 构建） | `MZMEDIA_SERVER=./build-asan/bin/mzmedia ./scripts/concurrent_test.sh --quick --kill-half --overload 8` | **10/10 通过**（对应 NFR-3 的"ASAN 无报错"） |
 | 脚本验收 | `scripts/{http,flv_mux,flv_http}_test.sh` | **全绿**（M3 / 8 项 / **51 项**） |
 | 单进程全量 | `./build/bin/mzmedia_unittest` | **247/247 用例、61,341 条断言**（诊断用，不作为计时门禁） |
