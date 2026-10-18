@@ -69,6 +69,7 @@
 | 并发（TSAN） | `./scripts/tsan.sh` | **全绿**：严格组 18 组 **282** 用例、含超时组 **44**，**真问题 0**；合计 **326**（含跨组重复计数） |
 | 端到端（HTTP） | `./scripts/http_test.sh` | **EXIT=0**（测试页 / CORS / 路由 / 404 / 405 / 501 / 400 / keep-alive / chunked / Range / stats） |
 | 端到端（FLV） | `./scripts/flv_http_test.sh` | **51/51 通过**（含 §8「源结束后正常收尾」—— 它跑的就是本版改动所在的关闭路径） |
+| **tag 独立构建**（`VERSIONING.md` §5） | `git clone --branch v0.1.1 <repo> /tmp/v && cd /tmp/v && ./scripts/make_samples.sh && cmake -B build && cmake --build build -j4 && (cd build && ctest)` | **21/21 通过**。**注**：样本不入库（`/samples/` 在 `.gitignore`），所以**跳过 `make_samples.sh` 会红 5 个组** —— 4 个样本相关组（`ffmpeg`/`producer`/`srcmgr`/`flv`）+ 已知间歇的 `timer`（`TESTING.md` §2.2） |
 
 ## 5. 已知边界与"未验证"（诚实版）
 
@@ -85,6 +86,7 @@
 ```bash
 cd /home/bpy/MyZltoolkit
 cmake -B build && cmake --build build -j"$(nproc)"
+./scripts/make_samples.sh                       # ★ 必需：样本不入库，不生成会让 4 个组红
 cd build && ctest --output-on-failure          # 21/21、248 用例
 
 # 关闭语义的裸 socket 复现（关键：客户端什么都不做，只等 EOF）
