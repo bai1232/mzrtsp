@@ -10,6 +10,7 @@
 |---|---|---|
 | 设计 | 规格、架构、能力矩阵、验收指标 | ✅ 已定稿 |
 | **v0.1.0** | MP4 / H264 裸流 → **HTTP-FLV**，remux 零拷贝，多客户端共享 | ✅ **已发布**（tag `v0.1.0`；验收证据见 [docs/ACCEPTANCE_v0.1.0.md](docs/ACCEPTANCE_v0.1.0.md)） |
+| **v0.1.1** | 补丁：`Connection: close` 与畸形请求之后**真的关闭连接**（RFC 7230 §6.6） | ✅ **已发布**（tag `v0.1.1`；证据见 [docs/ACCEPTANCE_v0.1.1.md](docs/ACCEPTANCE_v0.1.1.md)） |
 | v0.2.0 | MKV / TS 输入、**HLS** 输出、转码 | ⏳ 计划 |
 | v0.3.0 | RTSP 输入、解码处理（滤镜/缩放/水印） | ⏳ 计划 |
 
@@ -157,6 +158,7 @@ cd build && ctest                        # 21 个分组（245 个用例），串
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构设计：分层、线程模型、一源多消费者、资源管理 |
 | [docs/CODEC_MATRIX.md](docs/CODEC_MATRIX.md) | 输入 × 输出的可行性判定（何时 remux、何时必须转码） |
 | [docs/ACCEPTANCE_v0.1.0.md](docs/ACCEPTANCE_v0.1.0.md) | **v0.1.0 验收报告**：逐条 SC/NFR/FR → 状态 + 证据命令 + 实测数字 + 复现步骤 + 未达成清单 |
+| [docs/ACCEPTANCE_v0.1.1.md](docs/ACCEPTANCE_v0.1.1.md) | **v0.1.1 补丁验收报告**：两个缺陷的修前/修后实测、变异验证、门禁数字、已知边界 |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 里程碑任务分解与风险 |
 | [docs/TESTING.md](docs/TESTING.md) | 验收与测试方法（ffprobe 校验、并发、1 小时长跑） |
 | [docs/DESIGN_M2.md](docs/DESIGN_M2.md) | **网络层设计（M2）**：组件接口形状、机制、分批计划、风险清单、决策记录 |

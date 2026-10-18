@@ -66,8 +66,9 @@ while (!rest.empty()) { st = parser.parse(rest); if (st != Complete) break; 处�
 | 机制 | 做法 | 为什么 |
 |---|---|---|
 | 分帧 | `HttpSession::onRecv` 把 `Buffer` 交给 `HttpParser`；循环 `reset()` 直到 `NeedMoreData` | 复用 Session 已验证的读路径（ET 读到 EAGAIN、上限、流控），HTTP 只做解析 |
-| keep-alive | HTTP/1.1 默认长连接；`Connection: close` 关；空闲用 Session 的 `recv_idle`（60s） | 不另造超时机制；`onIdle` 已由协议层可重写 |
-| 错误响应 | `LineTooLong/UriTooLong`→414、`HeadersTooLarge/TooManyHeaders`→431、其余畸形→400、未知方法→405 | 让客户端能自助定位，且日志里有 `errorName()` |
+| keep-alive | HTTP/1.1 默认长连接；**声明 `Connection: close` 就必须真的关**（v0.1.1 修：修前只写头、从不关）；空闲用 Session 的 `recv_idle`（60s） | 不另造超时机制；`onIdle` 已由协议层可重写。关闭统一走 `Session::shutdownAfterFlush()`：排空后再关，**队列本来就是空时同步立即关**（`session.cpp` 的 `maybeCloseAfterFlush`），所以普通响应不会凭空多出 5s 延迟 |
+| 错误响应 | `LineTooLong/UriTooLong`→414、`HeadersTooLarge/TooManyHeaders`→431、其余畸形→400、未知方法→405；**解析类错误回完即关连接** | 让客户端能自助定位，且日志里有 `errorName()`（body 里也带，便于自助排障） |
+| **关闭出口**（v0.1.1） | **三处**：①普通响应在 `send()` 后判 `!resp.keepAlive()`；②**chunked 早退分支**单独判一次（它在上面的 `return` 就结束了，外层盖不到）；③`sendParseError()`（解析错误，恒关）。三者共用 `HttpSession::closeAfterFlush()`，失败时计数 + Warn + 硬关兜底 | 修前只在响应头里写 `Connection: close`、**从不真的关** → 客户端按 close 语义等不到 FIN（只能等 60s 读空闲），同一条连接还能继续被服务（实测：close 请求之后第 2 条请求照样回 200）。`chunkedAsync`（HTTP-FLV）**排除在外**：它的关闭权在 `endStreamFn`/`abortFn`（M6-b），双关会把正在推的流掐断 |
 | chunked 流式（M3-c） | `Transfer-Encoding: chunked` + 持续 `send()`；**注意 `send()` 返回 0 不是失败**（已受理未写出） | 与 Session 发送队列/背压对接；FR-5.1/5.2 的帧级策略留 M5 |
 | Range | 只支持单区间 `bytes=a-b`；多区间 → **返回 200 并记一条 Warn** | 半吊子 206 比明确不支持更危险 |
 | `/api/stats` | JSON：暴露 M2 的计数（会话/accept/拒绝/空闲超时/超收/发超限/丢弃）+ M3 的（请求数/4xx/5xx/超限拒绝数） | 可观测性是 FR-4.x/NFR-x 的验收基础 |
@@ -81,6 +82,7 @@ while (!rest.empty()) { st = parser.parse(rest); if (st != Complete) break; 处�
 |---|---|---|
 | **M3-a** | `HttpParser` + `tests/test_http_parser.cpp`（19 用例） | 正常/半包/粘包/超长/畸形/NUL 全部确定性通过；进 TSAN 严格组 |
 | **M3-b** ✅ | `HttpSession`（内部类，重写 `onRecv` 分帧）、`HttpResponse`、`HttpServer`（路由 + 错误码 + CORS + 观测）、`examples/http_server.cpp`、`tests/test_http_server.cpp`（14 用例）、`scripts/http_test.sh`（8 项） | **已完成**：curl 8 项全过（测试页 200 且 `Content-Length` 与正文一致、CORS、404、405+`Allow`、501、400、keep-alive 复用）；14 个连接级用例全绿 |
+| **v0.1.1 修复批** ✅ | 三处关闭出口 + `closeFallback` 计数（`/api/stats` 暴露）+ 用例补「每一步都断言连接是开还是关」+ 每类错误响应补 body/`Connection` 可观察量 | **已完成**：`ntimed_http` **24 用例 / 263 断言**全绿；变异验证 3 组均按预期变红（见 `CHANGELOG.md` 的 `[0.1.1]`） |
 | **M3-c** ✅ | `HttpResponse` chunked（`beginChunked`/`sendChunk`/`endChunked`）、`/stream` 演示路由、单区间 `Range`（206/416）、`/api/stats`（JSON） | **已完成**：`curl -N /stream` 收到 chunked 数据且无 `Content-Length`；`curl -r 0-9 /` 得 206 + `Content-Range`、越界 416；`/api/stats` 返回 JSON |
 
 ## 6. 测试计划
@@ -88,7 +90,7 @@ while (!rest.empty()) { st = parser.parse(rest); if (st != Complete) break; 处�
 | 分组 | 位置 | 说明 |
 |---|---|---|
 | `http` | `tests/test_http_parser.cpp` | 纯解析，单线程无等待 → **TSAN 严格组** |
-| `ntimed_http` ✅ | `tests/test_http_server.cpp`（14 用例） | 连接级（测试页/路由/404/405/400/414/431/501/keep-alive/管线化/CORS/异常 500/存活）→ 只用 socket 超时 + `sleepMs`，**进 TSAN 严格组** |
+| `ntimed_http` ✅ | `tests/test_http_server.cpp`（**24 用例**） | 连接级（测试页/路由/404/405/400/414/431/501/keep-alive/管线化/CORS/异常 500/存活/**关闭矩阵**）→ 只用 socket 超时 + `sleepMs` + `poll`，**进 TSAN 严格组**。v0.1.1 起每条用例都断言「这一步之后连接是开还是关」（`stillOpen` / `waitEof`） |
 | 脚本 | `scripts/http_test.sh` ✅（11 组：测试页/CORS/路由/404/405/501/400/keep-alive + chunked `-N` + Range 206/416 + stats JSON） | `curl` 端到端：测试页、CORS、404/405、501、400、keep-alive；M3-c 加流式与 Range |
 
 ## 7. 风险清单
@@ -116,7 +118,8 @@ while (!rest.empty()) { st = parser.parse(rest); if (st != Complete) break; 处�
 | 路由配置时机 | **必须 `start()` 之前**；之后调用返回 false 且不生效（已记 Warn） | 排除"运行期动态加路由"（v0.1 不需要；还免掉"路由表被事件循环线程读时另一线程改"的并发问题） |
 | 响应基础头 | 由 `HttpServer::makeResponse()` 统一给（`Server`、CORS），处理器从它起步、可覆盖任意一项 | 排除"由处理器自己拼"——实现时真踩过：处理器自建的响应漏了 CORS，用例才抓到 |
 | 非 GET | 一律 405 + `Allow: GET` | 排除"假装支持 POST"（v0.1 不需要 body 处理，明确 405 比半支持好） |
-| 畸形请求 | 回 4xx + `Connection: close`，**不再解析后续字节** | 攻击面收敛；响应里带上具体原因（`errorName()`）便于自助定位 |
+| 畸形请求 | 回 4xx + `Connection: close`，**然后真的关连接**，不再解析后续字节 | 攻击面收敛；响应里带上具体原因（`errorName()`）便于自助定位 |
+| **畸形请求后真的关连接**（v0.1.1 变更记录） | 回 4xx（带 `Connection: close`）→ `shutdownAfterFlush()` 排空后关；`malformed` 计数语义**改为每连接一次**（与 parser 的 `totalRejected()` 对齐） | 修前：头里写 close 但连接不关，同一条连接每读一包就再回一个 400（**实测 5 条畸形 → 5 个响应**，日志却只有 1 条）。排除「立即 `shutdown()`」（会丢掉发送队列里没写完的数据 = 静默丢数据）；排除「只靠响应头声明」（RFC 7230 §6.6 要求发了 close 就必须关） |
 | chunked 头部 | `Transfer-Encoding: chunked` 且**绝不发 `Content-Length`**；结束块由 `endChunked()` 显式发（忘了则 Session 兜底 + Warn） | 长度在传输中才知道；少发结束块 = 客户端静默挂住，必须吵出来 |
 | chunked 发送出口 | 由 `HttpSession` 注入 `Sender`；`send()` 返回 0 视为成功（已入队） | 与 M2 队列/背压语义对齐；M6 的 FLV 同一形状 |
 | Range | 只支持 `bytes=a-b` / `bytes=a-`；多区间/后缀区间/畸形 → 忽略回 200 + Warn；起点越界 → 416 | 不做 multipart/byteranges，也不做半吊子 206 |

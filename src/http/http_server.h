@@ -80,6 +80,13 @@ public:
     uint64_t total4xx() const;
     uint64_t total5xx() const;
     uint64_t totalMalformed() const;   // 解析层拒掉的（含 400/414/431）
+    /**
+     * 【v0.1.1】「发完再关」排程失败的次数（应当恒为 0）
+     * @note 什么时候会涨：`Session::shutdownAfterFlush()` 返回 false 且连接**还没在关**
+     *       （poller 已退出 / 截止定时器建不出来）。那时必须立刻硬关连接，
+     *       否则会留下"活着但永远不回话"的连接 —— 比不关更糟。计数 + Warn 让它可观测。
+     */
+    uint64_t totalCloseFallback() const;
     /// 网络层计数（会话数 / accept / 空闲超时 / 收超限 / 发超限）
     TcpServer &tcp();
 
@@ -88,6 +95,8 @@ private:
     /// 内部：给会话用（会话在 http_server.cpp 里定义）
     void onRequestHandled(int status);
     void onMalformedRequest();
+    /// 【v0.1.1】会话报告：「发完再关」排程失败（计数，由会话在硬关前调用）
+    void onCloseFallback();
     HttpHandler findHandler(const std::string &path) const;
     /// 建一个已填好 CORS 头的响应
     HttpResponse makeResponse(int status) const;
@@ -107,6 +116,8 @@ private:
     std::atomic<uint64_t> _total_4xx{0};
     std::atomic<uint64_t> _total_5xx{0};
     std::atomic<uint64_t> _total_malformed{0};
+    /// 【v0.1.1】「发完再关」排程失败次数（恒为 0 才正常；见 totalCloseFallback 的说明）
+    std::atomic<uint64_t> _total_close_fallback{0};
     /// 【M7】进程/服务启动时刻（单调时钟毫秒）：`/api/stats` 的 `uptime_ms`（FR-6.1 要求"运行时长"）
     uint64_t _started_at_ms = 0;
 };

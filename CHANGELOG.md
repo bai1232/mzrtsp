@@ -7,6 +7,38 @@
 
 （下一版内容；v0.2.0 计划见 [docs/ROADMAP.md](docs/ROADMAP.md)）
 
+## [0.1.1] - 2026-10-18
+
+> **修复**：`Connection: close` 与畸形请求之后**只写响应头、不真的关连接**（协议违规 + 攻击面未收敛）。
+> 逐条证据与变异验证见 **[docs/ACCEPTANCE_v0.1.1.md](docs/ACCEPTANCE_v0.1.1.md)**。
+
+### Fixed
+- **`Connection: close` 不生效**：服务端只把 `Connection: close` 写进响应头，
+  `handleOneRequest()` 发完从不关闭连接。后果：客户端按 close 语义等 EOF 要等到 **60s** 读空闲（FR-4.4）；
+  同一连接还能继续发请求（实测「close 请求」之后第 2 条请求照样回 **200**）。违反 RFC 7230 §6.6。
+- **畸形请求回完不关、且可被反复触发**：`sendParseError()` 同样只写头；解析判错后连接不关，
+  同一条连接每读到一个报文就再回一个 400（实测连发 5 条畸形 → **收到 5 个 400**，`malformed` 计成 5，
+  而日志只有 1 条）。与 `docs/DESIGN_M3.md` §决策记录「回完就关、不再解析后续字节」相反。
+- 三处关闭出口统一走 `Session::shutdownAfterFlush()`：普通响应 / **chunked 早退分支**（原实现漏了它）/
+  解析错误。**`chunkedAsync`（HTTP-FLV）明确排除** —— 它的关闭权在 `endStreamFn`/`abortFn`（M6-b），
+  双关会把正在推的流掐断。
+- 「发完再关」排程失败时不再静默：计数 `closeFallback`（`/api/stats` 暴露）+ Warn + 立即硬关兜底
+  （否则会留下「活着但永远不回话」的连接，比不关更糟）。
+
+### Changed
+- `malformed` 计数语义：由「每次读到畸形报文 +1」改为「**每个连接 +1**」（与 `HttpParser::totalRejected()` 对齐）。
+- `/api/stats` 新增 `"closeFallback":N`（正常恒为 0）。
+
+### Tests
+- `ntimed_http` **23 → 24 用例 / 263 断言**：每条用例补齐 **status + body + 关键头**，
+  并**断言这一步之后连接是开还是关**（`waitEof()` 读到 EOF / `stillOpen()` 用 `poll` 给 50ms 观察窗）；
+  新增 `ntimed_http_malformed_single_response`（一条连接只回一次 4xx）。
+- **变异验证 3 组**：
+  - **M1**（把 `closeAfterFlush` 改成空操作 = 复现修前行为）→ **6 条用例红**：`close_honored` / `400` / `414` / `431` / `survives` / `single_response`
+  - **M2**（无条件关 = 修过头）→ **9 条对照组全红**：测试页 / `404` / `501` / keep-alive / `405` / 管线化 / chunked 保活 / `500` / CORS
+  - **M3**（去掉「每连接只回一次」的守卫）→ **仍绿** —— 诚实记录：关闭正常时该守卫不可观测，
+    它只在「关闭失效」的降级路径上兜底（详见 `docs/ACCEPTANCE_v0.1.1.md` §5）
+
 ## [0.1.0] - 2026-10-12
 
 > **v0.1.0 发布**：MP4 / H264 裸流 → **HTTP-FLV**（remux、零拷贝、一源多消费者），浏览器可直接播。

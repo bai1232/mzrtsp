@@ -206,10 +206,11 @@ MZMEDIA_SERVER=./build-asan/bin/mzmedia ./scripts/concurrent_test.sh --quick   #
 | FR-3.5 节流（按源时间轴与墙钟对齐，不得以磁盘速度灌入） | 单测 `media`：`Throttle` 按 dts 等待（`speed=1` 时 40ms 处的包真的等 ~40ms；`speed=100` 时 500ms 处的包几乎不等）；`enabled=false` 立即放行；**中止标志置位立刻返回 false**（不睡满，否则 `stop()` 的 join 要等满一拍）。集成：单测 `srcmgr` 用 **8 倍速**读 2 秒样本，断言用时 **≥100ms**（证明没有全速灌入）且 **<1500ms**（没有慢到实时） |
 | FR-2.1 v0.1 输入 MP4 / H264 裸流 | 单测 `srcmgr`：`DemuxerProducer` 真读 `samples/sample.mp4`（320x240 H264 + AAC）到 EOF，视频 dts 单调、关键帧 1 个、音视频包都 > 0；H264 裸流由 M4 的 `ffmpeg` 分组覆盖 |
 | FR-6.3 关键事件落日志 | 源创建 / 空闲释放走 `InfoL`（`SourceManager`）；打不开走 `WarnL` 且**不注册源**（`srcmgr_open_failure_not_silent` 断言 `lastError()` 非空） |
-| FR-4.4 连接上限 / 读空闲 / 写阻塞 | 单测：连接上限设为 1 时第 2 个连接被拒且 `totalRejected()` 增长；`recv_idle=50ms` + 连上不发数据的客户端 → 阈内断开且 `onError` 为超时；`send_blocked=50ms` + 只连不读的客户端 → 断开且 `bytesOut` 停止增长 |
+| FR-4.4 连接上限 / 读空闲 / 写阻塞（**v0.1.1 起含「声明 close 必须真关」**） | 单测：连接上限设为 1 时第 2 个连接被拒且 `totalRejected()` 增长；`recv_idle=50ms` + 连上不发数据的客户端 → 阈内断开且 `onError` 为超时；`send_blocked=50ms` + 只连不读的客户端 → 断开且 `bytesOut` 停止增长 |
 | FR-3.1 HTTP-FLV（chunked、首包即 sequence header） | **M6-a ✅**：单元 `flv` 组逐字节断言 header/tag/sequence header；集成 `scripts/flv_mux_test.sh` —— 产物经 `ffprobe` 认成 **h264 320x240 + aac**、解码 **50 帧 / 2 秒**、`ffmpeg -f null -` 完整解码无 error（**8/8**）。M6-b：`curl -N http://…/live/x.flv` 拿到合法 FLV |
 | FR-3.3 AAC 转发 / 无音频也能播 | 单元 `flv`：AAC sequence header（`0xAF` + AudioSpecificConfig）与 raw 包布局；另有**纯视频**用例（`Streams{video, nullptr}`）证明"没有音频不报错" |
 | FR-3.4 时间戳基准（FLV → 毫秒） | 单元 `flv`：`CompositionTime = pts - dts`（含负值的 24 位补码）；**per-client 基准**（中途接入的时间戳也从 0 开始）；32 位自然回绕；早于基准的包钳 0 并计数 |
+| **FR-4.5** 404/405/500 规范响应 + 日志（v0.1.1 起含「错误响应之后连接怎么办」） | 单测 `ntimed_http`（`tests/test_http_server.cpp`）：每条用例都断言 **status + body + 关键头**，并**断言这一步之后连接是开还是关** —— `400/414/431`（解析错误）必须读到 **EOF**（`waitEof`）；`404/405/500/501`（合法请求）必须 `stillOpen`（`poll` 给 50ms 观察窗，避免"误关的 FIN 晚到"被放过）。计数不变式：`totalMalformed()` **每连接 +1**、`total4xx()/total5xx()` 与响应数一致、`totalCloseFallback()` 恒为 0。端到端：`scripts/http_test.sh` 的 404/405/501/400 四项 |
 | FR-4.1 `/live/<name>.flv` 路由 | **M6-c ✅**：`scripts/flv_http_test.sh` **49/49** —— `curl -N` 拉到 **55,623 字节**合法 FLV（`ffprobe` 认 h264 320x240 + aac、解码 50 帧；`ffmpeg -f null -` 无 error）；`Content-Type: video/x-flv` + chunked + CORS；名字映射支持白名单扩展名（`.mp4/.h264/…`）；不存在 / 目录穿越 / 非法名 / 非白名单扩展名一律 404（并用**不同提示语**区分"路径非法"与"文件不存在"） |
 | NFR-1 首帧 < 1s | **M6-c ✅**：协议层用脚本 §4（"文件长到 2KB"近似首帧到达，实测 **20ms 级**，TTFB 3.3ms）；`FlvSender::start()` 在路由处理器内**同步**发出 FLV Header + sequence header 并**立刻搬一次队列**（不等第一帧，FR-3.1）；浏览器侧看 DevTools 的 TTFB（第 3.1 节） |
 | FR-2.1 裸流 → FLV（Annex-B → AVCC） | **M6-c ✅**：纯函数单测 `ffmpeg` 组 7 例（逐字节转换、avcC 逐字段、拒绝畸形）；`producer` 组断言快照是 avcC 且 `FlvMuxer::prepare()==Ok`、每个包都是合法 AVCC；端到端 `scripts/flv_http_test.sh` §3 用 `ffprobe`+`ffmpeg`+**python 逐 tag 复查 AVCC 结构**三重判定 |
@@ -309,21 +310,21 @@ cmake -B build-tsan -DMZMEDIA_ENABLE_TSAN=ON -DCMAKE_CXX_COMPILER=g++-12
 
 | 分组 | 用例数 | TSAN 报告 |
 |---|---|---|
-| 严格组（18 组）：`selftest` 4 / `util` 13 / `logger` **14** / `queue` 15 / `pool` 6 / `semaphore` 5 / `core` 12 / `poller` 16 / `timer` 20 / `buffer` 13 / `http` **42** / `ntimed_http` **23** / `ffmpeg` 27 / `media` 24 / `ntimed_media` 6 / `srcmgr` 12 / `flv` 20 / `producer` **8** | **280** | **0** |
-| 含超时等待的组：`qtimed` 2 / `ptimed` 1 / `ntimed` **40** | **43** | **0**（g++-12 运行时已无 §8.2 的误报） |
-| 合计（脚本统计，含跨组重复计数） | **323** | 真问题 **0** |
+| 严格组（18 组）：`selftest` 4 / `util` 13 / `logger` **14** / `queue` 15 / `pool` 6 / `semaphore` 5 / `core` 12 / `poller` 16 / `timer` 20 / `buffer` 13 / `http` **43** / `ntimed_http` **24** / `ffmpeg` 27 / `media` 24 / `ntimed_media` 6 / `srcmgr` 12 / `flv` 20 / `producer` **8** | **282** | **0** |
+| 含超时等待的组：`qtimed` 2 / `ptimed` 1 / `ntimed` **41** | **44** | **0**（g++-12 运行时已无 §8.2 的误报） |
+| 合计（脚本统计，含跨组重复计数） | **326** | 真问题 **0** |
 
 **同批其它门禁**（`VERSIONING.md` 发版清单里的项目；下表为 v0.1.0 的最终数字）：
 
 | 门禁 | 命令 | 实测 |
 |---|---|---|
 | 编译 | `cmake --build build` | **0 warning / 0 error**（`-Wall -Wextra`，无任何 `-Wno-`；ASAN 构建同样 0） |
-| 单元（串行） | `cd build && ctest --output-on-failure` | **21/21 分组通过**（**247 用例**；**不要**加 `-j`，见 §2.2） |
+| 单元（串行） | `cd build && ctest --output-on-failure` | **21/21 分组通过**（**248 用例**；**不要**加 `-j`，见 §2.2） |
 | 单元（ASAN） | `cmake -B build-asan -DMZMEDIA_ENABLE_ASAN=ON && cd build-asan && ctest` | **21/21 通过** |
 | 并发/长跑（**Debug** 构建） | `./scripts/concurrent_test.sh`（10 路 × 5 分钟）+ `--duration 3600`（1 小时） | 全绿；1 小时数据见 `ACCEPTANCE_v0.1.0.md` §3.3（Release 长跑未做，见该文件 §6 第 12 项） |
 | 并发（**ASAN** 构建） | `MZMEDIA_SERVER=./build-asan/bin/mzmedia ./scripts/concurrent_test.sh --quick --kill-half --overload 8` | **10/10 通过**（对应 NFR-3 的"ASAN 无报错"） |
 | 脚本验收 | `scripts/{http,flv_mux,flv_http}_test.sh` | **全绿**（M3 / 8 项 / **51 项**） |
-| 单进程全量 | `./build/bin/mzmedia_unittest` | **247/247 用例、61,341 条断言**（诊断用，不作为计时门禁） |
+| 单进程全量 | `./build/bin/mzmedia_unittest` | **248/248 用例、61,386 条断言**（诊断用，不作为计时门禁） |
 | 发版验收 | `docs/ACCEPTANCE_v0.1.0.md` | 逐条 SC/NFR/FR 的"状态 + 证据 + 实测"（v0.1.0 的发布依据） |
 
 > 分组按**用例名子串**匹配，因此个别用例会同时属于两个组

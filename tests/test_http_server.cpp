@@ -5,7 +5,8 @@
  *   正常  测试页、自定义路由、兜底路由、keep-alive 复用、管线化、CORS
  *   空    未知路径（404）、无 body 请求
  *   满    请求行超长（414）、头部超长（431）、非 GET（405）
- *   断开  Connection: close、畸形请求后服务端仍存活
+ *   断开  Connection: close / 畸形请求 **必须真的关**（读到 EOF）；404/405/500/501 必须**保活**
+ *         （v0.1.1 起每一步都断言"这条连接此刻是开还是关"，见 stillOpen / waitEof）
  *   超大  5KB URI、40KB 头部
  *
  * 为什么能进 TSAN 严格组：只用 socket 超时 + sleepMs 轮询（**不用** std::condition_variable
@@ -21,11 +22,14 @@
 
 #include <arpa/inet.h>
 #include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <map>
 #include <netinet/in.h>
+#include <poll.h>
 #include <string>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 using namespace mzmedia;
@@ -214,6 +218,69 @@ bool sendAll(int fd, const std::string &data) {
     return true;
 }
 
+/// 【v0.1.1】等对端**真的关闭**（recv 返回 0 = 收到 FIN）
+/// @return true = 读到了 EOF；false = 超时/出错（= 服务端没关，用例应当红）
+/// @note 判据是"关没关"，**不是延迟**：所以给宽上限（默认 2s），不拿它当计时门禁
+///       （TESTING.md §2.2 的教训）。服务端"发完再关"要排空队列，慢一点是正常的。
+bool waitEof(int fd, int timeout_ms = 2000) {
+    const uint64_t deadline = getCurrentMillisecond() + static_cast<uint64_t>(timeout_ms);
+    char buf[4096];
+    for (;;) {
+        const uint64_t now = getCurrentMillisecond();
+        if (now >= deadline) {
+            return false;
+        }
+        const uint64_t left = deadline - now;
+        struct timeval tv;
+        tv.tv_sec = static_cast<time_t>(left / 1000);
+        tv.tv_usec = static_cast<suseconds_t>((left % 1000) * 1000);
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n == 0) {
+            return true;   // FIN
+        }
+        if (n > 0) {
+            continue;      // 还有尾巴数据：收干净再继续等 EOF（不能当失败）
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            return false;  // 真错误
+        }
+    }
+}
+
+/// 【v0.1.1】断言连接**还开着**：在 grace_ms 观察窗内既不许出现 EOF，也不该有多余数据
+/// 为什么需要它：只加"畸形后必须 EOF"会漏掉另一类回归 —— 把该保活的连接也关了。
+/// 为什么要观察窗：服务端的关闭是"排空后再关"，FIN 不是同一瞬间到达；
+///   只做一次 `recv(MSG_DONTWAIT)` 会**放过**误关（变异验证实测：`get_test_page` 侥幸绿）。
+///   grace_ms 只用来"给误关留出暴露时间"，判据仍是"关没关"，不是延迟门禁（TESTING.md §2.2）。
+bool stillOpen(int fd, int grace_ms = 50) {
+    for (;;) {
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        const int rc = ::poll(&pfd, 1, grace_ms);
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;   // poll 失败：无法证明连接还活着
+        }
+        if (rc == 0) {
+            return true;    // 观察窗内没人来敲门，也没 FIN → 连接还开着
+        }
+        char buf[4096];
+        const ssize_t n = ::recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n == 0) {
+            return false;   // EOF = 被关了（= 修过头）
+        }
+        if (n < 0) {
+            return errno == EAGAIN || errno == EWOULDBLOCK;
+        }
+        // n > 0：还有没读的数据，读干净再等下一轮
+    }
+}
+
 /// 起一个 HttpServer（带 poller），port=0 由内核分配
 struct ServerFixture {
     EventPoller::Ptr poller;
@@ -267,6 +334,8 @@ MZ_TEST(ntimed_http_get_test_page) {
     MZ_ASSERT_FALSE(resp.has("connection"));   // 长连接默认不发 Connection 头
     MZ_ASSERT_EQ(fx.server->totalRequests(), 1u);
     MZ_ASSERT_EQ(fx.server->total4xx(), 0u);
+    // ★ v0.1.1：没声明 close 的响应必须**保活**（防"修过头把所有连接都关了"）
+    MZ_ASSERT_TRUE(stillOpen(cli));
     ::close(cli);
 }
 
@@ -281,6 +350,7 @@ MZ_TEST(ntimed_http_404_unknown_path) {
     MZ_ASSERT_EQ(resp.status, 404);
     MZ_ASSERT_TRUE(resp.body.find("404") != std::string::npos);
     MZ_ASSERT_EQ(fx.server->total4xx(), 1u);
+    MZ_ASSERT_TRUE(stillOpen(cli));   // 404 是合法请求 → 必须保活（不能因为"是错误码"就关）
     ::close(cli);
 }
 
@@ -295,6 +365,7 @@ MZ_TEST(ntimed_http_501_live_route) {
     MZ_ASSERT_EQ(resp.status, 501);   // 路由存在但没有实现（M6 才有）
     MZ_ASSERT_TRUE(resp.body.find("Not Implemented") != std::string::npos);
     MZ_ASSERT_EQ(fx.server->total5xx(), 1u);
+    MZ_ASSERT_TRUE(stillOpen(cli));   // 501 也是合法请求 → 保活
     ::close(cli);
 }
 
@@ -329,6 +400,7 @@ MZ_TEST(ntimed_http_custom_route_and_fallback) {
     MZ_ASSERT_EQ(resp.status, 200);
     MZ_ASSERT_STR_EQ(resp.body, std::string("fallback:/other"));
     MZ_ASSERT_EQ(fx.server->totalRequests(), 2u);
+    MZ_ASSERT_TRUE(stillOpen(cli));   // 两次都保活
     ::close(cli);
 }
 
@@ -347,7 +419,9 @@ MZ_TEST(ntimed_http_handler_exception_500) {
     Response resp;
     MZ_ASSERT_TRUE(readResponse(cli, &resp));
     MZ_ASSERT_EQ(resp.status, 500);
+    MZ_ASSERT_TRUE(resp.body.find("Internal Server Error") != std::string::npos);
     MZ_ASSERT_EQ(fx.server->total5xx(), 1u);
+    MZ_ASSERT_TRUE(stillOpen(cli));   // 500 不是解析错误 → 连接要保活
     ::close(cli);
 }
 
@@ -363,6 +437,7 @@ MZ_TEST(ntimed_http_cors_can_be_disabled) {
     MZ_ASSERT_TRUE(readResponse(cli, &resp));
     MZ_ASSERT_EQ(resp.status, 200);
     MZ_ASSERT_FALSE(resp.has("access-control-allow-origin"));   // 关掉之后必须没有 CORS 头
+    MZ_ASSERT_TRUE(stillOpen(cli));
     ::close(cli);
 }
 
@@ -387,8 +462,10 @@ MZ_TEST(ntimed_http_keepalive_two_requests) {
     MZ_ASSERT_TRUE(sendAll(cli, "GET /nope HTTP/1.1\r\n\r\n"));
     MZ_ASSERT_TRUE(readResponse(cli, &resp));
     MZ_ASSERT_EQ(resp.status, 404);
+    MZ_ASSERT_TRUE(resp.body.find("404 Not Found") != std::string::npos);   // 可观察量：body
     MZ_ASSERT_EQ(fx.server->totalRequests(), 2u);
     MZ_ASSERT_EQ(fx.server->tcp().totalAccepted(), 1u);   // 只建立了 1 条连接
+    MZ_ASSERT_TRUE(stillOpen(cli));   // ★ 两条都保活 → 不能因为"修 close"把它们关了
     ::close(cli);
 }
 
@@ -402,6 +479,10 @@ MZ_TEST(ntimed_http_connection_close_honored) {
     MZ_ASSERT_TRUE(readResponse(cli, &resp));
     MZ_ASSERT_EQ(resp.status, 200);
     MZ_ASSERT_STR_EQ(resp.get("connection"), std::string("close"));   // 必须如实告诉客户端
+    // ★ v0.1.1：**声明 close 就必须真的关**（RFC 7230 §6.6）。
+    //   修前 = 红：头里写着 close，服务端却不关，客户端只能等到 60s 读空闲（FR-4.4）。
+    MZ_ASSERT_TRUE(waitEof(cli));
+    MZ_ASSERT_EQ(fx.server->totalCloseFallback(), 0u);
     ::close(cli);
 }
 
@@ -420,6 +501,7 @@ MZ_TEST(ntimed_http_pipelined_same_packet) {
     MZ_ASSERT_EQ(first.status, 200);
     MZ_ASSERT_EQ(second.status, 404);
     MZ_ASSERT_EQ(fx.server->totalRequests(), 2u);
+    MZ_ASSERT_TRUE(stillOpen(cli));   // 管线化没声明 close → 两条响应之后仍然保活
     ::close(cli);
 }
 
@@ -437,8 +519,15 @@ MZ_TEST(ntimed_http_400_malformed) {
     MZ_ASSERT_TRUE(readResponse(cli, &resp));
     MZ_ASSERT_EQ(resp.status, 400);
     MZ_ASSERT_STR_EQ(resp.get("connection"), std::string("close"));   // 畸形：回完就关
+    // 可观察量：body 必须说清是**哪一类**畸形（客户端自助定位，不靠猜）
+    MZ_ASSERT_TRUE(resp.body.find("HTTP 400 Bad Request") == 0);
+    MZ_ASSERT_TRUE(resp.body.find("bad-request-line") != std::string::npos);
     MZ_ASSERT_EQ(fx.server->totalMalformed(), 1u);
     MZ_ASSERT_EQ(fx.server->total4xx(), 1u);
+    // ★ v0.1.1：光有 close **头**不够，必须真的读到 EOF。
+    //   修前 = 红（服务端不关；客户端按 close 语义永远等不到 FIN）。
+    MZ_ASSERT_TRUE(waitEof(cli));
+    MZ_ASSERT_EQ(fx.server->totalCloseFallback(), 0u);   // 应走"排空后再关"，不是硬关兜底
     ::close(cli);
 }
 
@@ -452,7 +541,12 @@ MZ_TEST(ntimed_http_414_uri_too_long) {
     Response resp;
     MZ_ASSERT_TRUE(readResponse(cli, &resp));
     MZ_ASSERT_EQ(resp.status, 414);
+    MZ_ASSERT_STR_EQ(resp.get("connection"), std::string("close"));   // v0.1.1：原来连头都没断言
+    MZ_ASSERT_TRUE(resp.body.find("HTTP 414 URI Too Long") == 0);
+    MZ_ASSERT_TRUE(resp.body.find("uri-too-long") != std::string::npos);
     MZ_ASSERT_EQ(fx.server->totalMalformed(), 1u);
+    MZ_ASSERT_EQ(fx.server->total4xx(), 1u);
+    MZ_ASSERT_TRUE(waitEof(cli));   // ★ 超限属于解析错误 → 必须断开
     ::close(cli);
 }
 
@@ -470,7 +564,12 @@ MZ_TEST(ntimed_http_431_headers_too_large) {
     Response resp;
     MZ_ASSERT_TRUE(readResponse(cli, &resp));
     MZ_ASSERT_EQ(resp.status, 431);
+    MZ_ASSERT_STR_EQ(resp.get("connection"), std::string("close"));
+    MZ_ASSERT_TRUE(resp.body.find("HTTP 431 Request Header Fields Too Large") == 0);
+    MZ_ASSERT_TRUE(resp.body.find("headers-too-large") != std::string::npos);
     MZ_ASSERT_EQ(fx.server->totalMalformed(), 1u);
+    MZ_ASSERT_EQ(fx.server->total4xx(), 1u);
+    MZ_ASSERT_TRUE(waitEof(cli));   // ★ 超限属于解析错误 → 必须断开
     ::close(cli);
 }
 
@@ -485,7 +584,9 @@ MZ_TEST(ntimed_http_405_method_not_allowed) {
     MZ_ASSERT_EQ(resp.status, 405);
     MZ_ASSERT_STR_EQ(resp.get("allow"), std::string("GET"));   // 告诉客户端支持什么
     MZ_ASSERT_EQ(fx.server->total4xx(), 1u);
+    MZ_ASSERT_TRUE(resp.body.find("405 Method Not Allowed") == 0);
     MZ_ASSERT_EQ(fx.server->totalMalformed(), 0u);   // 合法请求、只是不支持：不算畸形
+    MZ_ASSERT_TRUE(stillOpen(cli));   // ★ 405 不是解析错误 → 不能顺手关（防修过头）
     ::close(cli);
 }
 
@@ -499,6 +600,7 @@ MZ_TEST(ntimed_http_server_survives_malformed) {
     Response resp;
     MZ_ASSERT_TRUE(readResponse(bad, &resp));
     MZ_ASSERT_EQ(resp.status, 400);
+    MZ_ASSERT_TRUE(waitEof(bad));   // 畸形连接必须被服务端关掉（不是靠客户端自己关）
     ::close(bad);
 
     // 服务端必须还能正常服务新连接
@@ -509,6 +611,38 @@ MZ_TEST(ntimed_http_server_survives_malformed) {
     MZ_ASSERT_EQ(resp.status, 200);
     MZ_ASSERT_EQ(fx.server->totalRequests(), 2u);
     ::close(good);
+}
+
+MZ_TEST(ntimed_http_malformed_single_response) {
+    // ★ v0.1.1 修的第二个 bug：**一条连接只回一次 4xx**。
+    //   修前：解析判错后连接不关，同一连接每读到一个报文就再回一个 400
+    //   —— 实测连发 5 条畸形 → 收到 5 个 400、`malformed` 计成 5（日志却只有 1 条）。
+    ServerFixture fx;
+    MZ_ASSERT_TRUE(fx.setup());
+    const int cli = connectTo(fx.server->port());
+    MZ_ASSERT_GT(cli, 0);
+
+    // 一个包里塞 3 条畸形请求（缺版本段）：只允许回 1 个响应
+    MZ_ASSERT_TRUE(sendAll(cli, "GET /\r\n\r\nGET /\r\n\r\nGET /\r\n\r\n"));
+    Response resp;
+    MZ_ASSERT_TRUE(readResponse(cli, &resp));
+    MZ_ASSERT_EQ(resp.status, 400);
+    MZ_ASSERT_TRUE(resp.body.find("HTTP 400 Bad Request") == 0);
+    MZ_ASSERT_EQ(fx.server->totalRequests(), 1u);
+    MZ_ASSERT_EQ(fx.server->totalMalformed(), 1u);
+    MZ_ASSERT_EQ(fx.server->total4xx(), 1u);
+    // 回完就关：再 recv 必须是 EOF（不是"又来一个 400"）
+    MZ_ASSERT_TRUE(waitEof(cli));
+
+    // 服务端没被搞坏：新连接照常工作
+    const int again = connectTo(fx.server->port());
+    MZ_ASSERT_GT(again, 0);
+    MZ_ASSERT_TRUE(sendAll(again, "GET /no/such HTTP/1.1\r\n\r\n"));
+    MZ_ASSERT_TRUE(readResponse(again, &resp));
+    MZ_ASSERT_EQ(resp.status, 404);
+    MZ_ASSERT_EQ(fx.server->totalRequests(), 2u);
+    ::close(again);
+    ::close(cli);
 }
 
 
@@ -551,6 +685,7 @@ MZ_TEST(ntimed_http_chunked_keeps_connection_usable) {
     MZ_ASSERT_EQ(resp.status, 404);
     MZ_ASSERT_EQ(fx.server->totalRequests(), 2u);
     MZ_ASSERT_EQ(fx.server->tcp().totalAccepted(), 1u);   // 同一条连接
+    MZ_ASSERT_TRUE(stillOpen(cli));   // ★ 同步 chunked + 保活 → 不能被"发完再关"误关
     ::close(cli);
 }
 

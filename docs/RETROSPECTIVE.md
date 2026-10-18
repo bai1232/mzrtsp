@@ -164,6 +164,24 @@
 - **发版批次要专门花时间对齐"说的"与"做的"**：需求号、模块职责表、未决清单都会随时间漂移；
   一次系统性核对（编号求差集、文档 vs 代码逐条对）比新加功能更值。
 
+### 2.9 ✅ v0.1.1：**「写进响应头」不等于「做了这件事」**（2026-10-18）
+
+| # | 现象（可观测） | 根因 | 修法 | 防回归 |
+|---|---|---|---|---|
+| 1 | 客户端发 `Connection: close`，响应头如实写着 close，**连接却一直开着**（要等 60s 读空闲） | `handleOneRequest()` 只 `send(resp.serialize())`，从不判 `resp.keepAlive()` —— 关闭语义只落在 `serializeHead()` 的那一行字符串上 | 三处出口（普通响应 / **chunked 早退** / 解析错误）统一走 `Session::shutdownAfterFlush()` | `ntimed_http_connection_close_honored` 加「读到 EOF」；变异 M1 变红 |
+| 2 | 畸形请求后同一连接连发 5 条 → **收到 5 个 400**；`malformed` 计成 5、日志只有 1 条 | `sendParseError()` 同样只写头。而 `HttpParser` 早在 `http_parser.cpp:98` 就实现了粘滞态，注释写着「调用方应断开」——**契约一直写着，调用方没实现** | 主因是关连接；另加「每连接只回一次 4xx」的守卫 | 新用例 `ntimed_http_malformed_single_response`；**诚实记录**：该守卫在「关闭正常」时不可观测（变异 M3 仍绿） |
+| 3 | `chunked` 路径的关闭被漏掉 | `if (resp.chunked()) { ...; return; }` 在**中途**返回，外层关闭逻辑盖不到 | 在该分支单独判 `!resp.chunkedAsync() && !resp.keepAlive()`（`chunkedAsync` 双关会掐断 FLV 流） | `ntimed_http_chunked_keeps_connection_usable`（反向对照）+ 变异 M2 |
+| 4 | 用例全绿却什么都没验 | 断言写完立刻 `::close(cli)` —— **客户端自己先关**，服务端关不关看不出来；`readResponse()` 读到完整响应就返回，不等 EOF | 加 `waitEof()` / `stillOpen()`（`poll` 给 50ms 观察窗，否则误关的 FIN 晚到会被放过 —— 实测 `get_test_page` 侥幸绿） | 变异 M2：**9 条对照组全红** |
+
+**教训（可复用）**：
+- **「声明」与「实施」要分别有断言**：头里有 `Connection: close` 只证明"字符串写对了"，不证明"连接关了"。
+  同类风险点：`Content-Length` 与真实 body 长度、`Transfer-Encoding` 与真实分块、`Allow` 与真实支持的方法。
+- **测试里的 `close(cli)` 会掩盖「服务端该关没关」**：凡是"对端应主动关闭"的语义，断言只能是"客户端什么都不做、读到 EOF"。
+- **协议注释先于代码**：`http_parser.cpp:98` 那句"调用方应断开"挂了三个里程碑，没人验证过调用方是否照做。
+  **写「调用方必须 X」的时候，同批就要有一条断言证明调用方真的 X** —— 否则它就是下一份漂移的文档。
+- 这个 bug 的**验收脚本抓不到**：`curl` 收到完整响应就自己关连接，`readResponse()` 也不等 EOF。
+  「断开」这一维只有**裸 socket 客户端**能测到 —— 这就是 §3.1 第 1 条"先确认测量工具"的具体例子。
+
 ## 3. 测量工具与误判（**复用价值最高的一节**）
 
 > 这一节的价值高于 §2：§2 复用的是"某个坑的修法"，这一节复用的是**方法**。

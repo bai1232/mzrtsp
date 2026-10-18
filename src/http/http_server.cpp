@@ -237,12 +237,23 @@ public:
 
 protected:
     void onRecv(const Buffer::Ptr &buf) override {
+        // 【v0.1.1 修的真 bug】解析一旦判错，本连接的结局就定了（回 4xx + 关连接）。
+        // 这里必须**先挡住**：`sendParseError` 里排的"发完再关"只要还没落地（最多
+        // kFlushCloseWaitMs），后续读进来的每个报文都会再触发一次 `sendParseError`。
+        // 修前实测：同一条连接连发 5 条畸形 → **收到 5 个 400**、`malformed` 计成 5，
+        // 与 `DESIGN_M3.md` §决策记录「回完就关、不再解析后续字节」完全相反。
+        // 注意：真正的"不再接受数据"由 `HttpParser` 自己保证（`http_parser.cpp:98` 的粘滞态，
+        // 注释写着"调用方应断开"）；这里只负责**不重复响应**。
+        if (_malformed_replied) {
+            return;
+        }
         HttpParser::Status st = _parser.parse(buf->data(), buf->size());
         for (;;) {
             if (st == HttpParser::Status::Error) {
+                _malformed_replied = true;
                 _owner->onMalformedRequest();
                 sendParseError(statusForParseError(_parser.error()), _parser.errorName());
-                return;   // 不再解析后续字节：畸形请求的响应带 Connection: close
+                return;   // 响应带 Connection: close，且 sendParseError 里会真正关闭连接
             }
             if (st == HttpParser::Status::NeedMoreData) {
                 return;
@@ -337,6 +348,13 @@ private:
                 resp.endChunked();
             }
             _owner->onRequestHandled(resp.status());
+            // 【v0.1.1】关闭出口 ②：chunked 分支在上面的 `return` 就结束了，
+            // 外层"发完再关"盖不到它，必须在这里单独判一次。
+            // chunkedAsync（HTTP-FLV）**绝不能**走"发完再关" —— 它的关闭权在
+            // `setEndStream` / `setAbortFn`（M6-b），双关会把正在推的流掐断。
+            if (!resp.chunkedAsync() && !resp.keepAlive()) {
+                closeAfterFlush("chunked 响应声明 close");
+            }
             return;
         }
         _owner->onRequestHandled(resp.status());
@@ -344,6 +362,13 @@ private:
         const std::string wire = resp.serialize();
         // 返回 0 不是失败（数据已入队、由 EPOLLOUT 续写）；这里只关心连接是否已关闭
         send(wire.data(), wire.size());
+        // 【v0.1.1】关闭出口 ①：响应声明了 close（含 HTTP/1.0 默认非长连接）。
+        // 修前这里只把 `Connection: close` 写进头、**从不真的关**：
+        // 客户端按 close 语义等 EOF → 要等到 60s 读空闲（FR-4.4）；而且同一连接
+        // 还能继续发请求（实测第 2 条照样回 200）。违反 RFC 7230 §6.6。
+        if (!resp.keepAlive()) {
+            closeAfterFlush("响应声明 close");
+        }
     }
 
     void sendParseError(int status, const char *reason) {
@@ -354,12 +379,45 @@ private:
         _owner->onRequestHandled(status);
         const std::string wire = resp.serialize();
         send(wire.data(), wire.size());
+        // 【v0.1.1】关闭出口 ③：解析错误。修前这里只有 `Connection: close` 头，
+        // 连接实际不关 —— 客户端按 close 语义等 EOF 要等到 60s 读空闲，
+        // 期间同一条连接还会被反复喂畸形报文（见 onRecv 开头的 `_malformed_replied`）。
+        closeAfterFlush("解析错误响应");
+    }
+
+    /**
+     * 「发完再关」的唯一实现（三个出口共用：普通响应 / chunked 早退 / 解析错误）
+     * @param why 日志用：说明是哪个出口触发的
+     *
+     * 为什么不能直接 `shutdown()`：响应可能还在发送队列里（大响应/慢客户端），
+     * 立刻关会把已入队的数据丢掉 —— §4 明令禁止静默丢数据。所以统一走
+     * `Session::shutdownAfterFlush()`（排空后再关，队列本来就是空时**同步立即关**，
+     * 见 `session.cpp` 的 `maybeCloseAfterFlush`）。
+     */
+    void closeAfterFlush(const char *why) {
+        if (isShutdown()) {
+            return;   // 已经在关（客户端先走 / 写失败）：不是异常，不用重复处理
+        }
+        if (shutdownAfterFlush(kFlushCloseWaitMs)) {
+            return;
+        }
+        if (isShutdown()) {
+            return;   // 排程失败是因为它已经被别的路径关掉了：正常
+        }
+        // 真的排不上（poller 已退出 / 截止定时器建不出来）→ 必须硬关 + 计数 + Warn。
+        // 若这里静默放过，连接会"活着但永远不回话"，比修之前那个 bug 更糟。
+        _owner->onCloseFallback();
+        WarnP("HttpSession: 「发完再关」未能排程（%s）→ 立即关闭连接", why);
+        shutdown(SockException(SockException::ErrType::None, 0, why));
     }
 
     HttpServer *_owner;
     /// M6-b：连接级附件（流式响应的发送器/订阅者）—— 会话析构时统一释放
     std::vector<std::shared_ptr<void>> _held_resources;
     HttpParser _parser;
+    /// 【v0.1.1】本条连接是否**已经回过**畸形响应：每个连接只回一次 4xx
+    /// （parser 侧的"不再接受数据"由 HttpParser 自己保证；这里只管不重复响应）
+    bool _malformed_replied = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -400,6 +458,8 @@ bool HttpServer::start(uint16_t port, const std::string &bind_ip) {
             json += ",\"4xx\":" + std::to_string(_total_4xx.load());
             json += ",\"5xx\":" + std::to_string(_total_5xx.load());
             json += ",\"malformed\":" + std::to_string(_total_malformed.load());
+            // 【v0.1.1】应为 0；非 0 说明"发完再关"排程失败、走了硬关兜底（见 DESIGN_M3 §决策记录）
+            json += ",\"closeFallback\":" + std::to_string(_total_close_fallback.load());
             json += ",\"sessions\":" + std::to_string(t.sessionCount());
             json += ",\"accepted\":" + std::to_string(t.totalAccepted());
             json += ",\"rejected\":" + std::to_string(t.totalRejected());
@@ -593,6 +653,14 @@ void HttpServer::onRequestHandled(int status) {
 
 void HttpServer::onMalformedRequest() {
     _total_malformed.fetch_add(1);
+}
+
+void HttpServer::onCloseFallback() {
+    _total_close_fallback.fetch_add(1);
+}
+
+uint64_t HttpServer::totalCloseFallback() const {
+    return _total_close_fallback.load();
 }
 
 HttpHandler HttpServer::findHandler(const std::string &path) const {
