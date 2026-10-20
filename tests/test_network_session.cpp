@@ -10,6 +10,14 @@
  *
  * 断言纪律：poller 线程上的回调（onRecv/onError）**绝不能断言**，只记录到 atomic，
  * 断言回到测试主线程做。
+ *
+ * 【v0.1.2】除"回显内容对不对"之外，每条用例还要断言两类**可观测事实**：
+ *   1) 记账：bytesIn / bytesOut / pendingSendBytes / flushCloseTimeoutCount
+ *      （存活期间用 `SessionWatch` 读，关闭时刻用 `SessionSnapshot` 在 onError 里快照）；
+ *   2) 连接**是否真的关了**：客户端读到 EOF（`waitPeerClosed`），而不是只看"计数涨了"。
+ * 为什么必须持强引用才能测"真关"：不持有时会话一摘表就析构，`Socket::~Socket` 会**兜底**
+ * close(fd) —— 于是删掉 `shutdownImpl` 里的显式 `close()` 用例仍然全绿（变异实测）。
+ * 见 `SessionWatch::holdStrong()` 与本文件里标了 ★ 的断言。
  * ============================================================================
  */
 
@@ -25,6 +33,8 @@
 #include <cerrno>
 #include <cstring>
 #include <dirent.h>
+#include <memory>
+#include <mutex>
 #include <netinet/in.h>
 #include <string>
 #include <sys/socket.h>
@@ -113,20 +123,89 @@ size_t countOpenFds() {
     return n;   // 含 . / .. 与目录自身的 fd：作为**相对**基线足够
 }
 
+/**
+ * 【v0.1.2】会话**关闭时刻**的计数快照（在 onError 里取，那时对象还完整）
+ *
+ * 为什么需要：`Session` 由 `TcpServer` 用 `weak_ptr` 持有，用例拿不到强引用；
+ * 连接一断对象就没了。于是"关闭前一刻的计数"只能在 onError 这个唯一可观测点快照下来。
+ * 字段全用 atomic：写发生在轮询线程、读发生在用例主线程，**不能让 TSAN 报数据竞争**
+ *（`ntimed` 是 TSAN 严格组，必须 0 报告）。
+ */
+struct SessionSnapshot {
+    std::atomic<bool> valid{false};          // ★ 先看它：没发生过快照时下面那些 0 全是假绿
+    std::atomic<uint64_t> bytes_in{0};
+    std::atomic<uint64_t> bytes_out{0};
+    std::atomic<size_t> pending_send{0};
+    std::atomic<uint64_t> flush_timeouts{0};
+};
+
+/**
+ * 【v0.1.2】抓"当前这条连接的会话弱引用"，在会话**存活期间**读它的观测值
+ * @note attach 发生在轮询线程（accept 时），读发生在用例主线程 → weak_ptr 本身要加锁
+ */
+struct SessionWatch {
+    void attach(const std::shared_ptr<Session> &session) {
+        std::lock_guard<std::mutex> lck(_mtx);
+        _weak = session;
+    }
+    bool alive() const {
+        std::lock_guard<std::mutex> lck(_mtx);
+        return !_weak.expired();
+    }
+    /**
+     * 【v0.1.2】**替服务端保持一个强引用**（模拟"会话被别处持有"的真实场景：
+     * M6 的 `HttpResponse::holdResource()` 就把 FLV 的 Sender/订阅者挂在连接上）。
+     * 为什么需要：不持有强引用时，会话一被摘表就会析构，而 `Socket` 的析构又**兜底** close(fd) ——
+     * 于是"关闭流程到底有没有主动关 fd"这件事**根本区分不出来**（实测：删掉 shutdownImpl 里的
+     * `sock->close()`，用例仍然全绿）。持有强引用后，fd 只能靠显式关闭，泄漏才会暴露。
+     */
+    void holdStrong(const std::shared_ptr<Session> &session) {
+        std::lock_guard<std::mutex> lck(_mtx);
+        _weak = session;
+        _strong = session;
+    }
+    void releaseStrong() {
+        std::lock_guard<std::mutex> lck(_mtx);
+        _strong.reset();
+    }
+    uint64_t bytesIn() const { auto s = lockSession(); return s ? s->bytesIn() : 0; }
+    uint64_t bytesOut() const { auto s = lockSession(); return s ? s->bytesOut() : 0; }
+    size_t pendingSend() const { auto s = lockSession(); return s ? s->pendingSendBytes() : 0; }
+
+private:
+    std::shared_ptr<Session> lockSession() const {
+        std::lock_guard<std::mutex> lck(_mtx);
+        return _weak.lock();
+    }
+    mutable std::mutex _mtx;
+    std::weak_ptr<Session> _weak;
+    std::shared_ptr<Session> _strong;   // 只有 holdStrong() 才会填
+};
+
 /// 记录关闭原因类型的会话（用例断言"onError 为超时/超限"就靠它）
 class RecordingSession : public Session {
 public:
-    RecordingSession(const Socket::Ptr &sock, const EventPoller::Ptr &poller, std::atomic<int> *out)
-        : Session(sock, poller), _out(out) {}
+    RecordingSession(const Socket::Ptr &sock, const EventPoller::Ptr &poller, std::atomic<int> *out,
+                     SessionSnapshot *snap = nullptr)
+        : Session(sock, poller), _out(out), _snap(snap) {}
 
 protected:
     void onError(const SockException &err) override {
         _out->store(static_cast<int>(err.type()));   // 回调在 poller 线程：只记录，不断言
+        if (_snap != nullptr) {
+            // 顺序要注意：先填字段、最后置 valid（全是 seq_cst atomic，读侧先看 valid 就一定能看到前面的值）
+            _snap->bytes_in.store(bytesIn());
+            _snap->bytes_out.store(bytesOut());
+            _snap->pending_send.store(pendingSendBytes());
+            _snap->flush_timeouts.store(flushCloseTimeoutCount());
+            _snap->valid.store(true);
+        }
         Session::onError(err);
     }
 
 private:
     std::atomic<int> *_out;
+    SessionSnapshot *_snap;
 };
 
 /// 回显（示例程序里的同款写法：重写 onRecv）
@@ -172,8 +251,8 @@ private:
 class FlushCloseSession : public RecordingSession {
 public:
     FlushCloseSession(const Socket::Ptr &sock, const EventPoller::Ptr &poller, std::atomic<int> *out,
-                      size_t bytes, uint32_t wait_ms)
-        : RecordingSession(sock, poller, out), _blob(bytes, 'F'), _wait_ms(wait_ms) {}
+                      size_t bytes, uint32_t wait_ms, SessionSnapshot *snap = nullptr)
+        : RecordingSession(sock, poller, out, snap), _blob(bytes, 'F'), _wait_ms(wait_ms) {}
 
 protected:
     void onRecv(const Buffer::Ptr &) override {
@@ -195,9 +274,13 @@ private:
 MZ_TEST(ntimed_echo_roundtrip) {
     auto poller = EventPoller::create("test-session-echo");
     std::atomic<int> last_err{-1};
+    SessionWatch watch;   // 【v0.1.2】观测存活会话的记账值
     auto server = std::make_shared<TcpServer>(poller);
-    MZ_ASSERT_TRUE(server->setSessionCreator([&last_err](const Socket::Ptr &sock) -> Session::Ptr {
-        return std::make_shared<EchoSession>(sock, EventPollerPool::Instance().getPoller(), &last_err);
+    MZ_ASSERT_TRUE(server->setSessionCreator([&last_err, &watch](const Socket::Ptr &sock) -> Session::Ptr {
+        auto session =
+            std::make_shared<EchoSession>(sock, EventPollerPool::Instance().getPoller(), &last_err);
+        watch.attach(session);
+        return session;
     }));
     MZ_ASSERT_TRUE(server->setSessionTimeout(0, 0));   // 关掉空闲检测，别干扰本用例
     MZ_ASSERT_TRUE(server->start(0));
@@ -214,6 +297,23 @@ MZ_TEST(ntimed_echo_roundtrip) {
     MZ_ASSERT_STR_EQ(got, msg);
     MZ_ASSERT_EQ(server->totalAccepted(), 1u);
     MZ_ASSERT_EQ(server->sessionCount(), 1u);
+
+    // ★【v0.1.2】记账断言（此前一条都没有：回显内容对得上，但"读了多少、写了多少、队列排空没"没人验）
+    // 抓什么：bytesIn / bytesOut 的记账回归；以及 pendingSendBytes 不归零（数据进了队列再没人写出去）
+    // 后果：/api/stats 的吞吐与"慢客户端"判断全错（FR-6.1）；队列不排空 = 内存慢性上涨（NFR-3 的 RSS 斜率中招）
+    // 防线在哪：session.cpp 读路径的 `_bytes_in.fetch_add`、写路径的 `_bytes_out/_pending_send_bytes`、
+    //          以及 onWriteEvent 里"EAGAIN 之后靠 EPOLLOUT 续写"那段
+    // 变异：删掉 `_bytes_out.fetch_add` → bytes_out 断言红；删掉 EPOLLOUT 续写 → pendingSend 不归零
+    MZ_ASSERT_TRUE(watch.alive());   // 先确认会话还活着，否则下面三个 0 都是假绿（观测对象没了）
+    MZ_ASSERT_EQ(watch.bytesIn(), static_cast<uint64_t>(msg.size()));
+    // ⚠️ bytesOut 必须用"**最终一致**"断言，不能立即相等：
+    //   `Session::send` 是「先 writeToFd 把字节交给内核、**之后**才 `_bytes_out.fetch_add`」
+    //   （session.cpp 的写路径）。所以客户端 recv 返回的那一刻，服务端的计数可能还没加上 ——
+    //   立即断言 = 把两个线程的调度顺序当前提（单进程全量跑时实测翻红一次，组跑时侥幸绿）。
+    //   这正是 TESTING.md §2.2 与本项目 M7 那条教训（"别拿插桩/调度时序当前提"）的同一形状。
+    MZ_ASSERT_TRUE(waitFor([&watch]() { return watch.bytesOut(); },
+                           static_cast<uint64_t>(msg.size()), kWaitMs));
+    MZ_ASSERT_TRUE(waitFor([&watch]() { return static_cast<uint64_t>(watch.pendingSend()); }, 0, kWaitMs));
 
     ::close(cli);   // 对端关闭 → 会话应被摘表
     MZ_ASSERT_TRUE(waitFor([&server]() { return server->sessionCount(); }, 0, kWaitMs));
@@ -258,12 +358,15 @@ MZ_TEST(ntimed_session_idle_timeout) {
 MZ_TEST(ntimed_session_send_blocked) {
     auto poller = EventPoller::create("test-session-send-blocked");
     std::atomic<int> last_err{-1};
+    SessionWatch watch;   // 【v0.1.2】持强引用：让"显式关 fd"成为唯一能让对端收到 EOF 的途径
     auto server = std::make_shared<TcpServer>(poller);
-    MZ_ASSERT_TRUE(server->setSessionCreator([&last_err](const Socket::Ptr &sock) -> Session::Ptr {
+    MZ_ASSERT_TRUE(server->setSessionCreator([&last_err, &watch](const Socket::Ptr &sock) -> Session::Ptr {
         // 发送队列上限保持默认 8MB：本例测的是**时间**防线（50ms 没写成功就断）。
         // 发送缓冲压到 8KB，保证 1MB 一定写不完（否则结论取决于内核缓冲大小）
         sock->setSendBufSize(8 * 1024);
-        return std::make_shared<BlastSession>(sock, EventPollerPool::Instance().getPoller(), &last_err);
+        auto session = std::make_shared<BlastSession>(sock, EventPollerPool::Instance().getPoller(), &last_err);
+        watch.holdStrong(session);   // ★ 见 holdStrong() 的注释：不这样断言就测不出 fd 泄漏
+        return session;
     }));
     MZ_ASSERT_TRUE(server->setSessionTimeout(0, 50));
     MZ_ASSERT_TRUE(server->start(0));
@@ -275,9 +378,27 @@ MZ_TEST(ntimed_session_send_blocked) {
     MZ_ASSERT_EQ(last_err.load(), static_cast<int>(SockException::ErrType::Timeout));
     MZ_ASSERT_EQ(server->sessionCount(), 0u);
 
+    // ★【v0.1.2】"计数涨了" ≠ "连接真的关了"。
+    // 抓什么：超时只改了计数 / 只摘了会话表，却没 close(fd) → 客户端永远等不到 EOF，fd 泄漏（NFR-6）
+    // 后果：10 路慢客户端 = 10 个 fd 长期不回收；连接数上限（FR-4.4 默认 64）会被"假活"连接吃满
+    // 防线在哪：Session::shutdownImpl（先 delEvent 等 complete_cb，再 sock->close()）
+    // 变异：把 shutdownImpl 里的 sock->close() 去掉 → 本断言红（前面三条仍然绿）
+    // 注：本用例**替服务端持着强引用**（watch.holdStrong），所以会话不会因引用计数归零而析构
+    //     —— 客户端能收到 EOF 只可能来自 shutdownImpl 里那次**显式 close**。
+    MZ_ASSERT_TRUE(waitPeerClosed(cli, kTimeoutMs));
+
+    // ★【v0.1.2】方向断言：本用例测的是**时间**防线，就必须证明"字节防线没有先触发"
+    // 抓什么：两条防线的判定写反/写串（例如把 Timeout 记成 SendOverflow，或超限阈值被压到 8KB 附近）
+    // 后果：/api/stats 里 idleTimeout 与 sendOverflow 失去区分度 → 排障会去查错方向
+    // 防线在哪：Session 的 50ms 时间判定与 maxSendBuffer 字节判定是**两条独立路径**
+    // 变异：把 setMaxSendBuffer 压到 1KB → 本断言红（totalSendOverflow 变 1）
+    MZ_ASSERT_EQ(server->totalSendOverflow(), 0u);
+    MZ_ASSERT_EQ(server->totalRecvOverflow(), 0u);
+
     ::close(cli);
     server->shutdown();
     poller->shutdown();
+    watch.releaseStrong();   // 会话已关：放掉测试侧的强引用，避免析构顺序被测试干扰
 }
 
 // ---------------------------------------------------------------------------
@@ -287,12 +408,14 @@ MZ_TEST(ntimed_session_send_blocked) {
 MZ_TEST(ntimed_session_send_overflow) {
     auto poller = EventPoller::create("test-session-send-overflow");
     std::atomic<int> last_err{-1};
+    SessionWatch watch;   // 【v0.1.2】同上：持强引用，fd 只能靠显式关闭释放
     auto server = std::make_shared<TcpServer>(poller);
-    MZ_ASSERT_TRUE(server->setSessionCreator([&last_err](const Socket::Ptr &sock) -> Session::Ptr {
+    MZ_ASSERT_TRUE(server->setSessionCreator([&last_err, &watch](const Socket::Ptr &sock) -> Session::Ptr {
         sock->setSendBufSize(8 * 1024);   // 同上：让"发不完"成为确定事实
         auto session = std::make_shared<BlastSession>(sock, EventPollerPool::Instance().getPoller(), &last_err);
         // 上限压到 64KB：对端不读 → 必然有超过 64KB 进不了 socket，直接判超限
         session->setMaxSendBuffer(64 * 1024);
+        watch.holdStrong(session);
         return session;
     }));
     MZ_ASSERT_TRUE(server->setSessionTimeout(0, 0));   // 关掉时间防线，只验证字节防线
@@ -305,9 +428,19 @@ MZ_TEST(ntimed_session_send_overflow) {
     MZ_ASSERT_EQ(last_err.load(), static_cast<int>(SockException::ErrType::SendOverflow));
     MZ_ASSERT_EQ(server->totalIdleTimeout(), 0u);   // 不是被时间防线断的
 
+    // ★【v0.1.2】字节防线也必须**真的关连接**（前面只验了"计数涨了、类型对了"）
+    // 抓什么：`send()` 判超限后只把错误记进 last_err/SendOverflow，却忘了走关闭流程
+    // 后果：慢客户端既不读也不断，占着 8MB 队列 + 一个 fd；100 个这样的客户端 = OOM 前先耗尽连接上限
+    // 防线在哪：Session::send 里"队列超 maxSendBuffer → 以 SendOverflow 关闭"这条路径
+    // 变异：把那条 return -1 改成"只计数不断开" → 本断言红（waitPeerClosed 超时）
+    MZ_ASSERT_TRUE(waitPeerClosed(cli, kTimeoutMs));
+    MZ_ASSERT_EQ(server->sessionCount(), 0u);
+    MZ_ASSERT_EQ(server->totalSendOverflow(), 1u);   // 恰好一次：不是"关了两次/计了两次"
+
     ::close(cli);
     server->shutdown();
     poller->shutdown();
+    watch.releaseStrong();
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +507,17 @@ MZ_TEST(ntimed_max_session_count) {
     MZ_ASSERT_TRUE(waitFor([&server]() { return server->totalRejected(); }, 1, kWaitMs));
     MZ_ASSERT_EQ(server->sessionCount(), 1u);        // 只有第 1 个还活着
 
+    // ★【v0.1.2】被拒的连接**不能**计入 totalAccepted（之前只验了"拒绝了"，没验"没被算成接入"）
+    // 抓什么：拒绝计数语义漂移 —— 例如把 `_total_accepted.fetch_add` 挪到限额检查之前，
+    //         或拒绝路径顺手复用了 accepted 的累加
+    // 后果：/api/stats 的 accepted 把被拒连接也算进去 → 容量规划与告警全部失真；
+    //       FR-4.4 "默认 64 上限"的验收（第 65 条必须被拒）在数字上再也说不清
+    // 防线在哪：tcp_server.cpp 的 onAccept：限额检查 → 拒绝并 close(fd) → continue，
+    //           `_total_accepted.fetch_add(1)` 在会话真正建好**之后**
+    // 变异：把 accepted 的累加挪到限额检查之前 → 本断言红（实际 2）
+    MZ_ASSERT_EQ(server->totalAccepted(), 1u);
+    MZ_ASSERT_EQ(server->totalRejected(), 1u);
+
     ::close(second);
     ::close(first);
     server->shutdown();
@@ -430,10 +574,12 @@ MZ_TEST(ntimed_fd_recycle) {
 MZ_TEST(ntimed_onrecv_not_implemented) {
     auto poller = EventPoller::create("test-session-no-recv");
     std::atomic<int> last_err{-1};
+    SessionSnapshot snap;
     auto server = std::make_shared<TcpServer>(poller);
-    MZ_ASSERT_TRUE(server->setSessionCreator([&last_err](const Socket::Ptr &sock) -> Session::Ptr {
+    MZ_ASSERT_TRUE(server->setSessionCreator([&last_err, &snap](const Socket::Ptr &sock) -> Session::Ptr {
         // RecordingSession 只重写 onError，不重写 onRecv → 走基类守卫
-        return std::make_shared<RecordingSession>(sock, EventPollerPool::Instance().getPoller(), &last_err);
+        return std::make_shared<RecordingSession>(sock, EventPollerPool::Instance().getPoller(), &last_err,
+                                                  &snap);
     }));
     MZ_ASSERT_TRUE(server->setSessionTimeout(0, 0));
     MZ_ASSERT_TRUE(server->start(0));
@@ -443,6 +589,17 @@ MZ_TEST(ntimed_onrecv_not_implemented) {
     MZ_ASSERT_EQ(::send(cli, "x", 1, 0), 1);
     MZ_ASSERT_TRUE(waitPeerClosed(cli, kWaitMs));   // 服务器必须主动断开
     MZ_ASSERT_EQ(last_err.load(), static_cast<int>(SockException::ErrType::RecvFailed));
+
+    // ★【v0.1.2】排除假绿：确认那 1 个字节**真的被读进来了**才判"没实现 onRecv"
+    // 若 bytesIn 是 0，说明数据根本没到（连接建早了/发早了），那 RecvFailed 也能"凑"出来 ——
+    // 用例看着绿，实际什么都没测到。
+    // 抓什么：字节计数漏加；以及"以为收到了"与"真的收到了"混为一谈
+    // 后果：这类假绿会掩盖真正的"数据到了但没人处理"（§4.5 的静默丢数据）
+    // 防线在哪：session.cpp 读路径 `_bytes_in.fetch_add(n)`（在交付给 onRecv 之前）
+    // 变异：删掉 `_bytes_in.fetch_add` → 本断言红（实际 0）
+    MZ_ASSERT_TRUE(snap.valid.load());
+    MZ_ASSERT_EQ(snap.bytes_in.load(), 1u);
+    MZ_ASSERT_EQ(snap.bytes_out.load(), 0u);   // 守卫路径不该写任何东西回去
 
     ::close(cli);
     server->shutdown();
@@ -529,11 +686,12 @@ MZ_TEST(ntimed_session_shutdown_after_flush) {
     {
         auto poller = EventPoller::create("test-session-flush-a");
         std::atomic<int> last_err{-1};
+        SessionSnapshot snap;   // 【v0.1.2】关闭时刻的计数快照
         auto server = std::make_shared<TcpServer>(poller);
-        MZ_ASSERT_TRUE(server->setSessionCreator([&last_err](const Socket::Ptr &sock) -> Session::Ptr {
+        MZ_ASSERT_TRUE(server->setSessionCreator([&last_err, &snap](const Socket::Ptr &sock) -> Session::Ptr {
             sock->setSendBufSize(8 * 1024); // 逼出"多次写 + EPOLLOUT 续写"
             return std::make_shared<FlushCloseSession>(sock, EventPollerPool::Instance().getPoller(),
-                                                       &last_err, 256 * 1024, 3000);
+                                                       &last_err, 256 * 1024, 3000, &snap);
         }));
         MZ_ASSERT_TRUE(server->setSessionTimeout(0, 0)); // 关掉超时，专测「发完再关」
         MZ_ASSERT_TRUE(server->start(0));
@@ -561,6 +719,18 @@ MZ_TEST(ntimed_session_shutdown_after_flush) {
         MZ_ASSERT_TRUE(closed);          // ★ 而且是"排空之后"才关的
         MZ_ASSERT_EQ(last_err.load(), static_cast<int>(SockException::ErrType::None));
 
+        // ★【v0.1.2】服务端视角的"排空"：关闭那一刻发送队列必须是 0，且**没有**走过强制关分支
+        // 抓什么：客户端收到 256KB（看上去没事），但服务端其实是"到点强制关 + 丢尾巴"；
+        //         以及 bytes_out 记账漏加（数据发出去却没记）
+        // 后果：FLV/HLS 收尾时最后几片被静默丢掉（客户端表现为"播到一半没了"），
+        //       而 /api/stats 的字节数与实际不符
+        // 防线在哪：Session::maybeCloseAfterFlush（`_pending_send_bytes > 0` 就不关）
+        // 变异：把 maybeCloseAfterFlush 里的 pending 判定去掉 → 提前关 → got 少 + pending 快照非 0
+        MZ_ASSERT_TRUE(snap.valid.load());
+        MZ_ASSERT_EQ(snap.pending_send.load(), 0u);
+        MZ_ASSERT_EQ(snap.flush_timeouts.load(), 0u);   // 与场景 B 配对的另一半：不能记成"超时强制关"
+        MZ_ASSERT_EQ(snap.bytes_out.load(), static_cast<uint64_t>(256u * 1024u));
+
         ::close(cli);
         server->shutdown();
         poller->shutdown();
@@ -570,11 +740,12 @@ MZ_TEST(ntimed_session_shutdown_after_flush) {
     {
         auto poller = EventPoller::create("test-session-flush-b");
         std::atomic<int> last_err{-1};
+        SessionSnapshot snap;
         auto server = std::make_shared<TcpServer>(poller);
-        MZ_ASSERT_TRUE(server->setSessionCreator([&last_err](const Socket::Ptr &sock) -> Session::Ptr {
+        MZ_ASSERT_TRUE(server->setSessionCreator([&last_err, &snap](const Socket::Ptr &sock) -> Session::Ptr {
             sock->setSendBufSize(8 * 1024);
             return std::make_shared<FlushCloseSession>(sock, EventPollerPool::Instance().getPoller(),
-                                                       &last_err, 1u << 20, 100);
+                                                       &last_err, 1u << 20, 100, &snap);
         }));
         MZ_ASSERT_TRUE(server->setSessionTimeout(0, 0)); // 只有"发完再关"的截止时刻在起作用
         MZ_ASSERT_TRUE(server->start(0));
@@ -588,6 +759,25 @@ MZ_TEST(ntimed_session_shutdown_after_flush) {
         };
         MZ_ASSERT_TRUE(waitFor(hit_timeout, 1, kTimeoutMs));
         MZ_ASSERT_EQ(server->sessionCount(), 0u);
+
+        // ★【v0.1.2】"强制关记为失败"这条必须先被**确认发生过**，否则 last_err==SendFailed
+        //         可能是别的原因（例如对端 RST）误打误撞凑出来的 —— 那就是假绿
+        // 抓什么：强制关路径没有计数（下次"发完再关超时"就查不到）；以及 last_err 的归因串味
+        // 后果：FLV 直播里"慢客户端被强制关"变成不可观测事件；NFR-3 的"错误日志 0 条"也失去解释力
+        // 防线在哪：Session::onFlushDeadline（`++_flush_close_timeout_count` 后
+        //          以 SendFailed 关闭，而不是 None —— 静默丢尾部数据不可接受）
+        // 变异：把 onFlushDeadline 里的 ++ 去掉 → 本断言红（实际 0）；
+        //       把 SendFailed 改成 None → hit_timeout 永不成立
+        MZ_ASSERT_TRUE(snap.valid.load());
+        MZ_ASSERT_EQ(snap.flush_timeouts.load(), 1u);   // 恰好一次
+        // "关闭那一刻确实还有数据没发完"怎么观测？
+        //   ✗ 不能用 pendingSendBytes()：`shutdownImpl` 会 `_pending_send_bytes.store(0)`
+        //     （session.cpp 第 2 步"释放发送队列"），到 onError 时它**一定是 0**；
+        //     这个原始数字只留在 onFlushDeadline 的 Warn 日志里（所以"有日志"不能代替"有断言"）。
+        //   ✓ 用 bytes_out：1MB 的 payload 只写出去了一部分（> 0 且 < 1MB），
+        //     就证明"尾部数据确实没发完就被强行关掉了"——这是静默丢数据风险的现场证据。
+        MZ_ASSERT_GT(snap.bytes_out.load(), 0u);
+        MZ_ASSERT_LT(snap.bytes_out.load(), static_cast<uint64_t>(1u << 20));
 
         ::close(cli);
         server->shutdown();

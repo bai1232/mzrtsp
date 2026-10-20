@@ -7,6 +7,30 @@
 
 （下一版内容；v0.2.0 计划见 [docs/ROADMAP.md](docs/ROADMAP.md)）
 
+### Tests（测试加固，**不改产品代码/行为**）
+- `tests/test_network_session.cpp` 补齐**可观测断言**（`ntimed` 组 41 用例 / **525 断言**）：
+  - 记账：`bytesIn`、`bytesOut`、`pendingSendBytes`、`flushCloseTimeoutCount`、`totalAccepted`
+    —— 存活期间用新增的 `SessionWatch` 读，关闭时刻用新增的 `SessionSnapshot` 在 `onError` 里快照
+    （字段全 `std::atomic`，`ntimed` 仍进 TSAN 严格组）。
+  - 「计数涨了」≠「副作用发生了」：`send_blocked` / `send_overflow` 追加**客户端读到 EOF**；
+    `send_blocked` 追加方向断言 `totalSendOverflow()==0` / `totalRecvOverflow()==0`；
+    `max_session_count` 追加 `totalAccepted()==1`（拒绝不计入接入）；
+    `shutdown_after_flush` 场景 A 追加「关闭那一刻 `pendingSendBytes==0` 且 `flushCloseTimeoutCount==0`」
+    与 `bytesOut==256KB`，场景 B 追加 `flushCloseTimeoutCount==1`（强制关必须**记为失败**且恰好一次）；
+    `onrecv_not_implemented` 追加 `bytesIn==1`（排除"数据根本没到却判 RecvError"的假绿）。
+  - 每条断言旁写明：**抓什么 / 后果 / 防线在哪个文件哪一段 / 怎么变异能变红**。
+- **变异验证 5 组全部按预期变红**：删 `_bytes_in` 记账 → `onrecv_not_implemented` 红；
+  删写路径 `_bytes_out` 记账（直写 / EPOLLOUT 续写**两个站点分别**删）→ 对应用例红；
+  `totalAccepted` 提前到限额检查之前 → `max_session_count` 红；
+  删 `++_flush_close_timeout_count` → 场景 B 红；删 `shutdownImpl` 的显式 `close(fd)` →
+  `send_blocked`/`send_overflow` 红 —— **但只有测试侧持强引用时才红**（见下）。
+- **两处实测发现（都已修在测试里，并写进 `docs/DESIGN_M2.md` §9 决策记录）**：
+  1. 不持强引用时，「删掉显式 `close(fd)`」的变异**不会红** —— 因为 `Socket` 析构会兜底关 fd，
+     于是 `waitPeerClosed` 分不清"显式关"与"析构兜底关"。改法：`SessionWatch::holdStrong()` 替服务端持一个强引用
+     （对应 M6 的 `holdResource` 真实场景），fd 就只能靠显式关闭释放。
+  2. `bytesOut` 是「先写 socket、后加计数」，立即相等断言会把线程调度顺序当前提 ——
+     单进程全量跑实测翻红一次，已改成 `waitFor` 最终一致断言。
+
 ## [0.1.1] - 2026-10-18
 
 > **修复**：`Connection: close` 与畸形请求之后**只写响应头、不真的关连接**（协议违规 + 攻击面未收敛）。

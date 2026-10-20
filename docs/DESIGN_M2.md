@@ -789,6 +789,8 @@ void Session::onWriteEvent() {                                    // EPOLLOUT �
 | 「发完再关」（M6-b） | `shutdownAfterFlush(max_wait_ms)`：**队列排空即关**（挂在写路径的"队列空"分支上，事件驱动）；到点仍排不空 → 强制关 + `flushCloseTimeoutCount()` 计数 + Warn | 排除"直接 shutdown"（丢尾部数据 = 静默丢数据）；排除"靠空闲检查周期兜底"（那个周期可能 6 秒，播完要干等）；排除"没截止时刻"（无界，连接会永远挂着）；排除"在写循环之后检查"（那个循环只在队列空/出错时退出，钩子会变成**死代码** —— 本次就是这么错的） |
 | 接收上限的两级语义（M2-3b） | 每块 ≤ `maxRecvBuffer`（1MB）、每事件最多 `kMaxReadsPerEvent`（64）块 | 排除"一次事件读到上限就断"——8MB 的正常回显会被误判成攻击（这个坑真踩过） |
 | 尽量不用 `void` 的落地口径（M2-3b） | 配置 setter 返回"是否生效"；操作返回"实际完成量 / 状态是否改变"；注册回调返回上一个；只有"被调用的钩子"保留 void | 排除"全部强行加返回值"（钩子没有接收方语义，硬加只会让实现纠结返回什么） |
+| **测「连接真的关了」时，测试侧必须持强引用**（v0.1.2） | 用例用 `SessionWatch::holdStrong()` 替服务端保持一个 `shared_ptr`，再断言客户端读到 EOF | 排除"只断言 EOF"：不持强引用时，会话一被摘表就析构，而 `Socket::~Socket` 会**兜底** `close(fd)` → 删掉 `shutdownImpl` 里的显式 `close()`，用例仍然全绿（变异实测 `ntimed_session_send_blocked` / `_send_overflow` 双绿）。真实持有者确实存在：M6 的 `HttpResponse::holdResource()` 把 FLV 的 Sender/订阅者挂在连接上，所以"**显式关**"必须单独可证，不能靠析构兜底 |
+| 记账断言的时序（v0.1.2） | `bytesOut` 断言一律写"最终一致"（`waitFor`），不写立即相等 | 排除"立即相等"：`send()` 是「先 `writeToFd`、之后才 `_bytes_out.fetch_add`」，客户端 recv 返回早于计数累加是**允许**的；写成立即相等等于把两个线程的调度顺序当前提（单进程全量跑实测翻红一次） |
 
 ## 10. 未决事项（待定，走到对应步骤再定）
 

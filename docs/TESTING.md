@@ -32,6 +32,17 @@ MZ_TEST(timestamp_rational_conversion) {
 
 **必须覆盖的点**：HTTP 解析（含分块与畸形请求）、`Buffer` 边界、时间基换算（含 23.976/25/29.97 等有理帧率）、32 位时间戳回绕、`CodecMatrix` 判定表每一行、`FrameQueue` 溢出丢帧策略、日志滚动。
 
+**还要覆盖"记账"与"真的发生了"**（v0.1.2 起，`ntimed` 组为范本）：
+- **记账**：`bytesIn` / `bytesOut` / `pendingSendBytes` / `flushCloseTimeoutCount` / `totalAccepted` ——
+  "回显内容对得上"不等于"记账对得上"，而 `/api/stats`、容量规划、NFR-3 的 RSS 斜率全依赖记账。
+- **"计数涨了" ≠ "副作用发生了"**：例如写阻塞超时要断言**客户端真的收到了 EOF**，而不只是
+  `totalIdleTimeout()==1`（只改计数不 `close(fd)` 会 fd 泄漏，NFR-6）。
+- **断言要能区分"谁干的"**：超时用例要顺带断言 `totalSendOverflow()==0`（方向断言），
+  否则"时间防线"与"字节防线"串了也看不出来。
+- **最终一致 vs 立即相等**：`bytesOut` 是「先 `writeToFd`、**之后**才 `fetch_add`」，
+  所以客户端刚收到数据时计数可能还是旧值 —— 这类断言必须写成 `waitFor(...)`（实测：
+  写成立即相等，单进程全量跑时翻红过一次，组跑时侥幸绿）。
+
 ### 2.1 用例之间必须隔离（硬约束）
 
 判据只有一句：**同一个用例，单独跑 与 放在全量里跑，结果必须一致。**
@@ -206,7 +217,7 @@ MZMEDIA_SERVER=./build-asan/bin/mzmedia ./scripts/concurrent_test.sh --quick   #
 | FR-3.5 节流（按源时间轴与墙钟对齐，不得以磁盘速度灌入） | 单测 `media`：`Throttle` 按 dts 等待（`speed=1` 时 40ms 处的包真的等 ~40ms；`speed=100` 时 500ms 处的包几乎不等）；`enabled=false` 立即放行；**中止标志置位立刻返回 false**（不睡满，否则 `stop()` 的 join 要等满一拍）。集成：单测 `srcmgr` 用 **8 倍速**读 2 秒样本，断言用时 **≥100ms**（证明没有全速灌入）且 **<1500ms**（没有慢到实时） |
 | FR-2.1 v0.1 输入 MP4 / H264 裸流 | 单测 `srcmgr`：`DemuxerProducer` 真读 `samples/sample.mp4`（320x240 H264 + AAC）到 EOF，视频 dts 单调、关键帧 1 个、音视频包都 > 0；H264 裸流由 M4 的 `ffmpeg` 分组覆盖 |
 | FR-6.3 关键事件落日志 | 源创建 / 空闲释放走 `InfoL`（`SourceManager`）；打不开走 `WarnL` 且**不注册源**（`srcmgr_open_failure_not_silent` 断言 `lastError()` 非空） |
-| FR-4.4 连接上限 / 读空闲 / 写阻塞（**v0.1.1 起含「声明 close 必须真关」**） | 单测：连接上限设为 1 时第 2 个连接被拒且 `totalRejected()` 增长；`recv_idle=50ms` + 连上不发数据的客户端 → 阈内断开且 `onError` 为超时；`send_blocked=50ms` + 只连不读的客户端 → 断开且 `bytesOut` 停止增长 |
+| FR-4.4 连接上限 / 读空闲 / 写阻塞（**v0.1.1 起含「声明 close 必须真关」；v0.1.2 起含记账与「真关」断言**） | 单测：连接上限设为 1 时第 2 个连接被拒且 `totalRejected()` 增长、**`totalAccepted()` 仍为 1**（拒绝不计入接入）；`recv_idle=50ms` + 连上不发数据的客户端 → 阈内断开且 `onError` 为超时；`send_blocked=50ms` + 只连不读的客户端 → 断开且 `bytesOut` 停止增长 |
 | FR-3.1 HTTP-FLV（chunked、首包即 sequence header） | **M6-a ✅**：单元 `flv` 组逐字节断言 header/tag/sequence header；集成 `scripts/flv_mux_test.sh` —— 产物经 `ffprobe` 认成 **h264 320x240 + aac**、解码 **50 帧 / 2 秒**、`ffmpeg -f null -` 完整解码无 error（**8/8**）。M6-b：`curl -N http://…/live/x.flv` 拿到合法 FLV |
 | FR-3.3 AAC 转发 / 无音频也能播 | 单元 `flv`：AAC sequence header（`0xAF` + AudioSpecificConfig）与 raw 包布局；另有**纯视频**用例（`Streams{video, nullptr}`）证明"没有音频不报错" |
 | FR-3.4 时间戳基准（FLV → 毫秒） | 单元 `flv`：`CompositionTime = pts - dts`（含负值的 24 位补码）；**per-client 基准**（中途接入的时间戳也从 0 开始）；32 位自然回绕；早于基准的包钳 0 并计数 |
@@ -324,7 +335,7 @@ cmake -B build-tsan -DMZMEDIA_ENABLE_TSAN=ON -DCMAKE_CXX_COMPILER=g++-12
 | 并发/长跑（**Debug** 构建） | `./scripts/concurrent_test.sh`（10 路 × 5 分钟）+ `--duration 3600`（1 小时） | 全绿；1 小时数据见 `ACCEPTANCE_v0.1.0.md` §3.3（Release 长跑未做，见该文件 §6 第 12 项） |
 | 并发（**ASAN** 构建） | `MZMEDIA_SERVER=./build-asan/bin/mzmedia ./scripts/concurrent_test.sh --quick --kill-half --overload 8` | **10/10 通过**（对应 NFR-3 的"ASAN 无报错"） |
 | 脚本验收 | `scripts/{http,flv_mux,flv_http}_test.sh` | **全绿**（M3 / 8 项 / **51 项**） |
-| 单进程全量 | `./build/bin/mzmedia_unittest` | **248/248 用例、61,386 条断言**（诊断用，不作为计时门禁） |
+| 单进程全量 | `./build/bin/mzmedia_unittest` | **248/248 用例、61,409 条断言**（诊断用，不作为计时门禁） |
 | 发版验收 | `docs/ACCEPTANCE_v0.1.0.md` | 逐条 SC/NFR/FR 的"状态 + 证据 + 实测"（v0.1.0 的发布依据） |
 
 > 分组按**用例名子串**匹配，因此个别用例会同时属于两个组
