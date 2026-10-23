@@ -22,11 +22,11 @@
 
 | 任务 | 说明 |
 |---|---|
-| MKV / TS 输入 | 复用 M4 的 `Demuxer`，`CodecMatrix` 增补组合 |
-| **HLS 输出** | `HlsWriter`：mpegts 切片 2s、滑动窗口 6 片、`.m3u8` 序列管理、切片静态服务（含 Range） |
-| **转码** | `Transcoder`：解码 → 编码；`libswscale` 做像素格式/分辨率转换（**需先 `apt install libswscale-dev`**） |
-| 转码调度 | 由 `ThreadPool` 承载；lazy 启动 + 空闲 60s 释放；实时倍数统计 |
-| 验收 | `hls.js` / 原生播放器能播；转码 ≥1.0x 实时（1080p→720p x264 veryfast） |
+| MKV / TS 输入（**FR-2.2**） | 复用 M4 的 `Demuxer`，`CodecMatrix` 增补组合。**已知缺口**：TS 里的 AAC 是 ADTS（无 extradata），必须先造出 `AudioSpecificConfig`（v0.1.x 实测该路径返回 415 `MissingExtradata`） |
+| **HLS 输出**（**FR-3.2** / **FR-4.1**（`/hls/` 路由）/ **FR-4.2**（切片 Range）/ **FR-3.4**（TS → 90kHz）） | `HlsWriter`：mpegts 切片 2s、滑动窗口 6 片、`.m3u8` 序列管理、切片静态服务（含 Range） |
+| **转码**（**NFR-5** / **FR-6.1**（实时倍数）/ **FR-7.1**（转码开关）） | `Transcoder`：解码 → 编码；`libswscale` 做像素格式/分辨率转换（**需先 `apt install libswscale-dev`**） |
+| 转码调度（**FR-1.3**） | 由 `ThreadPool` 承载；lazy 启动 + 空闲 60s 释放；实时倍数统计 |
+| 验收（**NFR-5** / **SC-2** 的第二次验证） | `hls.js` / 原生播放器能播；转码 ≥1.0x 实时（1080p→720p x264 veryfast）；新增输出/输入**不改 `media/`、`network/`** |
 
 ## v0.3.0 —— RTSP 输入 + 解码处理
 

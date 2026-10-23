@@ -206,7 +206,7 @@ MZMEDIA_SERVER=./build-asan/bin/mzmedia ./scripts/concurrent_test.sh --quick   #
 | SC-4 1 小时稳定 | 第 5 节（`--duration 3600`，**M7 已实跑并写进 `ACCEPTANCE_v0.1.0.md` §3.3**） |
 | NFR-1 首帧 <1s | 浏览器 Performance 面板 / 日志打点（请求到首字节） |
 | NFR-4 remux CPU <5% | `top -H -p $(pgrep mzmedia)` 观察单路负载 |
-| NFR-5 转码 ≥1.0x | `/api/stats` 的 `speed` 字段 |
+| NFR-5 转码 ≥1.0x（⏳ **v0.2**） | `/api/stats` 的 `speed` 字段：`speed = 已输出媒体时长 / 已耗墙钟`，判据 `speed ≥ 1.0`；口径 = **1080p→720p、x264 veryfast**、本机 4 核。**当前未实测**（等 M10）——不达标就如实写「未达成」，不放宽口径 |
 | NFR-6 资源回收 | 断开前后对比 `/api/stats` 与 `/proc/<pid>/fd`；单测 `media`：订阅者 `shared_ptr` 释放后由 `weak_ptr` **自动注销**、其队列被回收 |
 | ROADMAP M2 验收：定时器精度 | 单测 `timer` 分组（`tests/test_network_timer.cpp`，用例清单见 `DESIGN_M2.md` §7.1）：**0 早触发** + 相对宿主裸 `nanosleep` 基线增量 ≤5ms。**绝对 ±10ms 在本宿主实测不可达**（裸 `nanosleep` 自身的超出量就有 0~14ms，且与延时长短无关），原始数据见 `DESIGN_M2.md` §7.1 / §8 R11 |
 | FR-5.1 每客户端队列上限（**只按字节**：码率上限 × 延迟额度） | 单测 `media` 分组（`tests/test_media.cpp`，清单见 `docs/DESIGN_M5.md` §5）：`setLimits(0)` / 超硬上限被拒；推导值 = `码率 × 时长 / 8000`（用例断言 8 Mbps × 2 s = 2,000,000）；上限不可绕过（`bytes() ≤ max_bytes`） |
@@ -229,6 +229,13 @@ MZMEDIA_SERVER=./build-asan/bin/mzmedia ./scripts/concurrent_test.sh --quick   #
 | `--loop`（循环播放，默认关） | **M6-c ✅**：单测 `producer_loop_offsets_timestamps_monotonically`（跨趟**视频与音频各自严格递增**、偏移≈样本时长、`loopFailures()==0`）；端到端脚本 §9（4 倍速拉 3 秒 → **11 秒**媒体时长 / 297 帧 / `loops=6` / `ffmpeg` 解码无 error） |
 | 源结束后的行为（不挂连接） | **M6-c ✅**：单测 `flv_sender_start_drains_already_ended_source`；端到端脚本 §8（修前 `curl rc=28` 挂满超时，修后 **12ms** 正常结束） |
 | 空闲释放不打断观看 | **M6-c ✅**：单测 `srcmgr_idle_release_waits_for_subscribers`（有订阅者 → 推迟并计数；订阅者一走 → 下一次复查释放） |
+| **FR-2.2** MKV / MPEG-TS 输入（⏳ **v0.2 计划**） | 计划：`scripts/make_samples.sh` 现场生成 `sample.mkv` / `sample.ts`（同一份 MP4 转封装），单测在 `producer`/`srcmgr` 组断言解出 **h264 320x240 + aac**；端到端 `curl …/live/sample.mkv.flv` 与 `…/sample.ts.flv` → `ffprobe` 认编码 + `ffmpeg -f null -` 零 error。**TS 的已知缺口**：AAC 在 TS 里是 ADTS（自描述、无 extradata），必须解析 ADTS 头造 `AudioSpecificConfig` 并逐帧剥掉 ADTS 头，否则 `FlvMuxer::prepare()` 报 `MissingExtradata`（v0.1.x 实测 415） |
+| **FR-3.2** HLS 切片与播放列表（⏳ **v0.2 计划**） | 计划：单测 `hls` 组断言 m3u8 文本 —— `#EXT-X-MEDIA-SEQUENCE` 跨切片递增、`#EXT-X-TARGETDURATION` **≥ 实测最大切片时长**（切片必须切在关键帧上，时长随 GOP 浮动）、窗口只有 6 片（滚动）、EOS 时追加 `#EXT-X-ENDLIST`；集成：`ffprobe` 逐切片认 h264+aac，并断言**每个切片首帧是关键帧**；端到端：`ffplay http://…/hls/<name>.m3u8` 连续播放、无 404 |
+| **FR-4.1** `/hls/<name>.m3u8` 与 `/hls/<name>-<seq>.ts` 路由（⏳ **v0.2 计划**） | 计划：新增 `scripts/hls_test.sh` —— m3u8 返回 200 + `Content-Type: application/vnd.apple.mpegurl`；切片 200 + `video/mp2t`；不存在 / 目录穿越 / 非法名 / 非白名单扩展名 → 404（与 `/live/` 同一套名字映射） |
+| **FR-4.2** Range（**HLS 切片**，⏳ **v0.2 计划**） | 计划：对 `-<seq>.ts` 发 `Range: bytes=a-b` → 206 + `Content-Range`；越界 → 416；响应带 `Accept-Ranges: bytes`。现有 `http_test.sh` 已覆盖通用 Range，但**必须对切片再验一次**（切片来自内存/磁盘的实现不同） |
+| **FR-3.4** 时间戳基准（**TS → 90kHz**，⏳ **v0.2 计划**） | 计划：单测断言 `ms → 90kHz` 用整数有理换算（`time_base.h`）且丢帧 0；集成 `ffprobe -show_packets` 断言切片内 dts 单调、**跨切片接续**（不因切片边界回退） |
+| **FR-1.3** 转码源 lazy 启动 + 空闲 60s 释放（⏳ **v0.2 计划**） | 计划：`srcmgr` 组扩展 —— 转码源在**首个订阅者接入时**才建解码/编码器上下文；订阅者清零后 60s 释放，并回收 sws / 编码器 / 线程；`/api/stats` 的 `sources` 与线程数回落；释放后 `releaseAll()` 可 join |
+| **FR-7.1** 命令行**转码开关**（⏳ **v0.2 计划**） | 计划：`--transcode`（默认**关**）；关闭时 HEVC→FLV 仍返回 **415**（不静默降级）；开启时走解码→编码路径；未提供时用默认值、未知参数仍报错退出 |
 | 各 codec 组合 | `CODEC_MATRIX.md` 每个组合一条 ffprobe 用例 |
 
 ## 8. 并发检查（TSAN）
