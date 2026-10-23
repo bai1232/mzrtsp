@@ -65,6 +65,7 @@
 #include "ffmpeg/time_base.h"
 #include "ffmpeg/codec_matrix.h"
 #include "ffmpeg/h264_util.h"
+#include "ffmpeg/aac_util.h"
 #include "ffmpeg/demuxer.h"
 
 // M5 媒体分发（已接入）

@@ -7,6 +7,30 @@
 
 （下一版内容；v0.2.0 计划见 [docs/ROADMAP.md](docs/ROADMAP.md)）
 
+### Added（**M8 / FR-2.2：MKV / MPEG-TS 输入**）
+- `src/ffmpeg/aac_util.{h,cpp}`：**ADTS 头解析 / `AudioSpecificConfig` 构造 / ADTS → raw AAC**
+  —— 纯函数、不依赖 libav*，可手造字节单测（含 9 字节 CRC 头、表外采样率、一帧多块、半帧）。
+- `src/media/demuxer_producer.cpp`：音频侧 **REPACK**。TS 的 AAC 是 ADTS（`avformat` 不给 extradata），
+  而 FLV 要「ASC + raw AAC 帧」，所以：
+  - **现场造 ASC**：用一次性探针 `Demuxer` 打开同一文件，读到首个音频包就解析 ADTS 头
+    （`profile`/采样率索引/`channel_configuration` 才是权威）→ `12 08`（AAC-LC/44100/mono）；
+    探针读完即关，主解封装的读游标**一个字节都没动**（否则首帧就要进"重放队列"，那是另一套复杂度）。
+  - **逐包剥 ADTS 头**（7 或 9 字节，按 `protection_absent` 取）。
+  - 找不到音频帧 / 头不合法 / 采样率与 `Demuxer` 报的不一致 → **明确失败**（不猜 AAC-LC、不默认采样率）。
+  - 观测：`adtsAudio()` / `adtsPackets()`。
+- `scripts/make_samples.sh`：新增 `sample.mkv` / `sample.ts` / `vonly.ts`（`-c copy` 转封装，码流与 MP4 同一份）。
+- 测试：`ffmpeg` 组 **5 例**纯函数（含**与真实 TS 码流交叉校验**）+ `producer` 组 **2 例**
+  （ASC 在 `open()` 内就绪、与裸 `Demuxer` 的原始包长**逐字节对账**；纯视频 TS 不因"造不出 ASC"失败）。
+- `scripts/flv_http_test.sh`：新增 **§3b（17 项）** —— MKV / TS 各出一条合法 FLV，外加
+  python 逐 tag 复查 **ASC=`12 08`** 且 **每个 raw AAC tag 都不带 ADTS 同步字**（`audio_tags=89 seq=1 raw=88`）。
+  脚本项数 **51 → 68**。
+- **变异验证**：不剥 ADTS 头 / 不造 ASC → `producer_ts_aac_gets_asc_and_strips_adts` **双红**。
+- 修一个连带问题：`DemuxerProducer::_path` 原来在 `prepareStreams()` **之后**才赋值，
+  而 ADTS 探针要用它重开同一个文件 → 提前赋值（失败路径清空，不留半状态）。
+
+> **实测**：`sample.ts` → `/live/clip.ts.flv` = **200、55,954 字节**（h264 320x240 + aac 44100、50 帧、
+> `ffmpeg` 零 error）；v0.1.x 时这条路径是 **415 `MissingExtradata`**。详见 `CODEC_MATRIX.md` §6.1。
+
 ### Tests（测试加固，**不改产品代码/行为**）
 - `tests/test_network_session.cpp` 补齐**可观测断言**（`ntimed` 组 41 用例 / **525 断言**）：
   - 记账：`bytesIn`、`bytesOut`、`pendingSendBytes`、`flushCloseTimeoutCount`、`totalAccepted`

@@ -104,6 +104,8 @@ set(MZMEDIA_SOURCES
         # M4-b CodecMatrix + H264 工具
         src/ffmpeg/codec_matrix.cpp
         src/ffmpeg/h264_util.cpp
+        # M8：TS 的 AAC 是 ADTS（无 extradata），要现场造 ASC + 逐帧剥头
+        src/ffmpeg/aac_util.cpp
         # M5-a 媒体分发（MediaPacket / FrameQueue / GopCache / MediaSource）
         src/media/media_packet.cpp
         src/media/frame_queue.cpp

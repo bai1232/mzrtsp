@@ -23,11 +23,15 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SERVER="$ROOT/build/bin/mzmedia"
 SAMPLE="$ROOT/samples/sample.mp4"
 RAW_SAMPLE="$ROOT/samples/sample.h264"
+MKV_SAMPLE="$ROOT/samples/sample.mkv"   # M8 / FR-2.2
+TS_SAMPLE="$ROOT/samples/sample.ts"     # M8：AAC 在 TS 里是 ADTS
 FLVJS="$ROOT/third_party/flv.js/flv.min.js"
 
 MEDIA_DIR="/tmp/mzmedia_acc_media"
 OUT="/tmp/mzmedia_flv_http.flv"
 OUT_RAW="/tmp/mzmedia_flv_http_raw.flv"
+OUT_MKV="/tmp/mzmedia_flv_http_mkv.flv"   # M8
+OUT_TS="/tmp/mzmedia_flv_http_ts.flv"     # M8
 OUT_LOOP="/tmp/mzmedia_flv_http_loop.flv"
 OUT_LATE="/tmp/mzmedia_flv_http_late.flv"
 PAGE="/tmp/mzmedia_page.html"
@@ -42,6 +46,8 @@ LOOP_PORT=$(( PORT + 1 ))
 [ -x "$SERVER" ] || { echo "错误：找不到 $SERVER，先执行 cmake --build build" >&2; exit 1; }
 [ -f "$SAMPLE" ] || { echo "错误：找不到样本，先执行 ./scripts/make_samples.sh" >&2; exit 1; }
 [ -f "$RAW_SAMPLE" ] || { echo "错误：找不到 samples/sample.h264，先执行 ./scripts/make_samples.sh" >&2; exit 1; }
+[ -f "$MKV_SAMPLE" ] || { echo "错误：找不到 samples/sample.mkv，先执行 ./scripts/make_samples.sh" >&2; exit 1; }
+[ -f "$TS_SAMPLE" ] || { echo "错误：找不到 samples/sample.ts，先执行 ./scripts/make_samples.sh" >&2; exit 1; }
 [ -f "$FLVJS" ] || { echo "错误：找不到 $FLVJS（播放器要入库，见 third_party/flv.js/README.md）" >&2; exit 1; }
 for tool in curl ffprobe ffmpeg python3; do
     command -v "$tool" > /dev/null 2>&1 || { echo "错误：需要 $tool" >&2; exit 1; }
@@ -84,6 +90,8 @@ cp "$SAMPLE" "$MEDIA_DIR/movie.mp4"    # §5/§6/§7 用（保持"还没读完"�
 cp "$SAMPLE" "$MEDIA_DIR/cold.mp4"     # §4 冷启动首帧延迟
 cp "$SAMPLE" "$MEDIA_DIR/notes.sh"     # §6 用来验证"扩展名白名单"
 cp "$RAW_SAMPLE" "$MEDIA_DIR/clip.h264"
+cp "$MKV_SAMPLE" "$MEDIA_DIR/clip.mkv"    # §3b
+cp "$TS_SAMPLE" "$MEDIA_DIR/clip.ts"      # §3b（AAC 是 ADTS）
 
 SRV_PID=""
 LOOP_PID=""
@@ -235,6 +243,62 @@ then
     cat /tmp/mzmedia_avcc_check.txt
 else
     check_false_msg "每个视频 tag 都是合法 AVCC（python 独立解析）" "$(cat /tmp/mzmedia_avcc_check.txt)"
+fi
+
+echo "== 3b) MKV / MPEG-TS 源（FR-2.2）：新容器 + TS 的 ADTS → ASC =="
+# 同一份 MP4 用 -c copy 转封装出来的两份码流，服务端必须都能封成合法 FLV。
+# TS 这条尤其关键：AAC 在 TS 里是 **ADTS**（每帧自带头、avformat 不给 extradata），
+# 服务端必须当场造出 AudioSpecificConfig 并逐包剥头 —— 否则就是 415（v0.1.x 的表现）。
+for pair in "mkv:$OUT_MKV:clip.mkv" "ts:$OUT_TS:clip.ts"; do
+    label="${pair%%:*}"; rest="${pair#*:}"; out="${rest%%:*}"; name="${rest#*:}"
+    code="$(curl -sS -N --max-time 30 -o "$out" -w '%{http_code}' "http://127.0.0.1:$PORT/live/$name.flv")"
+    check "GET /live/$name.flv → 200" "$code" "200"
+    check "[$label] 前 3 字节是 FLV" "$(head -c 3 "$out" | tr -d '\0')" "FLV"
+    check "[$label] 视频编码" "$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$out")" "h264"
+    check "[$label] 分辨率" "$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$out")" "320,240"
+    check "[$label] 音频编码" "$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$out")" "aac"
+    check "[$label] 音频采样率" "$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$out")" "44100"
+    frames="$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$out")"
+    check_range "[$label] 视频帧数" "${frames:-0}" 1 60
+    err="$(ffmpeg -v error -i "$out" -f null - 2>&1 > /dev/null || true)"
+    if [ -z "$err" ]; then
+        check_true "[$label] 转出的 FLV 解码无 error"
+    else
+        check_false_msg "[$label] 转出的 FLV 解码无 error" "$err"
+    fi
+done
+
+# ★ 结构证据（不靠 ffprobe 的"能解"）：逐个音频 tag 检查
+#   ① AAC sequence header 的 ASC 必须是 12 08（AAC-LC / 44100 / mono）；
+#   ② 每个 raw AAC tag **不能**以 ADTS 同步字 0xFF 0xF? 开头 —— 剥头漏了就是噪声。
+if python3 - "$OUT_TS" > /tmp/mzmedia_adts_check.txt 2>&1 << 'PYINNER'
+import sys
+data = open(sys.argv[1], 'rb').read()
+pos, audio_tags, seq, raw = 13, 0, 0, 0
+while pos + 11 <= len(data):
+    ttype = data[pos]
+    size = int.from_bytes(data[pos + 1:pos + 4], 'big')
+    body = data[pos + 11: pos + 11 + size]
+    if len(body) != size:
+        sys.exit("tag 截断")
+    if ttype == 8 and len(body) >= 2 and (body[0] >> 4) == 10:   # SoundFormat 10 = AAC
+        audio_tags += 1
+        if body[1] == 0:                                         # AAC sequence header
+            seq += 1
+            if body[2:4] != bytes([0x12, 0x08]):
+                sys.exit("AudioSpecificConfig 不是 12 08：%s" % body[2:4].hex())
+        elif body[1] == 1:                                       # raw AAC
+            raw += 1
+            if len(body) >= 4 and body[2] == 0xFF and (body[3] & 0xF0) == 0xF0:
+                sys.exit("raw AAC tag 里还带着 ADTS 同步字（没剥头）")
+    pos += 11 + size + 4
+print("audio_tags=%d seq=%d raw=%d" % (audio_tags, seq, raw))
+sys.exit(0 if (seq == 1 and raw > 0) else 1)
+PYINNER
+then
+    check_true "TS：ASC=12 08 且 raw AAC tag 已剥 ADTS 头（$(cat /tmp/mzmedia_adts_check.txt)）"
+else
+    check_false_msg "TS：ASC=12 08 且 raw AAC tag 无 ADTS 头" "$(cat /tmp/mzmedia_adts_check.txt)"
 fi
 
 echo "== 4) NFR-1：冷启动首帧延迟 < 1s =="

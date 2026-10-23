@@ -14,6 +14,7 @@
 #include "media/demuxer_producer.h"
 
 #include "core/logger.h"
+#include "ffmpeg/aac_util.h"
 #include "ffmpeg/h264_util.h"
 
 #include <utility>
@@ -72,12 +73,15 @@ bool DemuxerProducer::open(const std::string &path) {
         setError(_demux.lastError()); // 不吞掉下层原因
         return false;
     }
+    // 【M8】_path 必须在 prepareStreams() **之前**记下：ADTS 探针要用它重新打开同一个文件
+    // （裸流/MP4 用不到，但把赋值提前没有副作用 —— 失败路径会把 _path 清掉，不留半状态）。
+    _path = path;
     if (!prepareStreams()) {
         _demux.close(); // 初始化数据不可用：不留一个半开的对象
+        _path.clear();
         ErrorL << "DemuxerProducer::open 失败：" << lastError();
         return false;
     }
-    _path = path;
     _opened_at_ms.store(static_cast<int64_t>(getCurrentMillisecond()));
     _loop_offset_ms.store(0);
     _pass.assign(_demux.streams().size(), PassTrack{});
@@ -116,6 +120,7 @@ bool DemuxerProducer::prepareStreams() {
     _has_video_info = false;
     _has_audio_info = false;
     _annexb_video = false;
+    _adts_audio = false;
     _video_info = StreamInfo{};
     _audio_info = StreamInfo{};
     _raw_video_info = StreamInfo{};
@@ -154,9 +159,118 @@ bool DemuxerProducer::prepareStreams() {
         _raw_audio_info = *audio;
         _audio_info = *audio;
         _has_audio_info = true;
+
+        // 【M8 / FR-2.2】TS 的 AAC 是 ADTS：没有 extradata，必须**现场造 ASC**。
+        // 为什么必须在 open() 之内做完：连接拿的是流快照的裸指针，AAC sequence header
+        // 在建连那一刻就要发（FR-3.1 的"立即"），等第一个包到了再造就来不及了。
+        const bool has_extra = audio->extradata && !audio->extradata->empty();
+        if (audio->codec_id == AV_CODEC_ID_AAC && !has_extra) {
+            if (!probeAdtsAudioConfig()) {
+                return false;   // 原因已由 probeAdtsAudioConfig 写进 lastError（明确失败，不猜）
+            }
+        }
     }
 
     _pass.assign(_demux.streams().size(), PassTrack{});
+    return true;
+}
+
+bool DemuxerProducer::probeAdtsAudioConfig() {
+    // 为什么要**另开一个** Demuxer 探针，而不是用主解封装读一帧：
+    //   主 Demuxer 的读游标一旦前进，读到的那些包就必须原样留到 read() 里再交付
+    //   （否则首帧/首包丢失 → 播放端从半途开始）。要实现这个就得引入"重放队列"，
+    //   而 ASC 又必须在 open() 之内就绪（见 prepareStreams 里的注释）。一次性探针
+    //   把这两个约束都绕开了：它只读前 N 个包、读完就关，主游标一个字节都没动。
+    // 代价：打开同一个文件两次（本地文件是一次 open + 读几个包，毫秒级）。
+    Demuxer probe(_config.demux);
+    if (!probe.open(_path)) {
+        setError("探测 ADTS 头失败：无法用探针打开 " + _path + "（" + probe.lastError() + "）");
+        ErrorL << "DemuxerProducer: " << lastError();
+        return false;
+    }
+    const StreamInfo *probe_audio = probe.firstAudio();
+    if (probe_audio == nullptr) {
+        (void) probe.close();
+        setError("探测 ADTS 头失败：探针没有看到音频流（与主解封装不一致）");
+        ErrorL << "DemuxerProducer: " << lastError();
+        return false;
+    }
+    const int want_index = probe_audio->index;
+
+    // 有界：最多看这么多包（正常 TS 里音频包间隔只有几个包；找不到就是文件本身异常）
+    constexpr int kMaxProbePackets = 512;
+    AdtsHeader header;
+    bool found = false;
+    for (int i = 0; i < kMaxProbePackets; ++i) {
+        const Demuxer::ReadResult result = probe.readPacket();
+        if (result == Demuxer::ReadResult::Eof) {
+            break;
+        }
+        if (result == Demuxer::ReadResult::Error) {
+            setError("探测 ADTS 头失败：探针读包出错（" + probe.lastError() + "）");
+            (void) probe.close();
+            ErrorL << "DemuxerProducer: " << lastError();
+            return false;
+        }
+        if (probe.packetStreamIndex() != want_index) {
+            continue;
+        }
+        const AVPacket *pkt = probe.packet();
+        if (pkt == nullptr || pkt->data == nullptr || pkt->size <= 0) {
+            continue;
+        }
+        if (!parseAdtsHeader(pkt->data, static_cast<size_t>(pkt->size), &header)) {
+            setError("探测 ADTS 头失败：TS 的 AAC 包不是合法 ADTS 帧（同步字 / 表外采样率 / 帧长非法）"
+                     " → 造不出 AudioSpecificConfig（明确拒绝，不猜）");
+            (void) probe.close();
+            ErrorL << "DemuxerProducer: " << lastError();
+            return false;
+        }
+        found = true;
+        break;
+    }
+    (void) probe.close();
+    if (!found) {
+        setError("探测 ADTS 头失败：前 " + std::to_string(kMaxProbePackets) +
+                 " 个包里没有 AAC 音频帧 → 造不出 AudioSpecificConfig（明确拒绝，不猜）");
+        ErrorL << "DemuxerProducer: " << lastError();
+        return false;
+    }
+
+    uint8_t asc[2] = {0, 0};
+    if (!buildAudioSpecificConfig(header, asc)) {
+        setError("由 ADTS 头构造 AudioSpecificConfig 失败（字段超出位宽）");
+        ErrorL << "DemuxerProducer: " << lastError();
+        return false;
+    }
+    // 交叉校验（两套独立路径互相印证，与 M4-b 的 SPS 交叉校验同一思路）：
+    //   · 采样率**必须**一致 —— 不一致说明两套读法有一边错了，继续下去会产出音调不对的流；
+    //   · 声道数只 Warn（ASC 用 ADTS 的 channel_configuration 才是权威；StreamInfo 是从 ADTS 推的，
+    //     而 7.1 的 channel_configuration=7 与"8 声道"不是同一个数值）。
+    const uint32_t adts_rate = aacSampleRateFromIndex(header.sampling_frequency_index);
+    if (_audio_info.sample_rate > 0 && adts_rate != static_cast<uint32_t>(_audio_info.sample_rate)) {
+        setError("ADTS 头声明的采样率 " + std::to_string(adts_rate) + " Hz 与解封装报的 " +
+                 std::to_string(_audio_info.sample_rate) + " Hz 不一致 → 明确拒绝（不猜用哪个）");
+        ErrorL << "DemuxerProducer: " << lastError();
+        return false;
+    }
+    if (_audio_info.channels > 0 &&
+        static_cast<int>(header.channel_configuration) != _audio_info.channels) {
+        WarnP("DemuxerProducer: ADTS 的 channel_configuration=%u 与解封装报的 channels=%d 不同"
+              "（7.1 的 channel_configuration=7 对应 8 声道，属于正常差异）→ 以 ADTS 为准",
+              static_cast<unsigned>(header.channel_configuration), _audio_info.channels);
+    }
+
+    _audio_info.extradata = std::make_shared<const std::vector<uint8_t>>(
+        std::vector<uint8_t>{asc[0], asc[1]});
+    _adts_audio = true;
+    InfoP("DemuxerProducer: 音频是 ADTS（TS）→ 现场构造 AudioSpecificConfig %02X %02X"
+          "（profile=%u 采样率索引=%u 声道配置=%u，头 %u 字节）→ 发包时逐包剥 ADTS 头",
+          static_cast<unsigned>(asc[0]), static_cast<unsigned>(asc[1]),
+          static_cast<unsigned>(header.profile),
+          static_cast<unsigned>(header.sampling_frequency_index),
+          static_cast<unsigned>(header.channel_configuration),
+          static_cast<unsigned>(header.header_bytes));
     return true;
 }
 
@@ -345,6 +459,16 @@ SourcePump::ReadResult DemuxerProducer::read(MediaPacket::Ptr *packet, std::stri
             }
             payload = std::move(avcc);
             ++_annexb_packets;
+        } else if (kind == MediaKind::Audio && _adts_audio) {
+            // 【M8】ADTS → raw AAC：FLV 的 AudioTag 里**不能**带 ADTS 头（那样播放端会当噪声）
+            auto raw = std::make_shared<std::vector<uint8_t>>();
+            if (!adtsToRawAac(pkt->data, static_cast<size_t>(pkt->size), raw.get())) {
+                setError("ADTS → raw AAC 转换失败（帧不完整 / 一帧多块 / 同步字丢失）");
+                ErrorL << "DemuxerProducer::read 失败：" << lastError();
+                return SourcePump::ReadResult::Error;
+            }
+            payload = std::move(raw);
+            ++_adts_packets;
         } else {
             payload = std::make_shared<std::vector<uint8_t>>(
                 pkt->data, pkt->data + static_cast<size_t>(pkt->size));

@@ -18,6 +18,7 @@
 #include "core/util.h"
 #include "ffmpeg/codec_matrix.h"
 #include "ffmpeg/demuxer.h"
+#include "ffmpeg/aac_util.h"
 #include "ffmpeg/h264_util.h"
 #include "ffmpeg/time_base.h"
 
@@ -641,4 +642,200 @@ MZ_TEST(ffmpeg_avcc_build_from_raw_sample_sps_pps) {
         return;
     }
     MZ_ASSERT_TRUE(looksLikeAnnexB(video->extradata->data(), video->extradata->size()));
+}
+
+
+// ---------------------------------------------------------------------------
+// M8 / FR-2.2：ADTS 头解析、AudioSpecificConfig 构造、ADTS → raw AAC
+//   全部是纯函数：字节自己造，不依赖样本、不依赖解码器。
+//   每条断言旁边写明「能证明什么 / 什么情况会红」。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// 造一个合法 ADTS 帧（头 + 指定长度的 payload，payload 填 0x55）
+std::vector<uint8_t> makeAdtsFrame(uint8_t profile, uint8_t sfi, uint8_t cc, size_t payload_size,
+                                   bool with_crc = false, uint8_t raw_blocks = 0) {
+    const size_t header_bytes = with_crc ? 9 : 7;
+    const size_t frame_length = header_bytes + payload_size;
+    std::vector<uint8_t> f(frame_length, 0x55);
+    f[0] = 0xFF;
+    // byte1: syncword 低 4 位 = 1111 | ID=0(MPEG-4) | layer=00 | protection_absent
+    f[1] = static_cast<uint8_t>(with_crc ? 0xF0 : 0xF1);
+    // byte2: profile(2) | sfi(4) | private(1) | channel_config 高位(1)
+    f[2] = static_cast<uint8_t>((profile << 6) | ((sfi & 0x0F) << 2) | ((cc >> 2) & 0x01));
+    // byte3: channel_config 低 2 位 | ... | frame_length 高 2 位
+    f[3] = static_cast<uint8_t>(((cc & 0x03) << 6) | ((frame_length >> 11) & 0x03));
+    f[4] = static_cast<uint8_t>((frame_length >> 3) & 0xFF);
+    f[5] = static_cast<uint8_t>(((frame_length & 0x07) << 5) | 0x1F);
+    f[6] = static_cast<uint8_t>(0xFC | (raw_blocks & 0x03));
+    return f;
+}
+
+} // namespace
+
+MZ_TEST(ffmpeg_aac_adts_header_and_asc) {
+    // 能证明什么：ADTS 头字段的位域位置（profile / sfi / channel_config / frame_length）
+    //             与 ASC 的位打包都对；AAC-LC/44100/单声道 → 12 08（立体声 → 12 10）。
+    // 什么情况会红：位偏移写错（例如 channel_config 高低位拆错）、ASC 打包错、把 CRC 当 payload。
+    const std::vector<uint8_t> mono = makeAdtsFrame(1, 4, 1, 20);   // AAC-LC / 44100 / mono
+    AdtsHeader h;
+    MZ_ASSERT_TRUE(parseAdtsHeader(mono.data(), mono.size(), &h));
+    MZ_ASSERT_EQ(h.profile, 1u);
+    MZ_ASSERT_EQ(h.sampling_frequency_index, 4u);
+    MZ_ASSERT_EQ(h.channel_configuration, 1u);
+    MZ_ASSERT_EQ(h.header_bytes, 7u);
+    MZ_ASSERT_EQ(h.frame_length, mono.size());
+    MZ_ASSERT_EQ(aacSampleRateFromIndex(h.sampling_frequency_index), 44100u);
+
+    uint8_t asc[2] = {0, 0};
+    MZ_ASSERT_TRUE(buildAudioSpecificConfig(h, asc));
+    MZ_ASSERT_EQ(asc[0], 0x12u);   // AOT=2(AAC-LC) | sfi 高 3 位 = 010
+    MZ_ASSERT_EQ(asc[1], 0x08u);   // sfi 低位 0 | channel_config 1
+
+    const std::vector<uint8_t> stereo = makeAdtsFrame(1, 4, 2, 20);
+    MZ_ASSERT_TRUE(parseAdtsHeader(stereo.data(), stereo.size(), &h));
+    MZ_ASSERT_EQ(h.channel_configuration, 2u);
+    MZ_ASSERT_TRUE(buildAudioSpecificConfig(h, asc));
+    MZ_ASSERT_EQ(asc[0], 0x12u);
+    MZ_ASSERT_EQ(asc[1], 0x10u);   // 443?→ 12 10 是 AAC-LC/44100/立体声的标准 ASC
+
+    const std::vector<uint8_t> f48 = makeAdtsFrame(1, 3, 2, 8);   // 48000 / 立体声
+    MZ_ASSERT_TRUE(parseAdtsHeader(f48.data(), f48.size(), &h));
+    MZ_ASSERT_TRUE(buildAudioSpecificConfig(h, asc));
+    MZ_ASSERT_EQ(asc[0], 0x11u);
+    MZ_ASSERT_EQ(asc[1], 0x90u);   // 11 90 = AAC-LC/48000/立体声
+
+    // 采样率表：13..15 一律 0（表外不猜），0/12 两端必须对
+    MZ_ASSERT_EQ(aacSampleRateFromIndex(0), 96000u);
+    MZ_ASSERT_EQ(aacSampleRateFromIndex(12), 7350u);
+    MZ_ASSERT_EQ(aacSampleRateFromIndex(13), 0u);
+    MZ_ASSERT_EQ(aacSampleRateFromIndex(15), 0u);
+    MZ_ASSERT_EQ(aacIndexFromSampleRate(44100), 4);
+    MZ_ASSERT_EQ(aacIndexFromSampleRate(44101), -1);
+}
+
+MZ_TEST(ffmpeg_aac_adts_crc_header_is_nine_bytes) {
+    // 能证明什么：protection_absent=0 时头是 9 字节（含 2 字节 CRC），剥头必须按 9 算。
+    // 什么情况会红：把 7 写死（CRC 流的 payload 会多带 2 字节 → 播放端噪声/爆音）。
+    const std::vector<uint8_t> frame = makeAdtsFrame(1, 4, 1, 16, /*with_crc=*/true);
+    AdtsHeader h;
+    MZ_ASSERT_TRUE(parseAdtsHeader(frame.data(), frame.size(), &h));
+    MZ_ASSERT_FALSE(h.protection_absent);
+    MZ_ASSERT_EQ(h.header_bytes, 9u);
+
+    std::vector<uint8_t> raw;
+    MZ_ASSERT_TRUE(adtsToRawAac(frame.data(), frame.size(), &raw));
+    MZ_ASSERT_EQ(raw.size(), 16u);
+    MZ_ASSERT_EQ(raw.front(), 0x55u);   // 从第 9 字节开始才是 payload
+}
+
+MZ_TEST(ffmpeg_aac_adts_rejects_malformed) {
+    // 能证明什么：畸形输入一律**明确失败**（返回 false），不产生"看起来能用"的半成品。
+    // 什么情况会红：把任一检查放宽成"默认值"（那会把畸形流的坏参数静默塞进 ASC）。
+    AdtsHeader h;
+    const std::vector<uint8_t> good = makeAdtsFrame(1, 4, 1, 8);
+
+    MZ_ASSERT_FALSE(parseAdtsHeader(nullptr, 16, &h));
+    MZ_ASSERT_FALSE(parseAdtsHeader(good.data(), 6, &h));          // 短于 7 字节
+    MZ_ASSERT_FALSE(parseAdtsHeader(good.data(), good.size(), nullptr));
+
+    std::vector<uint8_t> bad = good;
+    bad[0] = 0xFE;                                                  // 同步字错
+    MZ_ASSERT_FALSE(parseAdtsHeader(bad.data(), bad.size(), &h));
+
+    bad = good;
+    bad[1] = 0xF3;                                                  // layer != 0
+    MZ_ASSERT_FALSE(parseAdtsHeader(bad.data(), bad.size(), &h));
+
+    for (uint8_t sfi : {13, 14, 15}) {                              // 表外采样率索引
+        const std::vector<uint8_t> f = makeAdtsFrame(1, sfi, 1, 8);
+        MZ_ASSERT_FALSE(parseAdtsHeader(f.data(), f.size(), &h));
+    }
+    {
+        const std::vector<uint8_t> f = makeAdtsFrame(1, 4, 0, 8);    // channel_config=0（PCE）
+        MZ_ASSERT_FALSE(parseAdtsHeader(f.data(), f.size(), &h));
+    }
+    {
+        // 帧长（13 bit）小于头长：把 frame_length 改成 3
+        std::vector<uint8_t> f = good;
+        f[3] = static_cast<uint8_t>(f[3] & 0xFC);
+        f[4] = 0;
+        f[5] = static_cast<uint8_t>(f[5] & 0x1F);
+        MZ_ASSERT_FALSE(parseAdtsHeader(f.data(), f.size(), &h));
+    }
+}
+
+MZ_TEST(ffmpeg_aac_adts_to_raw_multi_frame) {
+    // 能证明什么：一个包里多帧时逐帧剥头、按序拼接；半帧/多块一律失败（不静默丢尾巴）。
+    // 什么情况会红：只剥第一帧的头；或把帧长当 payload 长（少/多算 7 字节）。
+    std::vector<uint8_t> stream;
+    for (int i = 0; i < 3; ++i) {
+        const std::vector<uint8_t> f = makeAdtsFrame(1, 4, 2, 20);
+        stream.insert(stream.end(), f.begin(), f.end());
+    }
+    std::vector<uint8_t> raw;
+    MZ_ASSERT_TRUE(adtsToRawAac(stream.data(), stream.size(), &raw));
+    MZ_ASSERT_EQ(raw.size(), 60u);                                  // 3 × 20
+    for (uint8_t b : raw) {
+        MZ_ASSERT_EQ(b, 0x55u);
+    }
+
+    // 半帧：帧长声明 27（7+20），但只给 20 字节
+    MZ_ASSERT_FALSE(adtsToRawAac(stream.data(), 20, &raw));
+
+    // 一帧多块（raw_blocks != 0）：本实现明确不做
+    const std::vector<uint8_t> multi = makeAdtsFrame(1, 4, 2, 20, false, 1);
+    MZ_ASSERT_FALSE(adtsToRawAac(multi.data(), multi.size(), &raw));
+
+    // 同步字丢失（第二帧头坏）
+    std::vector<uint8_t> broken = stream;
+    broken[27] = 0x00;
+    MZ_ASSERT_FALSE(adtsToRawAac(broken.data(), broken.size(), &raw));
+}
+
+MZ_TEST(ffmpeg_aac_adts_matches_real_ts_sample) {
+    // 能证明什么：**自己写的解析器**能读懂 ffmpeg 真实产出的 TS 音频包（交叉校验，
+    //   与 M4-b 的"SPS 解析 vs Demuxer 两套独立路径逐项一致"同一思路）。
+    // 什么情况会红：位域按错误规范写（对着手造字节能过、对着真实码流就错）。
+    const std::string path = samplePath("sample.ts");
+    MZ_ASSERT_FALSE(path.empty());
+    if (path.empty()) {
+        return;
+    }
+    Demuxer demuxer;
+    MZ_ASSERT_TRUE(demuxer.open(path));
+    const StreamInfo *audio = demuxer.firstAudio();
+    MZ_ASSERT_NOT_NULL(audio);
+    if (audio == nullptr) {
+        return;
+    }
+    // TS 的 AAC **没有** extradata —— 这正是 M8 要处理的那种形状
+    MZ_ASSERT_TRUE(audio->extradata == nullptr || audio->extradata->empty());
+
+    bool found = false;
+    for (int i = 0; i < 512; ++i) {
+        const Demuxer::ReadResult r = demuxer.readPacket();
+        MZ_ASSERT_TRUE(r == Demuxer::ReadResult::Packet);
+        if (r != Demuxer::ReadResult::Packet) {
+            return;
+        }
+        if (demuxer.packetStreamIndex() != audio->index) {
+            continue;
+        }
+        const AVPacket *pkt = demuxer.packet();
+        MZ_ASSERT_NOT_NULL(pkt);
+        AdtsHeader h;
+        MZ_ASSERT_TRUE(parseAdtsHeader(pkt->data, static_cast<size_t>(pkt->size), &h));
+        // 与 Demuxer 报的流参数交叉校验（两套独立路径）
+        MZ_ASSERT_EQ(aacSampleRateFromIndex(h.sampling_frequency_index),
+                     static_cast<uint32_t>(audio->sample_rate));
+        uint8_t asc[2] = {0, 0};
+        MZ_ASSERT_TRUE(buildAudioSpecificConfig(h, asc));
+        MZ_ASSERT_EQ(asc[0], 0x12u);   // AAC-LC
+        MZ_ASSERT_EQ(asc[1], 0x08u);   // 44100 / mono（样本是 sine 单声道）
+        found = true;
+        break;
+    }
+    MZ_ASSERT_TRUE(found);
 }

@@ -22,7 +22,7 @@
 
 | 任务 | 说明 |
 |---|---|
-| MKV / TS 输入（**FR-2.2**） | 复用 M4 的 `Demuxer`，`CodecMatrix` 增补组合。**已知缺口**：TS 里的 AAC 是 ADTS（无 extradata），必须先造出 `AudioSpecificConfig`（v0.1.x 实测该路径返回 415 `MissingExtradata`） |
+| **M8 ✅ MKV / TS 输入（FR-2.2）** | 复用 M4 的 `Demuxer`，`CodecMatrix` 增补组合。TS 的 AAC 是 ADTS（无 extradata）→ 新增 `aac_util`（ADTS 头解析 / ASC 构造 / 逐帧剥头）+ `DemuxerProducer` 的音频 REPACK（用一次性探针 Demuxer 取首帧 ADTS 头，**不改主读游标**）。**实测**：MKV / TS / 纯视频 TS 三条都能拉出合法 FLV；ASC=`12 08`；见 `CODEC_MATRIX.md` §6.1 |
 | **HLS 输出**（**FR-3.2** / **FR-4.1**（`/hls/` 路由）/ **FR-4.2**（切片 Range）/ **FR-3.4**（TS → 90kHz）） | `HlsWriter`：mpegts 切片 2s、滑动窗口 6 片、`.m3u8` 序列管理、切片静态服务（含 Range） |
 | **转码**（**NFR-5** / **FR-6.1**（实时倍数）/ **FR-7.1**（转码开关）） | `Transcoder`：解码 → 编码；`libswscale` 做像素格式/分辨率转换（**需先 `apt install libswscale-dev`**） |
 | 转码调度（**FR-1.3**） | 由 `ThreadPool` 承载；lazy 启动 + 空闲 60s 释放；实时倍数统计 |

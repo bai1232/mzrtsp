@@ -18,6 +18,16 @@
  *      而 FLV 要 length-prefixed + avcC。转换放在**这里**（而不是 `output/`）的原因：
  *      "输入是什么形状"是解封装层的知识，输出层只管"我要 avcC"；转换后 `MediaPacket` 与
  *      MP4 输入**完全同形**，于是 `FlvMuxer` 一行都不用改（也因此能被已有单测覆盖）。
+ *   4) 【M8 / FR-2.2】**ADTS → raw AAC + 现场造 ASC**：MPEG-TS 里的 AAC 是 ADTS（每帧 7/9 字节
+ *      自描述头，`avformat` **不给 extradata**），而 FLV 要「AudioSpecificConfig + raw AAC 帧」。
+ *      视频侧的对称物就是上面那条 Annex-B → AVCC：同一个地方、同一套理由（输入形状归解封装层）。
+ *      两个约束决定了它的形状：
+ *        · ASC **必须在 `open()` 之内就绪** —— 连接会拿着流快照的裸指针写 AAC sequence header，
+ *          所以不能"等第一个包到了再造"；
+ *        · 而造 ASC 需要**真读一帧音频**（ADTS 头里的 profile / 采样率索引 / 声道配置才是权威）。
+ *      做法：用**一次性探针 Demuxer** 打开同一个文件，读到首个音频包就解析 ADTS 头造 ASC，
+ *      然后关掉探针 —— 主解封装的读游标**完全不动**（否则首帧就得进"重放队列"，那是另一套复杂度）。
+ *      找不到音频帧 / 头不合法 → **明确失败**（不猜 AAC-LC，也不默认 44100）。
  *
  * 时间戳换算失败（`packetTimestampsMs` 返回 false）时**仍然发包**（用 Demuxer 保持的
  * 上一次值 + 单调钳制），只累加计数：丢一个包比时间戳不够精确更糟。
@@ -127,6 +137,14 @@ public:
     uint64_t annexBPackets() const {
         return _annexb_packets.load();
     }
+    /// 【M8】音频是否是 ADTS（即发生过"现场造 ASC + 逐包剥 ADTS 头"）
+    bool adtsAudio() const {
+        return _adts_audio;
+    }
+    /// 【M8】剥过 ADTS 头的音频包数（ADTS 输入 ≈ 音频包总数）
+    uint64_t adtsPackets() const {
+        return _adts_packets.load();
+    }
     /// 循环重开的次数
     uint64_t loopCount() const {
         return _loops.load();
@@ -153,6 +171,13 @@ private:
     const StreamInfo *findStream(int index) const;
     /// 记失败原因（内部加锁：读方可能在别的线程）
     void setError(const std::string &message);
+    /**
+     * 【M8】用一次性探针读到首个 ADTS 音频包，造出 `AudioSpecificConfig` 填进 `_audio_info`
+     * @return false = 打不开探针 / 前 N 个包里没有音频 / ADTS 头不合法 / 与 Demuxer 报的参数冲突
+     *         （原因写入 `lastError()`，**不猜** AAC-LC、也不默认采样率）
+     * @note 只在 `prepareStreams()` 里、且"AAC 输入且没有 extradata"时调用一次
+     */
+    bool probeAdtsAudioConfig();
     /// open() 之后：准备 muxer 用的流副本（含 Annex-B → avcC 构造）
     /// @return false = 初始化数据不足以封 FLV（**初始化头当场失败**，不是等每个包都失败）
     bool prepareStreams();
@@ -178,6 +203,7 @@ private:
     std::atomic<uint64_t> _skipped_unknown{0};
     std::atomic<uint64_t> _ts_failures{0};
     std::atomic<uint64_t> _annexb_packets{0};
+    std::atomic<uint64_t> _adts_packets{0};   ///< 【M8】剥过 ADTS 头的音频包数
     std::atomic<uint64_t> _loops{0};
     std::atomic<uint64_t> _loop_failures{0};
     std::atomic<int64_t> _loop_offset_ms{0};
@@ -193,6 +219,8 @@ private:
     bool _has_video_info = false;
     bool _has_audio_info = false;
     bool _annexb_video = false;
+    /// 【M8】音频输入是 ADTS（TS）：发包时逐包剥头
+    bool _adts_audio = false;
 
     // ---- 只有源线程碰：一趟的 dts 轨迹 ----
     std::vector<PassTrack> _pass;

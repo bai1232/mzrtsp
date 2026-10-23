@@ -79,8 +79,22 @@
 | 文件中无音视频轨 | 启动失败并输出明确错误（仅音频轨允许，纯无轨拒绝） |
 | 转码过程中失败 | 关闭该源的所有连接，返回已发送字节与错误原因，日志 `Error` |
 
+## 6.1 v0.2 已实测的组合（M8，2026-10-23）
+
+样本由 `scripts/make_samples.sh` 用 `-c copy` 从 `sample.mp4` 转封装而来（码流同一份，只换容器）：
+
+| 输入 | 视频 | 音频 | 判定 | 实测结果 |
+|---|---|---|---|---|
+| **MKV**（`sample.mkv`） | H264（avcC 直通，`extradata` 就是 `AVCDecoderConfigurationRecord`） | AAC（raw + ASC） | **REMUX** | ✅ `curl …/live/clip.mkv.flv` → 200、合法 FLV（h264 320x240 + aac 44100、50 帧、`ffmpeg` 零 error） |
+| **MPEG-TS**（`sample.ts`） | H264（**Annex-B**，`extradata` 是 `00 00 01 67 …`） | AAC（**ADTS**，无 `extradata`） | **REPACK**（视频剥起始码、音频剥 ADTS 头 + 现场造 ASC） | ✅ 200、合法 FLV（同上）；ASC = **`12 08`**（AAC-LC / 44100 / mono）；python 逐 tag 复查：`audio_tags=89 seq=1 raw=88`，**每个 raw AAC tag 都不带 ADTS 同步字** |
+| **纯视频 TS**（`vonly.ts`） | H264 | 无 | **REPACK** | ✅ 200、纯视频 FLV（FR-3.3：没有音频也不报错） |
+
+> TS 的音频不是"照搬"：v0.1.x 时这条路径会返回 **415 `MissingExtradata`**（`FlvMuxer::prepare()`
+> 发现 AAC 缺 `AudioSpecificConfig`）。M8 的修法与理由见 `docs/DESIGN_M6.md` §3.6 ③。
+
 ## 7. 待补全
 
-- v0.2 补齐 MKV（`matroska`）的编码组合实测结果
+- ~~v0.2 补齐 MKV（`matroska`）的编码组合实测结果~~ ✅ **M8 已完成**（见 §6.1）
 - v0.3 补齐 RTSP 输入的编码探测（远端 SDP 与实际码流可能不一致）
-- 每个组合都需要一条 `ffprobe` 校验用例，写入 `TESTING.md`
+- 每个组合都需要一条 `ffprobe` 校验用例，写入 `TESTING.md`（MKV/TS 的两条已在
+  `scripts/flv_http_test.sh` §3b + `producer`/`ffmpeg` 组落地）

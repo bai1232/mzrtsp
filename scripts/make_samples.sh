@@ -5,6 +5,9 @@
 #   samples/sample.h264  ：上面的视频轨转成 H264 裸流（M4-b 提 SPS/PPS 用）
 #   samples/bf.mp4       ：带 B 帧的样本（学习用：观察 dts 单调 / pts 乱序）
 #   samples/garbage.bin  ：随机字节（"畸形输入"用例用）
+#   samples/sample.mkv   ：sample.mp4 转封装成 Matroska（M8 / FR-2.2）
+#   samples/sample.ts    ：sample.mp4 转封装成 MPEG-TS（M8：AAC 在 TS 里是 ADTS，要现场造 ASC）
+#   samples/vonly.ts     ：纯视频 TS（"没有音频也要能出 FLV"，FR-3.3）
 # 用法：./scripts/make_samples.sh
 # ============================================================================
 set -eu
@@ -27,6 +30,15 @@ ffmpeg -y -i "$OUT/sample.mp4" -c:v copy -bsf:v h264_mp4toannexb -f h264 \
 # 带 B 帧的样本：用来观察"dts 单调、pts 乱序"（docs/AV_BASICS.md §2 ④）
 ffmpeg -y -f lavfi -i "testsrc=size=320x240:rate=25" -t 1 -bf 2 -pix_fmt yuv420p \
     -c:v libx264 -preset ultrafast "$OUT/bf.mp4" > /dev/null 2>&1
+
+# M8（FR-2.2）：同一份 MP4 **转封装**成 MKV / TS。
+# 为什么用 -c copy：这批要测的是**解封装**（容器 → 码流），码流必须与 sample.mp4 完全同一份，
+# 否则"TS 出来的 FLV 与 MP4 出来的 FLV 是否等价"就没有可比性。
+ffmpeg -y -i "$OUT/sample.mp4" -c copy "$OUT/sample.mkv" > /dev/null 2>&1
+# TS 必须带 -f mpegts：AAC 会被写成 ADTS（每帧自带头、没有 extradata）—— 这正是 M8 要处理的形状
+ffmpeg -y -i "$OUT/sample.mp4" -c copy -f mpegts "$OUT/sample.ts" > /dev/null 2>&1
+# 纯视频 TS：验证"没有音频也不报错"（FR-3.3）
+ffmpeg -y -i "$OUT/sample.mp4" -an -c:v copy -f mpegts "$OUT/vonly.ts" > /dev/null 2>&1
 
 head -c 65536 /dev/urandom > "$OUT/garbage.bin"
 

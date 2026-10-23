@@ -216,6 +216,24 @@ uint64_t loopCount() const;  int64_t loopOffsetMs() const;  uint64_t loopFailure
 - 快照**只写一次**（`open()` 时），重开时只**校验**不刷新：连接可能正拿着 `StreamInfo*` 写 FLV，
   就地刷新就是跨线程写 → 数据竞争 + 悬垂。
 
+**③ ADTS → raw AAC + 现场造 ASC（M8 / `FR-2.2`）**
+
+MPEG-TS 里的 AAC 是 **ADTS**：每帧自带 7/9 字节头（采样率/声道/profile 都在头里自描述），
+`avformat` **不给 extradata**。而 FLV 要的是「`AudioSpecificConfig` + **raw** AAC 帧」，
+所以这是一次**轻量转换**（`CODEC_MATRIX.md` 的 REPACK 档，不解码），与 ① 的 Annex-B→AVCC 完全对称。
+
+| 决策 | 做法 | 排除的选项与原因 |
+|---|---|---|
+| 造 ASC 的**数据来源** | 用**一次性探针 Demuxer** 打开同一个文件，读到首个音频包就解析它的 ADTS 头（`aac_util::parseAdtsHeader`）→ `buildAudioSpecificConfig` | 排除"从 `StreamInfo` 的采样率/声道**推断**"：profile（AAC-LC / HE-AAC）推不出来，猜错就是"能播但音调不对/无声"；D4 的教训是"不猜" |
+| 造 ASC 的**时机** | 在 `open()` / `prepareStreams()` 之内造好（早于任何客户端） | 排除"等首个音频包到了再造"：连接拿的是流快照裸指针，AAC sequence header 在建连那一刻就得发（FR-3.1 的"立即"），来不及 |
+| 为什么不直接在主 Demuxer 上"预读一个包" | 主读游标一旦前进，读到的包必须**原样留到 `read()` 再交付**（否则首帧丢失）→ 要引入"重放队列"。探针打开同一个文件（一次 open + 读几个包）把这两个约束都绕开，主游标**一个字节都没动** | 排除重放队列：多一套状态、多一组边界（循环重开时怎么清、内存上限多少），收益只是省一次 open |
+| 找不到音频帧 / 头不合法 | **明确失败**（`open()` 返回 false + 原因），HTTP 侧表现为该源打不开 | 排除"当没有音频"（静默丢一条轨）与"猜 AAC-LC/44100"（假成功最贵） |
+| `header_bytes` | 按 `protection_absent` 取 **7 或 9**（含 CRC 时是 9） | 排除写死 7：CRC 流的 payload 会多带 2 字节 → 播放端爆音（用例 `ffmpeg_aac_adts_crc_header_is_nine_bytes` 锁住） |
+| 帧长/多块 | `frame_length` 必须落在一个完整帧内；`number_of_raw_data_blocks != 0` → 失败 | 排除"静默丢半帧"与"假装转过一帧多块" |
+| 采样率交叉校验 | ADTS 头算出的采样率与 `Demuxer` 报的**必须一致**，否则失败；声道数只 Warn（7.1 的 `channel_configuration=7` 对应 8 声道，属正常差异） | 两套独立路径互相印证（与 M4-b 的 SPS 交叉校验同一思路） |
+
+观测：`adtsAudio()`（是否发生过这种转换）、`adtsPackets()`（剥过多少包）。
+
 ### 3.7 应用入口 `src/main.cpp`（M6-c）
 
 app 只做**接线**，不做媒体逻辑。三件事：

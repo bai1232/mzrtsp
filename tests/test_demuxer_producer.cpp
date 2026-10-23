@@ -24,6 +24,7 @@
 #include "test_main.h"
 
 #include "core/util.h"
+#include "ffmpeg/aac_util.h"
 #include "ffmpeg/demuxer.h"
 #include "ffmpeg/h264_util.h"
 #include "media/demuxer_producer.h"
@@ -470,4 +471,126 @@ MZ_TEST(producer_bitrate_and_uptime_are_measured) {
                 static_cast<unsigned long long>(bps2),
                 static_cast<unsigned long long>(producer.totalBytes()),
                 static_cast<unsigned long long>(getCurrentMillisecond() - producer.openedAtMs()));
+}
+
+
+// ---------------------------------------------------------------------------
+// M8 / FR-2.2：MPEG-TS 的 AAC 是 ADTS —— 必须**当场造出 ASC**并逐包剥头
+// ---------------------------------------------------------------------------
+
+MZ_TEST(producer_ts_aac_gets_asc_and_strips_adts) {
+    // 能证明什么（三件事，缺一不可）：
+    //   ① `open()` 之内就把 ASC 造好了（连接拿快照裸指针写 AAC sequence header，等不到首包）；
+    //   ② ASC 的字节对得上真实码流（AAC-LC / 44100 / mono → 12 08）；
+    //   ③ 每个音频包都被**逐字节**剥掉了 ADTS 头（用裸 Demuxer 的原始包长做对照）。
+    // 什么情况会红：
+    //   · 只造 ASC 不剥头 → ③ 的 size 比对差 7/9 字节（播放端会听到噪声）；
+    //   · 只剥头不造 ASC → ② 为空 / `FlvMuxer::prepare()` 返回 MissingExtradata；
+    //   · 把 7 字节写死 → CRC 流（9 字节头）会多带 2 字节；
+    //   · 采样率/声道位域解错 → ASC 不等于 12 08。
+    const std::string path = samplePath("sample.ts");
+    MZ_ASSERT_FALSE(path.empty());
+    if (path.empty()) {
+        return;
+    }
+
+    // ---- ① 对照组：用裸 Demuxer 取"首个音频包的原始大小 + ADTS 头长"
+    size_t raw_size = 0;
+    uint8_t header_bytes = 0;
+    uint16_t frame_length = 0;
+    {
+        Demuxer raw;
+        MZ_ASSERT_TRUE(raw.open(path));
+        const StreamInfo *raw_audio = raw.firstAudio();
+        MZ_ASSERT_NOT_NULL(raw_audio);
+        if (raw_audio == nullptr) {
+            return;
+        }
+        for (int i = 0; i < 512; ++i) {
+            const Demuxer::ReadResult r = raw.readPacket();
+            if (r != Demuxer::ReadResult::Packet) {
+                break;
+            }
+            if (raw.packetStreamIndex() != raw_audio->index) {
+                continue;
+            }
+            const AVPacket *pkt = raw.packet();
+            AdtsHeader h;
+            MZ_ASSERT_TRUE(parseAdtsHeader(pkt->data, static_cast<size_t>(pkt->size), &h));
+            raw_size = static_cast<size_t>(pkt->size);
+            header_bytes = h.header_bytes;
+            frame_length = h.frame_length;
+            break;
+        }
+    }
+    MZ_ASSERT_GT(raw_size, 0u);
+    MZ_ASSERT_TRUE(header_bytes == 7 || header_bytes == 9);
+
+    // ---- ② ASC 必须已经在快照里
+    DemuxerProducer producer;
+    MZ_ASSERT_TRUE(producer.open(path));
+    MZ_ASSERT_TRUE(producer.adtsAudio());
+    const StreamInfo *audio = producer.muxerAudio();
+    MZ_ASSERT_NOT_NULL(audio);
+    if (audio == nullptr) {
+        return;
+    }
+    MZ_ASSERT_TRUE(audio->extradata != nullptr);
+    if (audio->extradata == nullptr) {
+        return;
+    }
+    MZ_ASSERT_EQ(audio->extradata->size(), 2u);
+    MZ_ASSERT_EQ((*audio->extradata)[0], 0x12u);   // AAC-LC / 44100
+    MZ_ASSERT_EQ((*audio->extradata)[1], 0x08u);   // mono
+    // 下游必须接受（M6-a 时代这里会因为缺 ASC 返回 MissingExtradata）
+    FlvMuxer muxer(FlvMuxer::Streams{producer.muxerVideo(), producer.muxerAudio()});
+    MZ_ASSERT_EQ(muxer.prepare(), FlvMuxer::Result::Ok);
+    // 视频侧同时也是 Annex-B → avcC（TS 的视频是 Annex-B）
+    MZ_ASSERT_TRUE(producer.annexBVideo());
+
+    // ---- ③ 首个音频包必须**已经被剥掉 ADTS 头**
+    MediaPacket::Ptr audio_packet;
+    for (int i = 0; i < 512; ++i) {
+        MediaPacket::Ptr packet;
+        std::string error;
+        const SourcePump::ReadResult result = producer.read(&packet, &error);
+        MZ_ASSERT_TRUE(result == SourcePump::ReadResult::Packet);
+        if (result != SourcePump::ReadResult::Packet || !packet) {
+            return;
+        }
+        if (packet->kind() == MediaKind::Audio) {
+            audio_packet = packet;
+            break;
+        }
+    }
+    MZ_ASSERT_TRUE(audio_packet != nullptr);
+    if (audio_packet == nullptr) {
+        return;
+    }
+    if (raw_size == frame_length) {
+        // 一包一帧（本项目样本就是）：可以**逐字节**对账
+        MZ_ASSERT_EQ(audio_packet->size(), raw_size - header_bytes);
+    } else {
+        // 一包多帧：只要求"变小了且还非空"（多帧的精确对账由 aac_util 的单测覆盖）
+        MZ_ASSERT_LT(audio_packet->size(), raw_size);
+        MZ_ASSERT_GT(audio_packet->size(), 0u);
+    }
+    MZ_ASSERT_EQ(producer.adtsPackets(), 1u);   // 只剥过这一个音频包
+}
+
+MZ_TEST(producer_ts_video_only_still_has_no_audio) {
+    // 能证明什么：没有音频轨的 TS **不能**因为"造不出 ASC"而失败（FR-3.3：纯视频也要能出 FLV）。
+    // 什么情况会红：把"没有音频"当成"ADTS 探测失败"（那会把纯视频 TS 也拒掉）。
+    const std::string path = samplePath("vonly.ts");
+    MZ_ASSERT_FALSE(path.empty());
+    if (path.empty()) {
+        return;
+    }
+    DemuxerProducer producer;
+    MZ_ASSERT_TRUE(producer.open(path));
+    MZ_ASSERT_FALSE(producer.adtsAudio());
+    MZ_ASSERT_NULL(producer.muxerAudio());
+    MZ_ASSERT_NOT_NULL(producer.muxerVideo());
+    FlvMuxer muxer(FlvMuxer::Streams{producer.muxerVideo(), producer.muxerAudio()});
+    MZ_ASSERT_EQ(muxer.prepare(), FlvMuxer::Result::Ok);
 }
