@@ -81,3 +81,6 @@
 // M6 输出层（已接入）
 #include "output/flv_muxer.h"
 #include "output/flv_sender.h"
+
+// M9 输出层（HLS 切片的地基）
+#include "output/mpegts_muxer.h"

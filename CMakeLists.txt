@@ -122,6 +122,8 @@ set(MZMEDIA_SOURCES
         src/output/flv_muxer.cpp
         # M6-b 每连接的 FLV 发送器
         src/output/flv_sender.cpp
+        # M9：MPEG-TS 封装（HLS 切片的地基）
+        src/output/mpegts_muxer.cpp
         )
 
 # 骨架阶段（第 1 批）没有任何源文件，此时不能创建 STATIC 库目标

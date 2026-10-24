@@ -839,3 +839,111 @@ MZ_TEST(ffmpeg_aac_adts_matches_real_ts_sample) {
     }
     MZ_ASSERT_TRUE(found);
 }
+
+
+// ---------------------------------------------------------------------------
+// M9：TS/HLS 需要的**反向**转换（AVCC→Annex-B、avcC→SPS/PPS、raw AAC→ADTS）
+// ---------------------------------------------------------------------------
+
+MZ_TEST(ffmpeg_h264_avcc_to_annexb_roundtrip) {
+    // 能证明什么：AVCC ↔ Annex-B 互逆；length_size 用 avcC 里的值（本项目是 4）。
+    // 什么情况会红：把"长度前缀"当数据、长度字段位宽写错、0 长度 NAL 被静默跳过。
+    const std::vector<uint8_t> nal_a = {0x65, 0x11, 0x22, 0x33};      // IDR 片段
+    const std::vector<uint8_t> nal_b = {0x41, 0x44, 0x55};            // 非 IDR 片段
+    std::vector<uint8_t> avcc;
+    for (const auto *nal : {&nal_a, &nal_b}) {
+        avcc.push_back(static_cast<uint8_t>((nal->size() >> 24) & 0xFF));
+        avcc.push_back(static_cast<uint8_t>((nal->size() >> 16) & 0xFF));
+        avcc.push_back(static_cast<uint8_t>((nal->size() >> 8) & 0xFF));
+        avcc.push_back(static_cast<uint8_t>(nal->size() & 0xFF));
+        avcc.insert(avcc.end(), nal->begin(), nal->end());
+    }
+    std::vector<uint8_t> annexb;
+    MZ_ASSERT_TRUE(avccToAnnexB(avcc.data(), avcc.size(), 4, &annexb));
+    // 期望：00 00 01 + nal_a + 00 00 01 + nal_b
+    MZ_ASSERT_EQ(annexb.size(), 3 + nal_a.size() + 3 + nal_b.size());
+    MZ_ASSERT_EQ(annexb[0], 0x00u);
+    MZ_ASSERT_EQ(annexb[1], 0x00u);
+    MZ_ASSERT_EQ(annexb[2], 0x01u);
+    MZ_ASSERT_EQ(annexb[3], 0x65u);
+    MZ_ASSERT_EQ(annexb[3 + nal_a.size()], 0x00u);
+    MZ_ASSERT_EQ(annexb[3 + nal_a.size() + 3], 0x41u);
+
+    // 再转回去必须与原始 AVCC **逐字节相同**（互逆性）
+    std::vector<uint8_t> back;
+    MZ_ASSERT_TRUE(annexBToAvcc(annexb.data(), annexb.size(), &back));
+    MZ_ASSERT_EQ(back.size(), avcc.size());
+    bool same = (back.size() == avcc.size());
+    for (size_t i = 0; same && i < avcc.size(); ++i) {
+        same = (back[i] == avcc[i]);
+    }
+    MZ_ASSERT_TRUE(same);
+
+    // 畸形：0 长度 NAL / 声明越界 / 长度前缀字节数非法 → 一律失败
+    const std::vector<uint8_t> zero = {0x00, 0x00, 0x00, 0x00};
+    MZ_ASSERT_FALSE(avccToAnnexB(zero.data(), zero.size(), 4, &back));
+    const std::vector<uint8_t> too_long = {0x00, 0x00, 0x00, 0x09, 0x65, 0x00};
+    MZ_ASSERT_FALSE(avccToAnnexB(too_long.data(), too_long.size(), 4, &back));
+    MZ_ASSERT_FALSE(avccToAnnexB(avcc.data(), avcc.size(), 3, &back));
+}
+
+MZ_TEST(ffmpeg_h264_parse_avcc_extracts_sps_pps) {
+    // 能证明什么：能从 avcC 里把 SPS/PPS 原样取出来（HLS 每个切片的关键帧要补它们）。
+    // 什么情况会红：偏移算错（多/少 1 字节）、没做 NAL 类型自检。
+    const std::vector<uint8_t> sps = {0x67, 0x42, 0xC0, 0x0D, 0xDA, 0x05};
+    const std::vector<uint8_t> pps = {0x68, 0xCE, 0x0F, 0xC8};
+    std::vector<uint8_t> avcc;
+    MZ_ASSERT_TRUE(buildAvcC(sps.data(), sps.size(), pps.data(), pps.size(), &avcc));
+
+    std::vector<uint8_t> out_sps;
+    std::vector<uint8_t> out_pps;
+    MZ_ASSERT_TRUE(parseAvcC(avcc.data(), avcc.size(), &out_sps, &out_pps));
+    MZ_ASSERT_EQ(out_sps.size(), sps.size());
+    MZ_ASSERT_EQ(out_pps.size(), pps.size());
+    bool sps_same = (out_sps.size() == sps.size());
+    for (size_t i = 0; sps_same && i < sps.size(); ++i) {
+        sps_same = (out_sps[i] == sps[i]);
+    }
+    MZ_ASSERT_TRUE(sps_same);
+    MZ_ASSERT_EQ(out_pps[0], 0x68u);
+
+    // 畸形：版本不是 1 / 截断
+    std::vector<uint8_t> bad = avcc;
+    bad[0] = 2;
+    MZ_ASSERT_FALSE(parseAvcC(bad.data(), bad.size(), &out_sps, &out_pps));
+    MZ_ASSERT_FALSE(parseAvcC(avcc.data(), 8, &out_sps, &out_pps));
+}
+
+MZ_TEST(ffmpeg_aac_raw_to_adts_roundtrip) {
+    // 能证明什么：raw AAC + ASC → ADTS 帧，再解析回来字段一致（TS/HLS 靠它把 raw 变 ADTS）。
+    // 什么情况会红：头字段错、帧长少算 7 字节、AOT 映射错（profile = AOT - 1）。
+    const uint8_t asc[2] = {0x12, 0x08};   // AAC-LC / 44100 / mono
+    std::vector<uint8_t> raw(120, 0x5A);
+    std::vector<uint8_t> frame;
+    MZ_ASSERT_TRUE(rawAacToAdts(asc, 2, raw.data(), raw.size(), &frame));
+    MZ_ASSERT_EQ(frame.size(), 7 + raw.size());
+
+    AdtsHeader header;
+    MZ_ASSERT_TRUE(parseAdtsHeader(frame.data(), frame.size(), &header));
+    MZ_ASSERT_EQ(header.profile, 1u);                                    // AOT 2 - 1
+    MZ_ASSERT_EQ(header.sampling_frequency_index, 4u);
+    MZ_ASSERT_EQ(header.channel_configuration, 1u);
+    MZ_ASSERT_EQ(header.frame_length, static_cast<uint16_t>(frame.size()));
+    MZ_ASSERT_EQ(frame[7], 0x5A);                                        // payload 从第 7 字节起
+
+    // 剥回去必须与原始 raw 一致
+    std::vector<uint8_t> back;
+    MZ_ASSERT_TRUE(adtsToRawAac(frame.data(), frame.size(), &back));
+    MZ_ASSERT_EQ(back.size(), raw.size());
+
+    // 拒绝：AOT=5（HE-AAC 不能用 ADTS 的 2 bit profile 表示）/ ASC 太短 / 帧长超过 13 bit
+    const uint8_t he_asc[2] = {0x2B, 0x92};   // AOT=5
+    MZ_ASSERT_FALSE(rawAacToAdts(he_asc, 2, raw.data(), raw.size(), &frame));
+    MZ_ASSERT_FALSE(rawAacToAdts(asc, 1, raw.data(), raw.size(), &frame));
+    std::vector<uint8_t> huge(8191, 0x11);
+    MZ_ASSERT_FALSE(rawAacToAdts(asc, 2, huge.data(), huge.size(), &frame));
+
+    uint8_t header7[7] = {0};
+    MZ_ASSERT_FALSE(buildAdtsHeader(1, 13, 1, 10, header7));   // 表外采样率索引
+    MZ_ASSERT_FALSE(buildAdtsHeader(1, 4, 0, 10, header7));    // channel_configuration = 0（PCE）
+}

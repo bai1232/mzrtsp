@@ -125,4 +125,58 @@ bool adtsToRawAac(const uint8_t *data, size_t size, std::vector<uint8_t> *out) {
     return true;
 }
 
+bool buildAdtsHeader(uint8_t profile, uint8_t sampling_frequency_index, uint8_t channel_configuration,
+                     size_t payload_size, uint8_t out[7]) {
+    if (out == nullptr) {
+        return false;
+    }
+    if (aacSampleRateFromIndex(sampling_frequency_index) == 0) {
+        return false;   // 表外采样率索引：不猜
+    }
+    if (channel_configuration == 0 || channel_configuration > 7) {
+        return false;   // 0 = PCE（流内定义），本实现不支持
+    }
+    if (payload_size == 0 || payload_size > 8191u - 7u) {
+        return false;   // frame_length 只有 13 bit
+    }
+    const size_t frame_length = payload_size + 7u;
+    out[0] = 0xFF;
+    out[1] = 0xF1;   // syncword 低 4 位=1111 | ID=0(MPEG-4) | layer=00 | protection_absent=1
+    out[2] = static_cast<uint8_t>((profile << 6) | ((sampling_frequency_index & 0x0F) << 2) |
+                                  ((channel_configuration >> 2) & 0x01));
+    out[3] = static_cast<uint8_t>(((channel_configuration & 0x03) << 6) |
+                                  ((frame_length >> 11) & 0x03));
+    out[4] = static_cast<uint8_t>((frame_length >> 3) & 0xFF);
+    out[5] = static_cast<uint8_t>(((frame_length & 0x07) << 5) | 0x1F);
+    out[6] = 0xFC;   // buffer_fullness 低 6 位全 1（合法）| number_of_raw_data_blocks=0
+    return true;
+}
+
+bool rawAacToAdts(const uint8_t *asc, size_t asc_size, const uint8_t *raw, size_t raw_size,
+                  std::vector<uint8_t> *out) {
+    // asc_size 允许 > 2：MP4 的 ASC 常见是 5 字节（核心 2 字节 + SBR/PS 扩展）。
+    // ADTS 只能表达核心字段，扩展位被忽略 —— 调用方（MpegTsMuxer）会把这件事实 Warn 出来。
+    if (asc == nullptr || raw == nullptr || out == nullptr || asc_size < 2 || raw_size == 0) {
+        return false;
+    }
+    // ASC = AOT(5) | samplingFrequencyIndex(4) | channelConfiguration(4)
+    const uint32_t aot = (static_cast<uint32_t>(asc[0]) >> 3) & 0x1F;
+    const uint8_t sfi = static_cast<uint8_t>(((asc[0] & 0x07) << 1) | ((asc[1] >> 7) & 0x01));
+    const uint8_t cc = static_cast<uint8_t>((asc[1] >> 3) & 0x0F);
+    // ADTS 的 profile 只有 2 bit，只能表示 AOT 1..4（AAC Main/LC/SSR/LTP）；
+    // HE-AAC（AOT=5）等**明确拒绝**，不硬塞成 LC（那会变成"能播但音调不对"）
+    if (aot < 1 || aot > 4) {
+        return false;
+    }
+    uint8_t header[7] = {0};
+    if (!buildAdtsHeader(static_cast<uint8_t>(aot - 1), sfi, cc, raw_size, header)) {
+        return false;
+    }
+    out->clear();
+    out->reserve(7 + raw_size);
+    out->insert(out->end(), header, header + 7);
+    out->insert(out->end(), raw, raw + raw_size);
+    return true;
+}
+
 } // namespace mzmedia

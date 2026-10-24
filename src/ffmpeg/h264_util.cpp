@@ -370,6 +370,82 @@ bool annexBToAvcc(const uint8_t *data, size_t size, std::vector<uint8_t> *out) {
     return !out->empty();
 }
 
+bool avccToAnnexB(const uint8_t *data, size_t size, size_t length_size, std::vector<uint8_t> *out) {
+    if (data == nullptr || out == nullptr || size == 0) {
+        return false;
+    }
+    if (length_size != 1 && length_size != 2 && length_size != 4) {
+        return false;
+    }
+    std::vector<uint8_t> result;
+    result.reserve(size + 16);   // 每个 NAL 多 3 字节起始码
+    size_t pos = 0;
+    size_t nals = 0;
+    while (pos < size) {
+        if (pos + length_size > size) {
+            return false;   // 尾部有半个长度前缀
+        }
+        size_t nal_len = 0;
+        for (size_t i = 0; i < length_size; ++i) {
+            nal_len = (nal_len << 8) | data[pos + i];
+        }
+        pos += length_size;
+        if (nal_len == 0 || pos + nal_len > size) {
+            return false;   // 0 长度 NAL / 声明长度越界：不静默跳过
+        }
+        result.push_back(0x00);
+        result.push_back(0x00);
+        result.push_back(0x01);
+        result.insert(result.end(), data + pos, data + pos + nal_len);
+        pos += nal_len;
+        ++nals;
+    }
+    if (nals == 0) {
+        return false;
+    }
+    *out = std::move(result);
+    return true;
+}
+
+bool parseAvcC(const uint8_t *data, size_t size, std::vector<uint8_t> *sps, std::vector<uint8_t> *pps) {
+    if (data == nullptr || sps == nullptr || pps == nullptr) {
+        return false;
+    }
+    // 布局：version(1) profile(1) compat(1) level(1) lengthSize(1) numSPS(1) ...
+    if (size < 7 || data[0] != 1) {
+        return false;
+    }
+    if ((data[5] & 0x1Fu) == 0) {
+        return false;   // 没有 SPS
+    }
+    size_t pos = 6;
+    const size_t sps_len = static_cast<size_t>((data[pos] << 8) | data[pos + 1]);
+    pos += 2;
+    if (sps_len == 0 || pos + sps_len >= size) {   // 后面至少还要有 numPPS + pps_len（3 字节）
+        return false;
+    }
+    std::vector<uint8_t> sps_out(data + pos, data + pos + sps_len);
+    pos += sps_len;
+    const uint8_t num_pps = data[pos];
+    ++pos;
+    if (num_pps == 0 || pos + 2 > size) {
+        return false;
+    }
+    const size_t pps_len = static_cast<size_t>((data[pos] << 8) | data[pos + 1]);
+    pos += 2;
+    if (pps_len == 0 || pos + pps_len > size) {
+        return false;
+    }
+    std::vector<uint8_t> pps_out(data + pos, data + pos + pps_len);
+    // 语法自检：取出来的必须真的是 SPS(7) / PPS(8)，否则说明 avcC 本身坏了
+    if ((sps_out[0] & 0x1Fu) != kNalSps || (pps_out[0] & 0x1Fu) != kNalPps) {
+        return false;
+    }
+    *sps = std::move(sps_out);
+    *pps = std::move(pps_out);
+    return true;
+}
+
 bool buildAvcC(const uint8_t *sps, size_t sps_size, const uint8_t *pps, size_t pps_size,
                std::vector<uint8_t> *out) {
     if (sps == nullptr || pps == nullptr || out == nullptr) {

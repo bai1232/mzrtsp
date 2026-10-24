@@ -7,6 +7,23 @@
 
 （下一版内容；v0.2.0 计划见 [docs/ROADMAP.md](docs/ROADMAP.md)）
 
+### Added（**M9-a：MPEG-TS 封装**，HLS 的地基）
+- `src/output/mpegts_muxer.{h,cpp}`：PAT/PMT（含 MPEG-2 CRC32）、PES、188 字节 TS 包、
+  adaptation field 填充、PCR、90kHz 时间戳（33 bit 回绕）、**关键帧前补 SPS/PPS**、**raw AAC → ADTS**。
+  与 `FlvMuxer` 同一个形状（给它包，它还你字节），不碰网络/线程/文件。
+- 反向转换（纯函数，独立可测）：`h264_util::avccToAnnexB()` / `parseAvcC()`；
+  `aac_util::buildAdtsHeader()` / `rawAacToAdts()`。
+- `examples/ts_mux_demo.cpp` + `scripts/ts_mux_test.sh`：产物交给 `ffprobe`/`ffmpeg` 独立判定。
+- 测试：新增 `mpegts` 分组 **5 例 / 78 断言**（PAT/PMT 布局与 CRC、Annex-B + SPS/PPS、ADTS 重封装、
+  拒绝路径、小帧 AF 填充的 188 边界）；`ffmpeg` 组 +3 例（反向转换互逆与拒绝）。
+
+> **实测**：`ts_mux_test.sh` **23/23** —— sample.mp4 / sample.ts / vonly.ts 三种输入各出一份 TS，
+> 均 188 对齐、逐包同步字正确、`ffprobe` 认 h264 320x240（+aac 44100）、视频 50 帧、
+> `ffmpeg -f null -` **零 error**、含 PAT(0x0000)+PMT(0x1000)。
+> **踩到并修掉的两个真 bug**：① 无 PCR 时 adaptation field 少算 flags 字节（每包多 1 字节 →
+> 138 包 × 1 字节错位 → 全流花屏）；② MP4 的 ASC 是 **5 字节**（`12 08 56 e5 00`，含扩展），
+> 原先只接受 2 字节 → 现在允许 ≥2 并 Warn（ADTS 表达不了扩展）。
+
 ### Added（**M8 / FR-2.2：MKV / MPEG-TS 输入**）
 - `src/ffmpeg/aac_util.{h,cpp}`：**ADTS 头解析 / `AudioSpecificConfig` 构造 / ADTS → raw AAC**
   —— 纯函数、不依赖 libav*，可手造字节单测（含 9 字节 CRC 头、表外采样率、一帧多块、半帧）。

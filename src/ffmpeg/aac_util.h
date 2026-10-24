@@ -81,4 +81,23 @@ bool buildAudioSpecificConfig(const AdtsHeader &header, uint8_t out[2]);
  */
 bool adtsToRawAac(const uint8_t *data, size_t size, std::vector<uint8_t> *out);
 
+/**
+ * 【M9】构造 7 字节 ADTS 头（`protection_absent = 1`，不带 CRC）
+ * @param payload_size ADTS 头**之后**的字节数（整帧长 = 7 + payload_size，13 bit 上限 8191）
+ * @return false = 采样率索引表外 / channel_configuration 不在 1..7 / 帧长超过 8191
+ */
+bool buildAdtsHeader(uint8_t profile, uint8_t sampling_frequency_index, uint8_t channel_configuration,
+                     size_t payload_size, uint8_t out[7]);
+
+/**
+ * 【M9】**raw AAC → ADTS 帧**（方向与 `adtsToRawAac` 相反）
+ * @param asc 2 字节 `AudioSpecificConfig`（来自 `StreamInfo::extradata`）
+ * @return false = ASC 长度不是 2 / AOT 无法用 ADTS 的 2 bit profile 表示（如 HE-AAC AOT=5）/
+ *         采样率索引表外 / 帧长超上限
+ * @note 为什么需要：`MediaPacket` 里的音频是 **raw AAC**（FLV 要），而 MPEG-TS/HLS 要 **ADTS**
+ *       （每帧自带头）。HLS 切片由输出层重新加头，输入层不用动。
+ */
+bool rawAacToAdts(const uint8_t *asc, size_t asc_size, const uint8_t *raw, size_t raw_size,
+                  std::vector<uint8_t> *out);
+
 } // namespace mzmedia

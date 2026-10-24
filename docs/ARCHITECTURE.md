@@ -52,7 +52,7 @@
 | Http | `HttpServer` `HttpParser` `HttpResponse` `HttpSession` | HTTP/1.1 解析与响应、路由、chunked（含异步流式）、CORS、Range、内置播放页 | 不碰 FFmpeg（`/live/` 由 app 注册 → 反向依赖被杜绝） |
 | FFmpeg 封装 | `AvPtr` `Demuxer` `CodecMatrix` `h264_util` `TimeBase`；⏳ `Remuxer`/`Transcoder`（v0.2） | 输入解封装、编码可行性判定、H264 语法工具（Annex-B/avcC/SPS）、时间基换算、FFmpeg 对象 RAII | 不做业务分发；**不解码**（v0.1） |
 | Media | `MediaPacket` `FrameQueue` `GopCache` `Subscriber` `MediaSource` `SourcePump` `DemuxerProducer` `SourceManager` `Throttle` | 一源多消费者分发、订阅者生命周期、GOP 缓存、按墙钟节流、懒启动/空闲释放、输入形状转换（Annex-B→AVCC）与循环重开 | 不关心输出是 FLV 还是 TS（v0.2 的 TS） |
-| Output | `FlvMuxer`（纯函数）、`FlvSender`（每连接）；⏳ `HlsWriter`（v0.2） | 具体输出格式的封装与发送 | 不管理源的生命周期、不依赖 `http/`（写出目标是 `Sink` 抽象） |
+| Output | `FlvMuxer`（纯函数）、`FlvSender`（每连接）、**`MpegTsMuxer`（纯函数，M9-a）**；⏳ `HlsWriter`（M9-b） | 具体输出格式的封装与发送 | 不管理源的生命周期、不依赖 `http/`（写出目标是 `Sink` 抽象） |
 | **App** | `src/main.cpp` → `build/bin/mzmedia` | 命令行、组装、路由接线（`/live/`、`/flv.min.js`）、优雅退出 | 媒体逻辑一律在库里：app 不认识 FLV 字节、也不碰 `Demuxer` |
 | Stats | ⏳ `StatsCenter`（**尚未抽**） | 现在由各模块 `dumpStats()`/`dumpStatsJson()` + `HttpServer::setExtraStatsProvider()` 拼成 `/api/stats` | 等**第二个 provider** 出现再抽（`AI_COLLAB §3.6`；见 `DESIGN_M5` §8 未决 12） |
 

@@ -69,6 +69,23 @@ bool looksLikeAnnexB(const uint8_t *data, size_t size);
 bool annexBToAvcc(const uint8_t *data, size_t size, std::vector<uint8_t> *out);
 
 /**
+ * 【M9】**AVCC → Annex-B**：每个 NAL 前加 `00 00 01`，去掉长度前缀
+ * @param length_size 长度前缀字节数（avcC 的 `lengthSizeMinusOne + 1`，本项目的 avcC 是 **4**）
+ * @return false = 前缀长度非法 / NAL 长度为 0 / 越界（**不静默跳过坏 NAL**）
+ * @note 方向与 `annexBToAvcc` 相反。为什么需要：`MediaPacket` 里统一是 AVCC（FLV 要），
+ *       而 MPEG-TS / HLS 要 Annex-B —— 转换放输出层（TS 封装器），输入层不用动
+ */
+bool avccToAnnexB(const uint8_t *data, size_t size, size_t length_size, std::vector<uint8_t> *out);
+
+/**
+ * 【M9】从 `AVCDecoderConfigurationRecord`（avcC）取出 SPS / PPS（**含** NAL header，不含长度前缀）
+ * @return false = 版本不是 1 / 越界 / SPS 或 PPS 数量为 0 / 取出来的不是 SPS(7)/PPS(8)
+ * @note 为什么需要：MP4/FLV 的 H264 把 SPS/PPS 放在 avcC 里，**码流包里没有**；
+ *       而 HLS 的每个切片都必须能独立解码 → 切片首帧要补 SPS/PPS（Annex-B 形式）
+ */
+bool parseAvcC(const uint8_t *data, size_t size, std::vector<uint8_t> *sps, std::vector<uint8_t> *pps);
+
+/**
  * 用 SPS/PPS 构造 `AVCDecoderConfigurationRecord`（= FLV 的 AVC sequence header 内容）
  * @param sps/pps 含各自 NAL header（0x67 / 0x68），**不含**起始码，长度 ≤ 65535
  * @return true = 构造成功；false = 参数非法（空 / 超长 / nal_unit_type 不是 7 / 8）

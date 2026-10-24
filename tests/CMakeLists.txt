@@ -47,6 +47,8 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_flv_sender.cpp
         # ---- M6-c 输入形状转换与循环重开（用例名 producer_*）----
         ${CMAKE_CURRENT_SOURCE_DIR}/test_demuxer_producer.cpp
+        # ---- M9 MPEG-TS 封装（用例名 mpegts_*）----
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_mpegts_muxer.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS
@@ -100,6 +102,9 @@ set(MZMEDIA_TEST_GROUPS
         # ---- M6-c 输入形状（Annex-B → AVCC）与循环重开 ----
         # 单线程、无等待（起线程/定时器的事在 srcmgr 组），只用真样本文件 → 严格组。
         producer
+        # ---- M9 MPEG-TS 封装（PAT/PMT/PES/PCR 字节布局）----
+        # 纯函数 + 手造包，无线程无等待 → 严格组。
+        mpegts
         )
 
 add_executable(mzmedia_unittest ${MZMEDIA_TEST_SOURCES})
