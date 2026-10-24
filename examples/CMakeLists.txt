@@ -29,6 +29,11 @@ target_link_libraries(flv_mux_demo PRIVATE mzmedia)
 add_executable(ts_mux_demo ts_mux_demo.cpp)
 target_link_libraries(ts_mux_demo PRIVATE mzmedia)
 
+# M9 起：一路直播流的完整生命周期演示（DemuxerProducer → MediaSource → FlvSender → FLV 落盘）
+# 只读现有 API、不改库代码；配置见 scripts/... 与文件头注释
+add_executable(live_demo live_demo.cpp)
+target_link_libraries(live_demo PRIVATE mzmedia)
+
 # M6-c：原 examples/flv_http_server.cpp 已**升级为应用**（src/main.cpp → build/bin/mzmedia）：
 # 它是 v0.1 的交付物（零参数启动 FR-7.2），放在 examples/ 里会让人以为它只是"示例"。
 # 验收脚本 scripts/flv_http_test.sh 已改指向 build/bin/mzmedia。

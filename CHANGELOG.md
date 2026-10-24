@@ -7,6 +7,17 @@
 
 （下一版内容；v0.2.0 计划见 [docs/ROADMAP.md](docs/ROADMAP.md)）
 
+### Added（**examples/live_demo**：一路直播流的完整生命周期）
+- `examples/live_demo.cpp`（约 420 行，**不改库代码**；只在 `examples/CMakeLists.txt` 追加一个目标）：
+  用真实链路 `Demuxer → DemuxerProducer → SourcePump → MediaSource → Subscriber/FrameQueue → FlvSender`，
+  把两个客户端（第二个**中途接入**）的 FLV 分别落盘，五阶段打日志：起源 / 订阅 / 分发 / 断开 / 结束。
+- 演示要点（每条都在注释里写了"字节层面发生了什么"）：时间戳从哪来（90kHz→ms + 单调钳制）、
+  push 时的 droppable 规则、唤醒合并、`FlvSender` drain 时 sequence header 与 GOP 缓存的时机、
+  以及**跨线程销毁必须投递回 poller**（`poller->sync([]{ sender.reset(); })`）。
+- 实测：`client1.flv` 134 帧 / `client2.flv` 84 帧（中途接入，首包来自 GOP 缓存、源 dts **2020 ms**、
+  关键帧），两条 FLV 的**首帧时间戳都≈0**（每客户端一份 `FlvMuxer` 基准）；`ffmpeg -f null -` 零 error；
+  **ASAN 运行 EXIT=0，无泄漏/无 UAF 报告**。
+
 ### Added（**M9-c：HLS 浏览器播放页**，闭环 M9）
 - `third_party/hls.js/`（**入库**，Apache-2.0）：`hls.min.js` **1.5.17**（413,952 字节，
   MD5 `b0e74c4afba433e2362a2e0931c58657`）+ `LICENSE` + `README.md`（来源/版本/散列/复核命令）。
