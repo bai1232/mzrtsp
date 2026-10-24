@@ -7,6 +7,35 @@
 
 （下一版内容；v0.2.0 计划见 [docs/ROADMAP.md](docs/ROADMAP.md)）
 
+### Added（**M10-a：转码组件 `Transcoder`**，v0.2.0 的第三块）
+- `src/ffmpeg/transcoder.{h,cpp}`：**解码（avcodec）→ `libswscale` 缩放/像素格式 → x264 编码**
+  （`preset=veryfast` + `tune=zerolatency` + `max_b_frames=0` + `AV_CODEC_FLAG_GLOBAL_HEADER`）。
+  进出都是 **AVCC 包 + 毫秒时间戳**，所以"转得对不对"可以交给 `ffprobe` 独立裁判；
+  **音频不转、由调用方原样透传**（SPEC §9）。`avcC` 由**编码器的 extradata 现场构造**
+  （分辨率变了，源 avcC 里的 SPS 宽高就是错的），每包走 `annexBToAvcc()`。
+- **自己生成输出时间轴**（这条是实测踩出来的，写进 `docs/DESIGN_M10.md` §3.3）：`Demuxer` 的单调守卫
+  会**连 pts 一起钳**，B 帧源的前几包 pts 实测是 `0,160,80,40,120 ms` → 被钳成 `0,160,160,160,160`；
+  拿它喂编码器会让输出的 dts 乱序（`ffmpeg` 报 `non monotonically increasing dts`）。
+  因此：喂解码器**只设 dts**（`pts=AV_NOPTS_VALUE`），输出时间轴 = `首个 dts + 帧序号 × 标称帧步长`，
+  锚点取源起点 ⇒ 与透传音频共用同一条时间轴。VFR 源会被按 CFR 规整 → **Warn 一次**（`vfrDetected()`），
+  不静默降级。
+- 有界与可观测：`Config{out_width/out_height/out_bitrate_kbps/gop_frames/max_out_packets}`（0 ≠ 无界，
+  非法配置直接拒）、`Result` 7 种失败原因（不返回"失败"了事）、
+  计数 `inputPackets/decodedFrames/scaledFrames/encodedPackets/keyPackets/outMediaMs/scaling/vfrDetected`。
+  `flush()` 负责冲编解码器残余 —— **漏了就是少最后几帧且不报错**。
+- `examples/transcode_demo.cpp`（demux → 转码 → `FlvMuxer` → `.flv`，机器可读输出 `OUT_W/OUT_H/SPEED/FPS/FRAMES`）
+  + `scripts/transcode_test.sh`（**12 项**）+ `tests/test_transcoder.cpp`（`transcode` 组 **3 例**；
+  拒绝路径、真样本全量转码、flush 幂等）+ `make_samples.sh` 增 `sample1080.mp4`（1920x1080@25，5s）。
+  CMake 用 `find_library(SWSCALE_LIB)`，**缺库直接 `FATAL_ERROR`**（不静默退化成"不缩放"）。
+- **实测**（4 核 VM）：1920x1080 → **1280x720**，**125 帧一帧不少**，`ffmpeg -f null -` **零 error**，
+  逐包 dts 严格单调；**NFR-5 speed = 2.61x / 2.89x**（74 帧/s）≥ 1.0x。
+  门禁：`ctest` **24/24**（272 用例）、单进程 **272/272 / 61,954 断言**、ASAN **24/24**、
+  TSAN **352 用例 | 真问题 0**、`flv_http_test.sh` **68/68**（回归）。
+- ⚠ **已知限制**：`Demuxer` 对 pts 的单调钳制**本身**仍会弄错 B 帧源的 CompositionTime
+  （v0.1 的 remux 路径对 B 帧源同样有这个问题）——本批只在转码器侧绕开，**修 `Demuxer` 需另立项 + 补
+  "B 帧源 FLV 的 composition time"用例**。另：本批是**组件级**验收，`/api/stats` 的 `speed`
+  与 `--transcode` 开关属 **M10-b**。
+
 ### Added（**examples/live_demo**：一路直播流的完整生命周期）
 - `examples/live_demo.cpp`（约 420 行，**不改库代码**；只在 `examples/CMakeLists.txt` 追加一个目标）：
   用真实链路 `Demuxer → DemuxerProducer → SourcePump → MediaSource → Subscriber/FrameQueue → FlvSender`，

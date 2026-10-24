@@ -40,6 +40,11 @@ ffmpeg -y -i "$OUT/sample.mp4" -c copy -f mpegts "$OUT/sample.ts" > /dev/null 2>
 # 纯视频 TS：验证"没有音频也不报错"（FR-3.3）
 ffmpeg -y -i "$OUT/sample.mp4" -an -c:v copy -f mpegts "$OUT/vonly.ts" > /dev/null 2>&1
 
+# M10（NFR-5）：1080p 样本 —— 转码验收口径是"1080p → 720p，x264 veryfast ≥ 1.0x 实时"。
+# 用 lavfi testsrc 现场造（不入库：5 秒 1080p 约几 MB）；GOP=50 ≈ 2s@25fps，便于切片/关键帧观察。
+ffmpeg -y -f lavfi -i "testsrc=size=1920x1080:rate=25" -t 5 -pix_fmt yuv420p \
+    -c:v libx264 -preset veryfast -g 50 "$OUT/sample1080.mp4" > /dev/null 2>&1
+
 head -c 65536 /dev/urandom > "$OUT/garbage.bin"
 
 ls -l "$OUT"

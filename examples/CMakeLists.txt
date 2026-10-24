@@ -34,6 +34,10 @@ target_link_libraries(ts_mux_demo PRIVATE mzmedia)
 add_executable(live_demo live_demo.cpp)
 target_link_libraries(live_demo PRIVATE mzmedia)
 
+# M10-a：转码示例（解封装 → 解码 → libswscale → x264 → FLV 落盘；NFR-5 的 speed 靠它量）
+add_executable(transcode_demo transcode_demo.cpp)
+target_link_libraries(transcode_demo PRIVATE mzmedia)
+
 # M6-c：原 examples/flv_http_server.cpp 已**升级为应用**（src/main.cpp → build/bin/mzmedia）：
 # 它是 v0.1 的交付物（零参数启动 FR-7.2），放在 examples/ 里会让人以为它只是"示例"。
 # 验收脚本 scripts/flv_http_test.sh 已改指向 build/bin/mzmedia。

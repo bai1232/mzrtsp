@@ -208,7 +208,7 @@ MZMEDIA_SERVER=./build-asan/bin/mzmedia ./scripts/concurrent_test.sh --quick   #
 | SC-4 1 小时稳定 | 第 5 节（`--duration 3600`，**M7 已实跑并写进 `ACCEPTANCE_v0.1.0.md` §3.3**） |
 | NFR-1 首帧 <1s | 浏览器 Performance 面板 / 日志打点（请求到首字节） |
 | NFR-4 remux CPU <5% | `top -H -p $(pgrep mzmedia)` 观察单路负载 |
-| NFR-5 转码 ≥1.0x（⏳ **v0.2**） | `/api/stats` 的 `speed` 字段：`speed = 已输出媒体时长 / 已耗墙钟`，判据 `speed ≥ 1.0`；口径 = **1080p→720p、x264 veryfast**、本机 4 核。**当前未实测**（等 M10）——不达标就如实写「未达成」，不放宽口径 |
+| NFR-5 转码 ≥1.0x（**M10-a ✅ 组件级已验**） | 口径 = **1080p→720p、x264 veryfast**、本机 **4 核**；`speed = 已输出媒体时长 / 已耗墙钟`。**实测 2.61x / 2.89x**（两次：`/usr/bin/time` 墙钟 1868 ms / 1688 ms 对媒体 4880 ms；74 帧/s），判据 ≥1.0 ✅。独立性：`ffprobe` 认 1280x720 / h264 / 25 fps，`ffmpeg -f null -` 零 error，125 帧一帧不少。**M10-b ⏳** 待做：把 `speed` 暴露到 `/api/stats` 并在服务进程内实测（现在是 `examples/transcode_demo` 的组件级实测）——服务端不达标就如实写「未达成」，不放宽口径 |
 | NFR-6 资源回收 | 断开前后对比 `/api/stats` 与 `/proc/<pid>/fd`；单测 `media`：订阅者 `shared_ptr` 释放后由 `weak_ptr` **自动注销**、其队列被回收 |
 | ROADMAP M2 验收：定时器精度 | 单测 `timer` 分组（`tests/test_network_timer.cpp`，用例清单见 `DESIGN_M2.md` §7.1）：**0 早触发** + 相对宿主裸 `nanosleep` 基线增量 ≤5ms。**绝对 ±10ms 在本宿主实测不可达**（裸 `nanosleep` 自身的超出量就有 0~14ms，且与延时长短无关），原始数据见 `DESIGN_M2.md` §7.1 / §8 R11 |
 | FR-5.1 每客户端队列上限（**只按字节**：码率上限 × 延迟额度） | 单测 `media` 分组（`tests/test_media.cpp`，清单见 `docs/DESIGN_M5.md` §5）：`setLimits(0)` / 超硬上限被拒；推导值 = `码率 × 时长 / 8000`（用例断言 8 Mbps × 2 s = 2,000,000）；上限不可绕过（`bytes() ≤ max_bytes`） |
@@ -236,6 +236,7 @@ MZMEDIA_SERVER=./build-asan/bin/mzmedia ./scripts/concurrent_test.sh --quick   #
 | **FR-4.1** `/hls/<name>.m3u8` 与 `/hls/<name>-<seq>.ts` 路由（**M9-b ✅**） | `scripts/hls_test.sh`：m3u8 = 200 + `application/vnd.apple.mpegurl`；切片 = 200 + `video/mp2t`；名字规则与 `/live/` 同一套（`mediaNameToPath` 白名单）；非法路径 404。原计划： 计划：新增 `scripts/hls_test.sh` —— m3u8 返回 200 + `Content-Type: application/vnd.apple.mpegurl`；切片 200 + `video/mp2t`；不存在 / 目录穿越 / 非法名 / 非白名单扩展名 → 404（与 `/live/` 同一套名字映射） |
 | **FR-4.2** Range（**HLS 切片**，**M9-b ✅**） | `scripts/hls_test.sh` 对切片发 `Range: bytes=0-187` → **206** + `Content-Range: bytes 0-187/<total>` + `Accept-Ranges: bytes` + 响应体 **188 字节**。实现复用 `HttpServer` 的 `serveMemoryAsStatic()`（与静态文件同一套 Range 语义）。原计划： 计划：对 `-<seq>.ts` 发 `Range: bytes=a-b` → 206 + `Content-Range`；越界 → 416；响应带 `Accept-Ranges: bytes`。现有 `http_test.sh` 已覆盖通用 Range，但**必须对切片再验一次**（切片来自内存/磁盘的实现不同） |
 | **FR-3.4** 时间戳基准（**TS → 90kHz**，⏳ **v0.2 计划**） | 计划：单测断言 `ms → 90kHz` 用整数有理换算（`time_base.h`）且丢帧 0；集成 `ffprobe -show_packets` 断言切片内 dts 单调、**跨切片接续**（不因切片边界回退） |
+| **FR-6.1** 实时倍数 / **NFR-5** 转码 ≥1.0x（**M10-a ✅ 组件级**） | 两层判定：①**组件自证**（`transcode` 组 3 例，`tests/test_transcoder.cpp`）——拒绝路径 5 类（非 H264 / 缺 avcC / 只给宽或高 / `max_out_packets=0` / `gop_frames=0`）、真样本 320x240→160x120 全量转码（输出是合法 AVCC、avcC 现场构造、**解码 25 帧 → 编码 25 包**、dts 严格单调、`scaling()` 懒创建、`flush()` 幂等、空包拒绝）；②**外部裁判**（`scripts/transcode_test.sh` **12 项**）——`ffprobe` 认 1280x720 / h264 / 25 fps / ≈5 s、`ffmpeg -f null -` 零 error、**逐包 dts 单调**、"不缩放"路径保持源分辨率、**NFR-5 speed ≥ 1.0x（实测 2.61x / 2.89x）**。⚠ 仍是**组件级**（`examples/transcode_demo`）：服务进程内的 `/api/stats` `speed` 与 `--transcode` 开关由 **M10-b ⏳** 补 |
 | **FR-1.3** lazy 启动 + 空闲释放（**HLS 已验 ✅** / 转码 ⏳） | HLS 的「客户端」是拉流请求，所以用**租约**：`scripts/hls_test.sh` 用 `--hls-lease-ms 2000` 起实例 → 拉一次 m3u8 后 `hls.streams=1`，超过租约再查 → **`streams=0` 且 `lease_expired≥1`**。转码源的 lazy/空闲释放仍待 M10： 计划：`srcmgr` 组扩展 —— 转码源在**首个订阅者接入时**才建解码/编码器上下文；订阅者清零后 60s 释放，并回收 sws / 编码器 / 线程；`/api/stats` 的 `sources` 与线程数回落；释放后 `releaseAll()` 可 join |
 | **FR-7.1** 命令行**转码开关**（⏳ **v0.2 计划**） | 计划：`--transcode`（默认**关**）；关闭时 HEVC→FLV 仍返回 **415**（不静默降级）；开启时走解码→编码路径；未提供时用默认值、未知参数仍报错退出 |
 | 各 codec 组合 | `CODEC_MATRIX.md` 每个组合一条 ffprobe 用例 |
@@ -349,6 +350,17 @@ cmake -B build-tsan -DMZMEDIA_ENABLE_TSAN=ON -DCMAKE_CXX_COMPILER=g++-12
 
 > 分组按**用例名子串**匹配，因此个别用例会同时属于两个组
 > （如 `logger_queue_overflow_drop` 同时属于 `logger` 与 `queue`）。上表为去重后的数字。
+
+**v0.2 当前基线（M10-a 完成时全门禁重跑，2026-10-24；以后每批交付都刷新这张表）**：
+
+| 门禁 | 实测 |
+|---|---|
+| 编译（`-Wall -Wextra`，无 `-Wno-`） | **0 warning / 0 error**（Debug、ASAN、TSAN 三个构建都是 0） |
+| 单元（串行 `ctest`，**不加 `-j`**） | **24/24 分组**（**272 用例**） |
+| 单元（单进程全量，诊断用） | **272/272 用例、61,954 条断言**（本轮 `timer_precision` 也没抖） |
+| ASAN | **24/24** |
+| TSAN | **352 用例 | 已知误报 0 | 真问题 0**（严格组 21 组 311 用例 + `qtimed`/`ptimed`/`ntimed`） |
+| 脚本 | `http` / `flv_mux` **8** / `ts_mux` **29** / `hls` **32** / `flv_http` **68** / **`transcode` 12** —— 全绿 |
 
 ### 8.7 已抓到的真实竞态（不是误报，要照规矩避开）
 

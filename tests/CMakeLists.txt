@@ -51,6 +51,8 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_mpegts_muxer.cpp
         # ---- M9-b HLS 切片器（用例名 hls_*）----
         ${CMAKE_CURRENT_SOURCE_DIR}/test_hls_writer.cpp
+        # ---- M10-a 转码（用例名 transcode_*）----
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_transcoder.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS
@@ -110,6 +112,9 @@ set(MZMEDIA_TEST_GROUPS
         # ---- M9-b HLS 切片器（切点/窗口/m3u8 文本）----
         # 同步喂包（不投递线程），无线程无等待 → 严格组。
         hls
+        # ---- M10-a 转码（解码→缩放→编码，同步调用）----
+        # 不用线程/等待；只读真样本 → 严格组。
+        transcode
         )
 
 add_executable(mzmedia_unittest ${MZMEDIA_TEST_SOURCES})

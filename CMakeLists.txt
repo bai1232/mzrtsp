@@ -106,6 +106,8 @@ set(MZMEDIA_SOURCES
         src/ffmpeg/h264_util.cpp
         # M8：TS 的 AAC 是 ADTS（无 extradata），要现场造 ASC + 逐帧剥头
         src/ffmpeg/aac_util.cpp
+        # M10：转码（解码 → libswscale → x264 编码）
+        src/ffmpeg/transcoder.cpp
         # M5-a 媒体分发（MediaPacket / FrameQueue / GopCache / MediaSource）
         src/media/media_packet.cpp
         src/media/frame_queue.cpp
@@ -137,10 +139,19 @@ find_path(AVFORMAT_INCLUDE_DIR libavformat/avformat.h)
 find_library(AVFORMAT_LIB avformat)
 find_library(AVCODEC_LIB avcodec)
 find_library(AVUTIL_LIB avutil)
+# M10：转码需要 libswscale（像素格式/分辨率转换）。缺了要明确报错，而不是链接期才炸
+find_path(SWSCALE_INCLUDE_DIR libswscale/swscale.h)
+find_library(SWSCALE_LIB swscale)
 if(NOT AVFORMAT_INCLUDE_DIR OR NOT AVFORMAT_LIB OR NOT AVCODEC_LIB OR NOT AVUTIL_LIB)
     message(FATAL_ERROR
             "M4 起需要 FFmpeg 开发库：libavformat / libavcodec / libavutil。\n"
             "Ubuntu: sudo apt install -y libavformat-dev libavcodec-dev libavutil-dev")
+endif()
+# M10 起还需要 libswscale（转码的缩放/像素格式转换）。**明确报错**，不静默降级成"没有转码能力"
+if(NOT SWSCALE_INCLUDE_DIR OR NOT SWSCALE_LIB)
+    message(FATAL_ERROR
+            "M10 起需要 libswscale（转码）：找不到 libswscale/swscale.h 或 libswscale。\n"
+            "Ubuntu: sudo apt install -y libswscale-dev")
 endif()
 
 if(MZMEDIA_SOURCES)
@@ -148,7 +159,8 @@ if(MZMEDIA_SOURCES)
     add_library(mzmedia::mzmedia ALIAS mzmedia)
     # FFmpeg 是**公开**依赖：使用方（examples/tests）会看到 libav* 的类型
     target_include_directories(mzmedia PUBLIC ${AVFORMAT_INCLUDE_DIR})
-    target_link_libraries(mzmedia PUBLIC ${AVFORMAT_LIB} ${AVCODEC_LIB} ${AVUTIL_LIB})
+    target_link_libraries(mzmedia PUBLIC ${AVFORMAT_LIB} ${AVCODEC_LIB} ${AVUTIL_LIB}
+                                   ${SWSCALE_LIB})
 
     target_include_directories(mzmedia
             PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
