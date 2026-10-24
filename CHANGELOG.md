@@ -7,6 +7,19 @@
 
 （下一版内容；v0.2.0 计划见 [docs/ROADMAP.md](docs/ROADMAP.md)）
 
+### Added（**M9-c：HLS 浏览器播放页**，闭环 M9）
+- `third_party/hls.js/`（**入库**，Apache-2.0）：`hls.min.js` **1.5.17**（413,952 字节，
+  MD5 `b0e74c4afba433e2362a2e0931c58657`）+ `LICENSE` + `README.md`（来源/版本/散列/复核命令）。
+- `GET /hls.min.js`：与 `flv.min.js` 同一套"从仓库目录找、找不到就 404 + 明确原因、不阻塞启动"。
+- 播放页升级：**「播放（FLV）」+「播放（HLS）」两个按钮**、状态栏显示 `flv.js 1.6.2 · hls.js 1.5.17`；
+  HLS 优先用 hls.js（MSE），Safari/iOS 走原生 `application/vnd.mpegurl`；
+  取不到库时**在页面上写明原因**（不是点了没反应）。
+- `scripts/hls_test.sh` 新增 **§1b**（9 项）：页面含 `hls.min.js`/`play-hls`/`Hls.isSupported`/`/hls/`、
+  `GET /hls.min.js` 与入库文件**逐字节一致**、页面内联 JS 过 **`node --check`**（脚本项数 23 → **32**）。
+
+> **为什么加 `node --check`**：播放页的 JS 是 C++ 原始字符串里的模板，改坏一个引号**不会**让任何
+> HTTP 断言变红 —— 浏览器只会白屏。这是"能编译、能起服务、页面却打不开"那类问题里最便宜的一道闸。
+
 ### Added（**M9-b：HLS 输出**，v0.2.0 的第二块）
 - `src/output/hls_writer.{h,cpp}`：一源一份的切片器 —— 目标 2s、窗口 6 片、`TARGETDURATION`
   取实测最大、`MEDIA-SEQUENCE` 前进、EOS 加 `#EXT-X-ENDLIST`；**只切视频关键帧**；单片/总量双上限

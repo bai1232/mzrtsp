@@ -23,7 +23,7 @@
 | 任务 | 说明 |
 |---|---|
 | **M8 ✅ MKV / TS 输入（FR-2.2）** | 复用 M4 的 `Demuxer`，`CodecMatrix` 增补组合。TS 的 AAC 是 ADTS（无 extradata）→ 新增 `aac_util`（ADTS 头解析 / ASC 构造 / 逐帧剥头）+ `DemuxerProducer` 的音频 REPACK（用一次性探针 Demuxer 取首帧 ADTS 头，**不改主读游标**）。**实测**：MKV / TS / 纯视频 TS 三条都能拉出合法 FLV；ASC=`12 08`；见 `CODEC_MATRIX.md` §6.1 |
-| **HLS 输出**（**FR-3.2** / **FR-4.1** / **FR-4.2** / **FR-3.4**） | **M9-a ✅** `MpegTsMuxer` + **M9-b ✅** `HlsWriter`/`HlsService`：2s 目标切片（只切视频关键帧）、窗口 6 片滚动、`.m3u8`（`TARGETDURATION`=实测最大 / `MEDIA-SEQUENCE` 前进 / EOS 加 `ENDLIST`）、`/hls/` 路由 + 切片 Range、租约 60s 空闲释放。验收 `ts_mux_test.sh` **29/29** + `hls_test.sh` **23/23**。设计见 `docs/DESIGN_M9.md` |
+| **HLS 输出**（**FR-3.2** / **FR-4.1** / **FR-4.2** / **FR-3.4**） | **M9-a ✅** `MpegTsMuxer` + **M9-b ✅** `HlsWriter`/`HlsService`：2s 目标切片（只切视频关键帧）、窗口 6 片滚动、`.m3u8`（`TARGETDURATION`=实测最大 / `MEDIA-SEQUENCE` 前进 / EOS 加 `ENDLIST`）、`/hls/` 路由 + 切片 Range、租约 60s 空闲释放。验收 `ts_mux_test.sh` **29/29** + `hls_test.sh` **32/32**（含播放页与 `hls.js` 入库的逐字节比对 + 内联 JS 的 `node --check`）。设计见 `docs/DESIGN_M9.md` |
 | **转码**（**NFR-5** / **FR-6.1**（实时倍数）/ **FR-7.1**（转码开关）） | `Transcoder`：解码 → 编码；`libswscale` 做像素格式/分辨率转换（**需先 `apt install libswscale-dev`**） |
 | 转码调度（**FR-1.3**） | 由 `ThreadPool` 承载；lazy 启动 + 空闲 60s 释放；实时倍数统计 |
 | 验收（**NFR-5** / **SC-2** 的第二次验证） | `hls.js` / 原生播放器能播；转码 ≥1.0x 实时（1080p→720p x264 veryfast）；新增输出/输入**不改 `media/`、`network/`** |

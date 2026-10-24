@@ -239,6 +239,21 @@ std::string findWebRoot(const std::string &explicit_root) {
     return explicit_root; // 没找到就如实返回（启动时会 Warn，页面上会显示原因）
 }
 
+/// 找 hls.min.js（M9-c）：搜索顺序与 flv.js 相同（当前目录 → 可执行文件旁边）
+std::string findHlsJsDir() {
+    const std::vector<std::string> candidates = {
+        "third_party/hls.js",                  // 在仓库根目录直接跑
+        exeDir() + "/../third_party/hls.js",   // build/bin/mzmedia
+        exeDir() + "/../../third_party/hls.js",
+    };
+    for (const auto &dir : candidates) {
+        if (fileExists(dir + "/hls.min.js")) {
+            return dir;
+        }
+    }
+    return {};
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -329,6 +344,11 @@ int main(int argc, char **argv) {
         WarnP("找不到 flv.min.js（--web-root %s）→ 网页会显示「flv.js 未加载」，"
               "但 /live/*.flv 拉流仍然可用",
               web_root.empty() ? "(未指定)" : web_root.c_str());
+    }
+    const std::string hls_js_dir = findHlsJsDir();
+    if (hls_js_dir.empty()) {
+        WarnP("找不到 hls.js（third_party/hls.js/hls.min.js）→ 播放页只能靠浏览器**原生** HLS"
+              "（Safari/iOS）；Chrome/Firefox 播不了。HLS 拉流本身（ffplay/ffmpeg/curl）不受影响");
     }
     if (!isDir(media_root)) {
         WarnP("媒体目录不存在：%s → /live/ 会回 404（先用 scripts/make_samples.sh 生成样本）",
@@ -516,6 +536,29 @@ int main(int argc, char **argv) {
             resp.setBody(body);
         })) {
         std::fprintf(stderr, "注册 /flv.min.js 路由失败\n");
+        return 1;
+    }
+
+    // M9-c：hls.js 同理由服务端提供（离线的播放页需要它）。没入库就 404 + 明确原因，
+    // 不阻塞启动 —— HLS 拉流本身不依赖它（ffplay/ffmpeg 直接吃 m3u8）。
+    if (!server->setRoute("/hls.min.js", [hls_js_dir](const HttpParser &, HttpResponse &resp) {
+            std::string error;
+            const std::string body =
+                hls_js_dir.empty() ? std::string() : loadFile(hls_js_dir + "/hls.min.js", &error);
+            if (body.empty()) {
+                resp.setStatus(404);
+                resp.setContentType("text/plain; charset=utf-8");
+                resp.setBody("404 Not Found：hls.js 未入库（third_party/hls.js/hls.min.js）"
+                             + (error.empty() ? std::string() : "（" + error + "）") +
+                             "\n→ 播放页将退回浏览器原生 HLS（Safari/iOS）；"
+                             "HLS 拉流本身不受影响\n");
+                return;
+            }
+            resp.setContentType("application/javascript; charset=utf-8");
+            resp.setHeader("Cache-Control", "public, max-age=600");
+            resp.setBody(body);
+        })) {
+        std::fprintf(stderr, "注册 /hls.min.js 路由失败\n");
         return 1;
     }
 

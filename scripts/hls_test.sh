@@ -66,6 +66,45 @@ ctype="$(curl -s -o /dev/null -D - --max-time 5 "$M3U8" | tr -d '\r' | awk 'tolo
 check "Content-Type" "$ctype" "application/vnd.apple.mpegurl"
 grep -q '^#EXTM3U' "$OUT/first.m3u8" && check_true "首行是 #EXTM3U" || check_false "首行是 #EXTM3U" "$(head -1 "$OUT/first.m3u8")"
 
+echo "== 1b) 播放页与 hls.js（M9-c：浏览器要的东西真的能取到）=="
+# 说明：这里只证明"页面/资源能取到、JS 语法没坏"，**不证明真实渲染**（那需要人看一眼）。
+# 但对播放页来说，这两件事恰好是最容易坏的：文件没入库、模板字符串被改坏。
+page_code="$(curl -s -o "$OUT/page.html" -w '%{http_code}' --max-time 5 "$BASE/")"
+check "GET / → 200" "$page_code" "200"
+for marker in 'hls.min.js' 'play-hls' 'Hls.isSupported' '/hls/' 'flv.min.js'; do
+    if grep -q -- "$marker" "$OUT/page.html"; then
+        check_true "页面含 $marker"
+    else
+        check_false "页面含 $marker" "缺"
+    fi
+done
+js_code="$(curl -s -o "$OUT/hls.min.js" -w '%{http_code}' --max-time 10 "$BASE/hls.min.js")"
+check "GET /hls.min.js → 200" "$js_code" "200"
+if cmp -s "$ROOT/third_party/hls.js/hls.min.js" "$OUT/hls.min.js"; then
+    check_true "hls.min.js 与入库文件**逐字节一致**（$(stat -c%s "$OUT/hls.min.js") 字节）"
+else
+    check_false "hls.min.js 与入库文件逐字节一致" "内容不同"
+fi
+# 内联 JS 的语法检查：页面坏了的话，浏览器只会白屏，任何 HTTP 断言都看不出来
+if command -v node > /dev/null 2>&1; then
+    python3 - "$OUT/page.html" > "$OUT/inline.js" << 'PY'
+import re, sys
+html = open(sys.argv[1], encoding="utf-8").read()
+# 取**最后一个**没有 src 的 <script>（页面里的内联脚本）
+blocks = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, re.S)
+if not blocks:
+    sys.exit("页面里没有内联 <script>")
+sys.stdout.write(blocks[-1])
+PY
+    if node --check "$OUT/inline.js" > "$OUT/node_check.txt" 2>&1; then
+        check_true "播放页内联 JS 语法正确（node --check）"
+    else
+        check_false "播放页内联 JS 语法正确" "$(head -2 "$OUT/node_check.txt")"
+    fi
+else
+    printf '  ⚠ %-44s 环境没有 node，**未检查**（不计入通过项）\n' "播放页内联 JS 语法"
+fi
+
 echo "== 2) 等 6 秒让切片出来（2 倍速 ≈ 12 秒媒体；窗口 6 片覆盖 6 秒墙钟）=="
 sleep 6
 curl -s --max-time 5 -o "$OUT/list.m3u8" "$M3U8"

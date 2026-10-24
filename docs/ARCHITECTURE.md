@@ -36,9 +36,10 @@
 层内代码不允许反向依赖，检查方式：
 `grep -rn "network/\|http/" src/output/`（应为空）、`grep -rn "#include \"mzmedia.h\"" src/`（应为空）。
 
-**`third_party/` 是分层之外的特例**：里面只有浏览器播放器 `flv.js`（Apache-2.0），
-不参与 C++ 构建（只是被 `src/main.cpp` 当静态文件服务出去）—— 所以"分层/零依赖"的约束对它不适用，
-但它必须带 `LICENSE` 与来源说明（见 `third_party/flv.js/README.md`）。
+**`third_party/` 是分层之外的特例**：里面只有两个浏览器播放器 —— `flv.js`（HTTP-FLV，Apache-2.0）
+与 `hls.js`（HLS，Apache-2.0，M9-c 入库）。它们**不参与 C++ 构建**（被 `src/main.cpp` 当静态文件
+服务出去：`/flv.min.js`、`/hls.min.js`）—— 所以"分层/零依赖"的约束对它们不适用，
+但每个都必须带 `LICENSE` 与来源说明（见各自目录的 `README.md`，含版本与散列，可复核）。
 
 ## 2. 模块职责
 
@@ -151,7 +152,8 @@ mzmedia/
 ├── tests/             # 单元测试（自研轻量断言宏）
 ├── examples/          # 最小示例（每个库组件一个可运行 demo）
 ├── third_party/
-│   └── flv.js/        # 浏览器播放器（唯一第三方文件，Apache-2.0，含 LICENSE 与来源说明）
+│   ├── flv.js/        # HTTP-FLV 播放器（Apache-2.0，含 LICENSE 与来源说明）
+│   └── hls.js/        # HLS 播放器（Apache-2.0，M9-c 入库，含 LICENSE 与来源说明）
 ├── scripts/           # make_samples / http_test / flv_mux_test / flv_http_test / tsan
 ├── samples/           # 测试素材（脚本现场生成，不入库）
 └── docs/

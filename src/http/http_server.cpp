@@ -59,12 +59,13 @@ const char *kTestPage = R"HTML(<!DOCTYPE html>
 </head>
 <body>
 <h1>mzmedia</h1>
-<p>HTTP-FLV 播放页。媒体文件放在服务端 <code>--media-root</code> 目录下：填 <code>sample</code>
-   就会去拉 <code>/live/sample.flv</code>（对应 <code>sample.mp4</code>；
-   填 <code>sample.h264</code> 就是 H264 裸流，服务端会现场构造 avcC 并转 AVCC）。</p>
+<p>播放页（HTTP-FLV + HLS）。媒体文件放在服务端 <code>--media-root</code> 目录下：填 <code>sample</code>
+   就会去拉 <code>/live/sample.flv</code>（对应 <code>sample.mp4</code>）；
+   填 <code>sample.h264</code> 就是 H264 裸流，服务端会现场构造 avcC 并转 AVCC。</p>
 <p>
   <label>媒体名：<input id="name" value="sample" size="20"></label>
-  <button id="play">播放</button>
+  <button id="play">播放（FLV）</button>
+  <button id="play-hls">播放（HLS）</button>
   <button id="stop">停止</button>
   <span id="state">未开始</span>
 </p>
@@ -72,66 +73,122 @@ const char *kTestPage = R"HTML(<!DOCTYPE html>
 <p id="err"></p>
 <details open><summary>/api/stats（每 2 秒刷新）</summary><pre id="stats">…</pre></details>
 <p>其它接口：<code>GET /api/stats</code>（运行统计）· <code>GET /stream</code>（chunked 演示）·
-   <code>GET /hls/N.m3u8</code>（HLS，v0.2 接入）。服务器加 <code>--loop</code> 启动则循环推流。</p>
+   <code>GET /hls/&lt;name&gt;.m3u8</code>（HLS 播放列表）· <code>GET /hls/&lt;name&gt;-&lt;seq&gt;.ts</code>（切片）。
+   服务器加 <code>--loop</code> 启动则循环推流。</p>
 <script src="/flv.min.js"></script>
+<script src="/hls.min.js"></script>
 <script>
 (function () {
   var stateEl = document.getElementById('state');
   var errEl = document.getElementById('err');
   var video = document.getElementById('v');
-  var player = null;
+  var flvPlayer = null;   // flv.js 实例（HTTP-FLV）
+  var hlsPlayer = null;   // hls.js 实例（HLS）
 
   function setState(s) { stateEl.textContent = s; }
   function setErr(s) { errEl.textContent = s || ''; }
 
-  if (!window.flvjs) {
-    setState('flv.js 未加载');
-    setErr('没有取到 /flv.min.js：浏览器播 FLV 依赖它。\n' +
-           '请用 bin/mzmedia 启动（它的 --web-root 默认指向 third_party/flv.js），' +
-           '或确认该文件存在且路径正确。');
-    return;
-  }
-  setState('flv.js ' + flvjs.version + ' 已就绪');
-
+  // 两个播放器不能同时活着：同一个 <video> 只能有一个 MSE 源
   function stop() {
-    if (player) {
-      try { player.unload(); player.detachMediaElement(); player.destroy(); } catch (e) { /* 已停 */ }
-      player = null;
+    if (flvPlayer) {
+      try { flvPlayer.unload(); flvPlayer.detachMediaElement(); flvPlayer.destroy(); } catch (e) { /* 已停 */ }
+      flvPlayer = null;
     }
+    if (hlsPlayer) {
+      try { hlsPlayer.destroy(); } catch (e) { /* 已停 */ }
+      hlsPlayer = null;
+    }
+    try { video.removeAttribute('src'); } catch (e) { /* 原生 HLS 也清掉 */ }
     setState('已停止');
   }
 
-  function play() {
+  // 启动时把"加载到了什么"直接写在页面上（取不到就说明原因，而不是点了没反应）
+  var ready = [];
+  if (window.flvjs) { ready.push('flv.js ' + flvjs.version); }
+  if (window.Hls) { ready.push('hls.js ' + Hls.version); }
+  if (ready.length) { setState(ready.join(' · ') + ' 已就绪'); }
+  if (!window.flvjs) {
+    setErr('没有取到 /flv.min.js：FLV 播放不可用（HLS 仍可试）。请用 bin/mzmedia 启动' +
+           '（--web-root 默认指向 third_party/flv.js），或确认该文件存在。');
+  }
+  if (!window.Hls) {
+    setErr((errEl.textContent ? errEl.textContent + '\n' : '') +
+           '没有取到 /hls.min.js：HLS 只能靠浏览器原生支持（Safari/iOS）。' +
+           'Chrome/Firefox 需要 hls.js，请确认 third_party/hls.js/hls.min.js 存在。');
+  }
+
+  function mediaName() {
+    var name = document.getElementById('name').value.trim();
+    if (!name) { setErr('请填媒体名'); return ''; }
+    return name;
+  }
+
+  // ---- HTTP-FLV（flv.js）----
+  function playFlv() {
     stop();
     setErr('');
-    var name = document.getElementById('name').value.trim();
-    if (!name) { setErr('请填媒体名'); return; }
+    var name = mediaName();
+    if (!name) { return; }
+    if (!window.flvjs) {
+      setErr('没有 flv.js，FLV 播不了（用「播放（HLS）」试试）。');
+      return;
+    }
     if (!flvjs.isSupported()) {
       setErr('这个浏览器不支持 MSE（flv.js 依赖它）。Chrome/Firefox/Edge 桌面版可以。');
       return;
     }
     var url = '/live/' + name + '.flv';
-    player = flvjs.createPlayer({ type: 'flv', isLive: false, url: url },
-                                { enableStashBuffer: false, stashInitialSize: 128 });
-    player.attachMediaElement(video);
-    player.on(flvjs.Events.ERROR, function (type, detail) {
+    flvPlayer = flvjs.createPlayer({ type: 'flv', isLive: false, url: url },
+                                   { enableStashBuffer: false, stashInitialSize: 128 });
+    flvPlayer.attachMediaElement(video);
+    flvPlayer.on(flvjs.Events.ERROR, function (type, detail) {
       setState('出错');
-      setErr('播放出错：' + type + ' / ' + detail +
+      setErr('FLV 播放出错：' + type + ' / ' + detail +
              '\n常见原因：文件名不对（应能在服务端 --media-root 下找到）、' +
              '不是 H264+AAC、或服务器没回 200。');
     });
-    player.load();
-    var p = player.play();
+    flvPlayer.load();
+    var p = flvPlayer.play();
     if (p && p.catch) {
       p.catch(function (e) { setErr('自动播放被浏览器策略拦住，请点视频上的播放键：' + e); });
     }
     setState('正在播放 ' + url);
   }
 
-  document.getElementById('play').onclick = play;
+  // ---- HLS（hls.js 优先，Safari 走原生）----
+  function playHls() {
+    stop();
+    setErr('');
+    var name = mediaName();
+    if (!name) { return; }
+    var url = '/hls/' + name + '.m3u8';
+    if (window.Hls && Hls.isSupported()) {
+      hlsPlayer = new Hls({ lowLatencyMode: false });
+      hlsPlayer.on(Hls.Events.ERROR, function (evt, data) {
+        setState('出错');
+        setErr('HLS 播放出错：' + (data && data.type) + ' / ' + (data && data.details) +
+               '\n常见原因：还没切出第一片（等 2~3 秒再试）、名字不对、' +
+               '或切片滑出窗口（老 m3u8）。');
+      });
+      hlsPlayer.loadSource(url);
+      hlsPlayer.attachMedia(video);
+      setState('正在播放 ' + url + '（hls.js ' + Hls.version + '）');
+      return;
+    }
+    if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = url;   // Safari / iOS 原生 HLS
+      setState('正在播放 ' + url + '（浏览器原生 HLS）');
+      return;
+    }
+    setErr('这个浏览器既没有 hls.js 也没有原生 HLS 支持，播不了 m3u8。' +
+           '请确认 third_party/hls.js/hls.min.js 存在并重启服务。');
+  }
+
+  document.getElementById('play').onclick = playFlv;
+  document.getElementById('play-hls').onclick = playHls;
   document.getElementById('stop').onclick = stop;
   document.getElementById('name').addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') { play(); }
+    if (e.key === 'Enter') { playFlv(); }
   });
 
   function refreshStats() {
