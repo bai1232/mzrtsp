@@ -226,6 +226,12 @@ int statusForParseError(HttpParser::Error err) {
 
 } // namespace
 
+bool serveMemoryAsStatic(const HttpParser &req, HttpResponse &resp, const std::string &body,
+                         const std::string &mime) {
+    // 直接复用本文件里的单区间 Range 实现（同一套语义，避免两份漂移）
+    return serveStaticWithRange(req, resp, body, mime);
+}
+
 // ---------------------------------------------------------------------------
 // HttpSession（只在 .cpp 里，M6 需要时再提升为公开类）
 // ---------------------------------------------------------------------------

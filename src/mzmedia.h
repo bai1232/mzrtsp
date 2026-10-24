@@ -84,3 +84,5 @@
 
 // M9 输出层（HLS 切片的地基）
 #include "output/mpegts_muxer.h"
+#include "output/hls_writer.h"
+#include "output/hls_service.h"

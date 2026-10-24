@@ -35,7 +35,11 @@ constexpr uint64_t kTimestampMask = (1ull << 33) - 1;   // PTS/DTS/PCR_base 都�
  */
 void appendTimestamp(std::vector<uint8_t> *out, uint64_t ts, uint8_t prefix) {
     ts &= kTimestampMask;
-    out->push_back(static_cast<uint8_t>((prefix << 4) | ((ts >> 30) & 0x07)));
+    // ★ 第 1 字节 = 'prefix(4 bit)' | ts[32:30] | **marker(1)**。
+    //   少写 marker 位时，ffmpeg 的 mpegts demuxer 会**直接丢弃**这个 PES 的时间戳
+    //   （现象：`ffprobe -show_entries packet=dts_time` 全是 N/A，而解码看起来"正常"，
+    //   直到把流重新封一道才报 `non monotonically increasing dts`）—— 真踩过。
+    out->push_back(static_cast<uint8_t>((prefix << 4) | ((ts >> 30) & 0x07) | 0x01));
     out->push_back(static_cast<uint8_t>((ts >> 22) & 0xFF));
     out->push_back(static_cast<uint8_t>((((ts >> 15) & 0x7F) << 1) | 0x01));
     out->push_back(static_cast<uint8_t>((ts >> 7) & 0xFF));
@@ -309,8 +313,18 @@ MpegTsMuxer::Result MpegTsMuxer::writePacket(const MediaPacket &packet, std::str
         return fail(Result::InvalidPacket, "包不属于这两路流（streamIndex 对不上）");
     }
 
-    const uint64_t pts90k = static_cast<uint64_t>(packet.ptsMs()) * kTsClockHz / 1000;
-    const uint64_t dts90k = static_cast<uint64_t>(packet.dtsMs()) * kTsClockHz / 1000;
+    // 负时间戳（MP4 编辑列表可能出现）直接钳到 0 并计数：把负值强转成 uint64 会得到天文数字，
+    // 那是"能播但时间轴全乱"的经典成因（实测：首包 PTS=0 时 ffmpeg 的 TS demuxer 还会
+    // 把它当回绕吐成 2^33，所以下面还要再加一个起点偏移）。
+    const int64_t pts_ms_raw = packet.ptsMs();
+    const int64_t dts_ms_raw = packet.dtsMs();
+    if (pts_ms_raw < 0 || dts_ms_raw < 0) {
+        ++_negative_ts_clamped;
+    }
+    const int64_t pts_ms = (pts_ms_raw > 0) ? pts_ms_raw : 0;
+    const int64_t dts_ms = (dts_ms_raw > 0) ? dts_ms_raw : 0;
+    const uint64_t pts90k = kStartOffset90k + static_cast<uint64_t>(pts_ms) * kTsClockHz / 1000;
+    const uint64_t dts90k = kStartOffset90k + static_cast<uint64_t>(dts_ms) * kTsClockHz / 1000;
     _last_dts90k = dts90k & kTimestampMask;
     ++_pes_packets;
 
@@ -348,8 +362,14 @@ MpegTsMuxer::Result MpegTsMuxer::writePacket(const MediaPacket &packet, std::str
         pes.push_back(kStreamIdVideo);
         pes.push_back(0x00);
         pes.push_back(0x00);
+        // ★ PES 头两个 flags 字节的布局（这里曾写错，只有外部裁判能抓到）：
+        //   byte6 = '10' | scrambling(2) | priority | data_alignment | copyright | original
+        //   byte7 = **PTS_DTS_flags(2)** | ESCR | ES_rate | trick | add_copy | CRC | extension
+        //   把 PTS_DTS_flags 写进 byte6 的话，ffmpeg 认为"这个 PES 没有时间戳"，
+        //   会把那 5/10 字节当 header_data 跳过 → `ffprobe` 全是 `pts=N/A`，
+        //   而解码看起来"正常"（playlist/切片都能播，只是没有时间轴）。
+        pes.push_back(0x80);
         pes.push_back(static_cast<uint8_t>(with_dts ? 0xC0 : 0x80));
-        pes.push_back(0x00);
         pes.push_back(static_cast<uint8_t>(header_data_len));
         appendTimestamp(&pes, pts90k, static_cast<uint8_t>(with_dts ? 0x03 : 0x02));
         if (with_dts) {
@@ -384,8 +404,8 @@ MpegTsMuxer::Result MpegTsMuxer::writePacket(const MediaPacket &packet, std::str
     pes.push_back(kStreamIdAudio);
     pes.push_back(static_cast<uint8_t>((pes_payload_len >> 8) & 0xFF));
     pes.push_back(static_cast<uint8_t>(pes_payload_len & 0xFF));
-    pes.push_back(0x80);   // 只带 PTS（音频 dts == pts）
-    pes.push_back(0x00);
+    pes.push_back(0x80);   // byte6：'10' + 0
+    pes.push_back(0x80);   // byte7：PTS_DTS_flags = '10'（只带 PTS，音频 dts == pts）
     pes.push_back(0x05);
     appendTimestamp(&pes, pts90k, 0x02);
     pes.insert(pes.end(), adts.begin(), adts.end());

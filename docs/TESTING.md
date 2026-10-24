@@ -97,7 +97,8 @@ MZ_TEST(timestamp_rational_conversion) {
 ```bash
 ./scripts/flv_http_test.sh     # M6-c/M8 端到端 68 项（HTTP + chunked + ffprobe + 播放器资源 + 循环 + 边界 + MKV/TS 与 ADTS 结构）
 ./scripts/flv_mux_test.sh      # M6-a 封装链 8 项（demux → FLV → 落盘 → ffprobe）
-./scripts/ts_mux_test.sh       # M9-a TS 封装 23 项（demux → TS → 落盘 → ffprobe/ffmpeg 四层判据）
+./scripts/ts_mux_test.sh       # M9-a TS 封装 29 项（demux → TS → 落盘 → ffprobe/ffmpeg 四层判据）
+./scripts/hls_test.sh          # M9-b HLS 23 项（m3u8/切片/Range/窗口滚动/租约释放 + ffmpeg 读 m3u8）
 ./scripts/http_test.sh         # M3 HTTP 层（含 Range / chunked / 统计）
 ./scripts/echo_test.sh         # M2 网络层（100MB 回显）
 ```
@@ -231,11 +232,11 @@ MZMEDIA_SERVER=./build-asan/bin/mzmedia ./scripts/concurrent_test.sh --quick   #
 | 源结束后的行为（不挂连接） | **M6-c ✅**：单测 `flv_sender_start_drains_already_ended_source`；端到端脚本 §8（修前 `curl rc=28` 挂满超时，修后 **12ms** 正常结束） |
 | 空闲释放不打断观看 | **M6-c ✅**：单测 `srcmgr_idle_release_waits_for_subscribers`（有订阅者 → 推迟并计数；订阅者一走 → 下一次复查释放） |
 | **FR-2.2** MKV / MPEG-TS 输入（**M8 ✅**） | 样本：`make_samples.sh` 从 `sample.mp4` `-c copy` 转出 `sample.mkv` / `sample.ts` / `vonly.ts`。单测：`ffmpeg` 组 5 例纯函数（ADTS 头位域、ASC=12 08/12 10/11 90、9 字节 CRC 头、畸形拒绝、多帧剥头）+ 1 例**与真实 TS 交叉校验**；`producer` 组 2 例（`producer_ts_aac_gets_asc_and_strips_adts`：`open()` 内 ASC 已就绪 + 与裸 `Demuxer` 的原始包长**逐字节对账**；`producer_ts_video_only_still_has_no_audio`：纯视频 TS 不因"造不出 ASC"而失败）。端到端：`flv_http_test.sh` **§3b** 17 项 —— MKV/TS 各出合法 FLV（`ffprobe` 认 h264 320x240 + aac 44100、50 帧、`ffmpeg` 零 error），外加 python 逐 tag 复查 `ASC=12 08` 且 **raw AAC tag 不带 ADTS 同步字**（`audio_tags=89 seq=1 raw=88`）。**变异**：不剥头 / 不造 ASC → `producer` 用例双红 |
-| **FR-3.2** HLS 切片与播放列表（**M9-a ✅ TS 封装** / M9-b ⏳ 切片器） | **TS 封装已验**：`scripts/ts_mux_test.sh` **23/23**（三种输入形状 × 结构/元数据/内容/PSI 四层）+ `mpegts` 组 5 例纯字节布局（含 adaptation field 的 off-by-one 边界）。切片器的验证见下一行。原计划： 计划：单测 `hls` 组断言 m3u8 文本 —— `#EXT-X-MEDIA-SEQUENCE` 跨切片递增、`#EXT-X-TARGETDURATION` **≥ 实测最大切片时长**（切片必须切在关键帧上，时长随 GOP 浮动）、窗口只有 6 片（滚动）、EOS 时追加 `#EXT-X-ENDLIST`；集成：`ffprobe` 逐切片认 h264+aac，并断言**每个切片首帧是关键帧**；端到端：`ffplay http://…/hls/<name>.m3u8` 连续播放、无 404 |
-| **FR-4.1** `/hls/<name>.m3u8` 与 `/hls/<name>-<seq>.ts` 路由（⏳ **v0.2 计划**） | 计划：新增 `scripts/hls_test.sh` —— m3u8 返回 200 + `Content-Type: application/vnd.apple.mpegurl`；切片 200 + `video/mp2t`；不存在 / 目录穿越 / 非法名 / 非白名单扩展名 → 404（与 `/live/` 同一套名字映射） |
-| **FR-4.2** Range（**HLS 切片**，⏳ **v0.2 计划**） | 计划：对 `-<seq>.ts` 发 `Range: bytes=a-b` → 206 + `Content-Range`；越界 → 416；响应带 `Accept-Ranges: bytes`。现有 `http_test.sh` 已覆盖通用 Range，但**必须对切片再验一次**（切片来自内存/磁盘的实现不同） |
+| **FR-3.2** HLS 切片与播放列表（**M9-a ✅ TS 封装 / M9-b ✅ 切片器**） | **切片器已验（M9-b ✅）**：`scripts/hls_test.sh` **23/23** —— m3u8 头部三要素、切片 URI 形态、窗口 ≤6 且 MEDIA-SEQUENCE 前进、滑出窗口的老切片 404、**`ffmpeg` 直接读 m3u8 解码 4 秒零 error**；单测 `hls` 组 6 例（切点只认视频关键帧、窗口/序号、TARGETDURATION 取实测最大、ENDLIST 幂等、空列表、非法配置）。TS 封装部分：`scripts/ts_mux_test.sh` **23/23**（三种输入形状 × 结构/元数据/内容/PSI 四层）+ `mpegts` 组 5 例纯字节布局（含 adaptation field 的 off-by-one 边界）。切片器的验证见下一行。原计划： 计划：单测 `hls` 组断言 m3u8 文本 —— `#EXT-X-MEDIA-SEQUENCE` 跨切片递增、`#EXT-X-TARGETDURATION` **≥ 实测最大切片时长**（切片必须切在关键帧上，时长随 GOP 浮动）、窗口只有 6 片（滚动）、EOS 时追加 `#EXT-X-ENDLIST`；集成：`ffprobe` 逐切片认 h264+aac，并断言**每个切片首帧是关键帧**；端到端：`ffplay http://…/hls/<name>.m3u8` 连续播放、无 404 |
+| **FR-4.1** `/hls/<name>.m3u8` 与 `/hls/<name>-<seq>.ts` 路由（**M9-b ✅**） | `scripts/hls_test.sh`：m3u8 = 200 + `application/vnd.apple.mpegurl`；切片 = 200 + `video/mp2t`；名字规则与 `/live/` 同一套（`mediaNameToPath` 白名单）；非法路径 404。原计划： 计划：新增 `scripts/hls_test.sh` —— m3u8 返回 200 + `Content-Type: application/vnd.apple.mpegurl`；切片 200 + `video/mp2t`；不存在 / 目录穿越 / 非法名 / 非白名单扩展名 → 404（与 `/live/` 同一套名字映射） |
+| **FR-4.2** Range（**HLS 切片**，**M9-b ✅**） | `scripts/hls_test.sh` 对切片发 `Range: bytes=0-187` → **206** + `Content-Range: bytes 0-187/<total>` + `Accept-Ranges: bytes` + 响应体 **188 字节**。实现复用 `HttpServer` 的 `serveMemoryAsStatic()`（与静态文件同一套 Range 语义）。原计划： 计划：对 `-<seq>.ts` 发 `Range: bytes=a-b` → 206 + `Content-Range`；越界 → 416；响应带 `Accept-Ranges: bytes`。现有 `http_test.sh` 已覆盖通用 Range，但**必须对切片再验一次**（切片来自内存/磁盘的实现不同） |
 | **FR-3.4** 时间戳基准（**TS → 90kHz**，⏳ **v0.2 计划**） | 计划：单测断言 `ms → 90kHz` 用整数有理换算（`time_base.h`）且丢帧 0；集成 `ffprobe -show_packets` 断言切片内 dts 单调、**跨切片接续**（不因切片边界回退） |
-| **FR-1.3** 转码源 lazy 启动 + 空闲 60s 释放（⏳ **v0.2 计划**） | 计划：`srcmgr` 组扩展 —— 转码源在**首个订阅者接入时**才建解码/编码器上下文；订阅者清零后 60s 释放，并回收 sws / 编码器 / 线程；`/api/stats` 的 `sources` 与线程数回落；释放后 `releaseAll()` 可 join |
+| **FR-1.3** lazy 启动 + 空闲释放（**HLS 已验 ✅** / 转码 ⏳） | HLS 的「客户端」是拉流请求，所以用**租约**：`scripts/hls_test.sh` 用 `--hls-lease-ms 2000` 起实例 → 拉一次 m3u8 后 `hls.streams=1`，超过租约再查 → **`streams=0` 且 `lease_expired≥1`**。转码源的 lazy/空闲释放仍待 M10： 计划：`srcmgr` 组扩展 —— 转码源在**首个订阅者接入时**才建解码/编码器上下文；订阅者清零后 60s 释放，并回收 sws / 编码器 / 线程；`/api/stats` 的 `sources` 与线程数回落；释放后 `releaseAll()` 可 join |
 | **FR-7.1** 命令行**转码开关**（⏳ **v0.2 计划**） | 计划：`--transcode`（默认**关**）；关闭时 HEVC→FLV 仍返回 **415**（不静默降级）；开启时走解码→编码路径；未提供时用默认值、未知参数仍报错退出 |
 | 各 codec 组合 | `CODEC_MATRIX.md` 每个组合一条 ffprobe 用例 |
 
@@ -329,21 +330,21 @@ cmake -B build-tsan -DMZMEDIA_ENABLE_TSAN=ON -DCMAKE_CXX_COMPILER=g++-12
 
 | 分组 | 用例数 | TSAN 报告 |
 |---|---|---|
-| 严格组（19 组）：`selftest` 4 / `util` 13 / `logger` **14** / `queue` 15 / `pool` 6 / `semaphore` 5 / `core` 12 / `poller` 16 / `timer` 20 / `buffer` 13 / `http` **43** / `ntimed_http` **24** / `ffmpeg` **35** / `media` 24 / `ntimed_media` 6 / `srcmgr` 12 / `flv` 20 / `producer` **10** / `mpegts` **5** | **297** | **0** |
+| 严格组（20 组）：`selftest` 4 / `util` 13 / `logger` **14** / `queue` 15 / `pool` 6 / `semaphore` 5 / `core` 12 / `poller` 16 / `timer` 20 / `buffer` 13 / `http` **43** / `ntimed_http` **24** / `ffmpeg` **35** / `media` 24 / `ntimed_media` 6 / `srcmgr` 12 / `flv` 20 / `producer` **10** / `mpegts` **5** / `hls` **6** | **303** | **0** |
 | 含超时等待的组：`qtimed` 2 / `ptimed` 1 / `ntimed` **41** | **44** | **0**（g++-12 运行时已无 §8.2 的误报） |
-| 合计（脚本统计，含跨组重复计数） | **341** | 真问题 **0** |
+| 合计（脚本统计，含跨组重复计数） | **348** | 真问题 **0** |
 
 **同批其它门禁**（`VERSIONING.md` 发版清单里的项目；下表为 v0.1.0 的最终数字）：
 
 | 门禁 | 命令 | 实测 |
 |---|---|---|
 | 编译 | `cmake --build build` | **0 warning / 0 error**（`-Wall -Wextra`，无任何 `-Wno-`；ASAN 构建同样 0） |
-| 单元（串行） | `cd build && ctest --output-on-failure` | **22/22 分组通过**（**263 用例**；**不要**加 `-j`，见 §2.2） |
+| 单元（串行） | `cd build && ctest --output-on-failure` | **23/23 分组通过**（**269 用例**；**不要**加 `-j`，见 §2.2） |
 | 单元（ASAN） | `cmake -B build-asan -DMZMEDIA_ENABLE_ASAN=ON && cd build-asan && ctest` | **21/21 通过** |
 | 并发/长跑（**Debug** 构建） | `./scripts/concurrent_test.sh`（10 路 × 5 分钟）+ `--duration 3600`（1 小时） | 全绿；1 小时数据见 `ACCEPTANCE_v0.1.0.md` §3.3（Release 长跑未做，见该文件 §6 第 12 项） |
 | 并发（**ASAN** 构建） | `MZMEDIA_SERVER=./build-asan/bin/mzmedia ./scripts/concurrent_test.sh --quick --kill-half --overload 8` | **10/10 通过**（对应 NFR-3 的"ASAN 无报错"） |
-| 脚本验收 | `scripts/{http,flv_mux,ts_mux,flv_http}_test.sh` | **全绿**（M3 / flv_mux 8 项 / **ts_mux 23 项** / **flv_http 68 项**） |
-| 单进程全量 | `./build/bin/mzmedia_unittest` | **263/263 用例、61,679 条断言**（诊断用，不作为计时门禁） |
+| 脚本验收 | `scripts/{http,flv_mux,ts_mux,hls,flv_http}_test.sh` | **全绿**（M3 / flv_mux 8 项 / **ts_mux 29 项** / **hls 23 项** / **flv_http 68 项**） |
+| 单进程全量 | `./build/bin/mzmedia_unittest` | **268/269 用例、61,728 条断言**（诊断用，不作为计时门禁；唯一的红是已知的 `timer_precision` 宿主噪声，按 §2.2 单跑该组 3/3 绿） |
 | 发版验收 | `docs/ACCEPTANCE_v0.1.0.md` | 逐条 SC/NFR/FR 的"状态 + 证据 + 实测"（v0.1.0 的发布依据） |
 
 > 分组按**用例名子串**匹配，因此个别用例会同时属于两个组

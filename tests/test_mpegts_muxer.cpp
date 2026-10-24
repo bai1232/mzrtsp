@@ -197,10 +197,12 @@ MZ_TEST(mpegts_video_pes_annexb_spspps_and_90khz) {
     MZ_ASSERT_EQ(static_cast<uint8_t>(first[pes_off + 1]), 0x00u);
     MZ_ASSERT_EQ(static_cast<uint8_t>(first[pes_off + 2]), 0x01u);
     MZ_ASSERT_EQ(static_cast<uint8_t>(first[pes_off + 3]), 0xE0u);             // video stream_id
-    // PES 头布局：start_code(3) + stream_id(1) + length(2) = 6 → flags1 在 **+6**、
-    // flags2 在 +7、header_data_len 在 +8。写这条断言时我自己先错了一次（写成 +7）。
-    MZ_ASSERT_EQ(static_cast<uint8_t>(first[pes_off + 6]), 0xC0u);             // PTS+DTS
-    MZ_ASSERT_EQ(static_cast<uint8_t>(first[pes_off + 7]), 0x00u);             // flags2
+    // PES 头布局：start_code(3)+stream_id(1)+length(2)=6，然后
+    //   byte6 = '10' + scrambling/priority/... （恒 0x80）
+    //   byte7 = **PTS_DTS_flags(2)** + 其它标志位  ← 这里错过一次，见 muxer 里的注释
+    //   byte8 = header_data_length
+    MZ_ASSERT_EQ(static_cast<uint8_t>(first[pes_off + 6]), 0x80u);             // byte6
+    MZ_ASSERT_EQ(static_cast<uint8_t>(first[pes_off + 7]), 0xC0u);             // PTS+DTS
     MZ_ASSERT_EQ(static_cast<uint8_t>(first[pes_off + 8]), 0x0Au);             // header_data_len = 10
     // 负载起点：SPS/PPS 在前（00 00 01 67 … 00 00 01 68 … 00 00 01 65 …）
     const size_t payload_off = pes_off + 9 + 10;
@@ -236,7 +238,8 @@ MZ_TEST(mpegts_audio_raw_becomes_adts) {
     MZ_ASSERT_EQ((static_cast<uint8_t>(first[3]) & 0x30), 0x10);   // 音频不带 AF（够满就纯负载）
     const size_t pes_off = 4;
     MZ_ASSERT_EQ(static_cast<uint8_t>(first[pes_off + 3]), 0xC0u); // audio stream_id
-    MZ_ASSERT_EQ(static_cast<uint8_t>(first[pes_off + 8]), 0x05u); // header_data_len = 5（只有 PTS）
+    MZ_ASSERT_EQ(static_cast<uint8_t>(first[pes_off + 7]), 0x80u); // PTS_DTS_flags = 10（只有 PTS）
+    MZ_ASSERT_EQ(static_cast<uint8_t>(first[pes_off + 8]), 0x05u); // header_data_len = 5
     const size_t adts_off = pes_off + 9 + 5;   // 包内偏移
     AdtsHeader header;
     // ★ 必须从**该包的起点**再偏移：直接 ts.substr(adts_off) 取到的是 PAT 里的字节

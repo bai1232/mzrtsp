@@ -124,6 +124,9 @@ set(MZMEDIA_SOURCES
         src/output/flv_sender.cpp
         # M9：MPEG-TS 封装（HLS 切片的地基）
         src/output/mpegts_muxer.cpp
+        # M9-b：HLS 切片器 + 租约注册表
+        src/output/hls_writer.cpp
+        src/output/hls_service.cpp
         )
 
 # 骨架阶段（第 1 批）没有任何源文件，此时不能创建 STATIC 库目标

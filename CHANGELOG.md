@@ -7,6 +7,27 @@
 
 （下一版内容；v0.2.0 计划见 [docs/ROADMAP.md](docs/ROADMAP.md)）
 
+### Added（**M9-b：HLS 输出**，v0.2.0 的第二块）
+- `src/output/hls_writer.{h,cpp}`：一源一份的切片器 —— 目标 2s、窗口 6 片、`TARGETDURATION`
+  取实测最大、`MEDIA-SEQUENCE` 前进、EOS 加 `#EXT-X-ENDLIST`；**只切视频关键帧**；单片/总量双上限
+  （超限**丢整片**并计数，绝不丢半片）；每片开头写 PAT/PMT（切片可独立起播）。
+- `src/output/hls_service.{h,cpp}`：名字→(源, 切片器) 注册表 + **租约 60s**（任意 `/hls/` 请求续租，
+  到期且无订阅者 → 释放源，FR-1.3 的 HLS 版本）+ 定时扫描 + `/api/stats` 的 `hls` 段。
+- HTTP：`/hls/<name>.m3u8` 与 `/hls/<name>-<seq>.ts`（替换 501 占位）；切片**在内存里**但仍支持
+  `Range` —— 复用 `HttpServer` 的 `serveMemoryAsStatic()`（不重写一份 Range 逻辑）。
+- CLI：`--hls-lease-ms <n>`（默认 60000，可调是为了让验收脚本能验"租约到期释放"）。
+- 测试：新增 `hls` 分组 6 例 / 48 断言（切点只认视频关键帧、窗口与序号、TARGETDURATION、
+  ENDLIST 幂等、空列表、非法配置）；新脚本 `scripts/hls_test.sh` **23/23**。
+
+> **实测**：`hls_test.sh` 23/23 —— m3u8 三要素齐全、窗口 6 片滚动、老切片 404、切片 188 对齐 +
+> PAT/PMT、`Range: bytes=0-187` → **206 + 188 字节**、首帧是关键帧、**`ffmpeg -t 4 -i <m3u8>` 零 error**、
+> 租约 2s 的实例在 5s 后 `hls.streams` **1 → 0** 且 `lease_expired=1`。
+> **三个真 bug（都由"外部裁判"抓到，单测当时是绿的）**：
+> ① PES 头的 `PTS_DTS_flags` 写进了 byte6（应在 byte7）→ ffmpeg 认为没有时间戳、`pts=N/A`，
+>   而解码看起来完全正常；② 切点用了 `packet.isKeyFrame()`，但 **AAC 音频包的 key 标志恒真**
+>   → 切在音频上（尾巴多一个 40ms 片 + 跨片时间戳回退）；③ 首包 PTS=0 被 ffmpeg 的 TS demuxer
+>   当 33 位回绕（吐 2^33）→ 时间轴加 1s 起点偏移。
+
 ### Added（**M9-a：MPEG-TS 封装**，HLS 的地基）
 - `src/output/mpegts_muxer.{h,cpp}`：PAT/PMT（含 MPEG-2 CRC32）、PES、188 字节 TS 包、
   adaptation field 填充、PCR、90kHz 时间戳（33 bit 回绕）、**关键帧前补 SPS/PPS**、**raw AAC → ADTS**。

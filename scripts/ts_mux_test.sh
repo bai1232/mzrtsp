@@ -118,7 +118,26 @@ PY
         check_false "[$label] ffmpeg 完整解码无 error" "$err"
     fi
 
-    # ④ PSI：每一份产物都必须带 PAT(0x0000) 与 PMT(0x1000)，否则"能播"只是运气
+    # ④ 时间戳可读性（**最容易漏的一条**）：PES 里的 PTS 必须被 ffprobe 读出来。
+    #    踩过：把 PTS_DTS_flags 写进 PES 头的 byte6 而不是 byte7，ffmpeg 会认为"没有时间戳"，
+    #    把 5/10 字节当 header_data 跳过 → 解码看起来正常（切片都能播），但 `pts=N/A`、
+    #    且再封一道就报 "non monotonically increasing dts"。单测当时把**错的布局**断言成了对的。
+    pts_first="$(ffprobe -v error -select_streams v:0 -show_entries packet=pts -of csv=p=0 "$out" | awk 'NF' | head -1)"
+    if [ -n "$pts_first" ] && [ "$pts_first" != "N/A" ]; then
+        check_true "[$label] PES 时间戳可读（首包 pts=$pts_first）"
+    else
+        check_false "[$label] PES 时间戳可读" "首包 pts=$pts_first（N/A = 写错了 PES 头，见 DESIGN_M9 §6）"
+    fi
+    # 且必须**单调**（相邻包 dts 不递减）
+    if ffprobe -v error -select_streams v:0 -show_entries packet=dts -of csv=p=0 "$out" \
+        | awk 'NF && $1 != "N/A" { if (prev != "" && $1 + 0 <= prev + 0) bad=1; prev=$1 } END { exit bad ? 1 : 0 }'
+    then
+        check_true "[$label] 视频包 dts 单调不减"
+    else
+        check_false "[$label] 视频包 dts 单调不减" "存在回退/重复/缺失"
+    fi
+
+    # ⑤ PSI：每一份产物都必须带 PAT(0x0000) 与 PMT(0x1000)，否则"能播"只是运气
     if python3 - "$out" > "$OUTDIR/$label.psi.txt" 2>&1 << 'PY'
 import sys
 data = open(sys.argv[1], 'rb').read()

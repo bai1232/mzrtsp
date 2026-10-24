@@ -49,6 +49,8 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_demuxer_producer.cpp
         # ---- M9 MPEG-TS 封装（用例名 mpegts_*）----
         ${CMAKE_CURRENT_SOURCE_DIR}/test_mpegts_muxer.cpp
+        # ---- M9-b HLS 切片器（用例名 hls_*）----
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_hls_writer.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS
@@ -105,6 +107,9 @@ set(MZMEDIA_TEST_GROUPS
         # ---- M9 MPEG-TS 封装（PAT/PMT/PES/PCR 字节布局）----
         # 纯函数 + 手造包，无线程无等待 → 严格组。
         mpegts
+        # ---- M9-b HLS 切片器（切点/窗口/m3u8 文本）----
+        # 同步喂包（不投递线程），无线程无等待 → 严格组。
+        hls
         )
 
 add_executable(mzmedia_unittest ${MZMEDIA_TEST_SOURCES})

@@ -47,7 +47,7 @@ Result writePacket(const MediaPacket &, std::string *out);
 | PCR | 关键帧的首个 TS 包携带（`PCR_PID = 视频 PID`） | 播放器靠 PCR 建时钟；间隔由 `pcrCount()`/`lastDts90k()` 可观测 |
 | 拒绝而不是猜 | 非 H264 / 缺 avcC / 缺 ASC / 外来包 / 空包 → 具体 `Result` + 日志 | §4 的"不静默降级"；调用方据此回 415/500 |
 
-### 3.2 `HlsWriter`（M9-b，待实现）
+### 3.2 `HlsWriter` + `HlsService`（M9-b ✅）
 
 **形状先定死**（`AI_COLLAB.md` §3.3 的纪律），实现随后：
 
@@ -67,7 +67,11 @@ public:
 };
 ```
 
-关键决策（已定，M9-b 照此做）：
+**落地形态**：`HlsWriter`（纯切片逻辑，`onPacket()` 同步、可手造包单测）+ `HlsService`
+（名字→(源, 切片器) 注册表 + 租约定时器 + 两个只读入口 `playlist()/slice()`）。
+HTTP 侧只读切片，复用 `serveMemoryAsStatic()`（= HttpServer 里那套已测的单区间 Range 逻辑）。
+
+关键决策（已定并已实现）：
 
 | 决策 | 选择 | 排除的选项与原因 |
 |---|---|---|
@@ -76,6 +80,8 @@ public:
 | 生命周期 | **租约**（任意 `/hls/` 请求续租 60s；到期且无订阅者 → 停源） | 排除"常驻到进程退出"（违背 FR-1.3）；排除"每个 m3u8 请求方各自切片"（N 倍 CPU） |
 | 切片存放 | **内存 ring（window 片）+ 单片/总量双上限** | 排除落盘（多一套清理与磁盘上限，NFR-6 的口径变脏） |
 | 探活 | m3u8 里 `#EXT-X-ENDLIST` 只在源 EOS 时出现 | 文件输入 + `--loop` 下窗口永不满，播放器当直播一直播 |
+| 切点 | **只认视频关键帧**（`is_video && packet.isKeyFrame()`） | 排除「用 `packet.isKeyFrame()` 直接判」：AAC 音频包的 key 标志**恒为 true** → 会切在音频包上（实测：切片时长变成音频的 2199ms、多出 40ms 尾巴片、跨片时间戳回退） |
+| 时间轴起点 | 每个 TS 切片的时间戳 = **90000**（1s）+ ms×90 | 排除「从 0 开始」：ffmpeg 的 mpegts demuxer 会把首包 PTS=0 当 33 位回绕，吐出 **2^33**（实测 8589934592） |
 
 ## 4. 分批
 
@@ -101,6 +107,9 @@ public:
 | 3 | HE-AAC（AOT=5）无法用 ADTS 的 2 bit profile 表示 | 高压缩音频 | `rawAacToAdts` 明确失败（不硬塞成 LC） |
 | 4 | PCR 间隔过大 | 关键帧间隔很长（如 10s GOP） | 当前只在关键帧插；HLS 要求 ≤100ms —— **M9-b 必须改成按时间插**（若 GOP 大），或明确记录"仅支持 GOP ≤100ms 的源" |
 | 5 | `PAT/PMT` 的 CRC 写错 | 手写位域 | 用例验 CRC 由 `crc32Mpeg` 生成；`ffprobe` 认得出就是对的 |
+| 6 | **PES 头两个 flags 字节写反**（把 `PTS_DTS_flags` 放进 byte6） | 任何切片 | ffmpeg 会认为「没有时间戳」，把那 5/10 字节当 header_data 跳过 → `pts=N/A`，**解码看起来完全正常**。单测当时把错的布局断言成了对的 → 已加**外部判据**：`ts_mux_test.sh` 断言 `pts != N/A` 且 dts 单调 |
+| 7 | 音频包 key 标志恒真导致切点错位 | AAC 音频 | 见 §3.2 决策表「切点」；用例 `hls_cuts_only_on_video_keyframes` 锁住 |
+| 8 | 首包 PTS=0 被 ffmpeg 当回绕 | 源时间轴从 0 开始 | 加 1s 起点偏移（`kStartOffset90k`）；`ts_mux_test.sh` 断言首包 pts=90000 |
 
 ## 7. 决策记录
 

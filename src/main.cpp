@@ -63,6 +63,7 @@ const char *kUsage =
     "  --web-root <dir>    静态网页目录（默认自动找 third_party/flv.js，提供 /flv.min.js）\n"
     "  --loop              循环推流：读到文件尾重开并把时间戳接着往后接（浏览器可长时间观看）\n"
     "  --speed <x>         推送倍速（默认 1.0；压测/调试用，> 1 会加快）\n"
+    "  --hls-lease-ms <n>  HLS 拉流请求的租约（默认 60000；到期且没人拉就释放源，FR-1.3）\n"
     "  --log-level <l>     trace|debug|info|warn|error|fatal（默认 info）\n"
     "  --log-file <path>   日志文件（默认 logs/mzmedia.log，64MB×5 滚动；FR-6.2）\n"
     "  --help              显示本帮助\n"
@@ -101,8 +102,31 @@ bool allowedExtension(const std::string &ext) {
 }
 
 /**
- * `/live/<name>.flv` → 媒体文件的绝对/相对路径
+ * 媒体名 → 文件路径（M6-b；M9-b 抽出来给 `/hls/` 复用 —— 两处必须是**同一套**白名单）
  * @param name 形如 `sample`（默认 .mp4）或 `sample.h264`（带白名单扩展名）
+ * @return false = 名字/扩展名非法（原因写进 `why`，调用方回 404 时可读）
+ */
+bool mediaNameToPath(const std::string &media_root, const std::string &name, std::string *full_path,
+                     std::string *why) {
+    if (!validMediaName(name)) {
+        *why = "媒体名只允许 [A-Za-z0-9_.-]（不带扩展名时默认 .mp4）";
+        return false;
+    }
+    // 有没有扩展名：没有就补 .mp4（M6-b 的行为保持兼容）
+    std::string file = name;
+    const size_t dot = name.rfind('.');
+    if (dot == std::string::npos) {
+        file += ".mp4";
+    } else if (!allowedExtension(name.substr(dot))) {
+        *why = "扩展名不在白名单（.mp4/.h264/.mkv/.ts/.aac/.flv）";
+        return false; // 明确拒绝，不"试试看"
+    }
+    *full_path = media_root + "/" + file;
+    return true;
+}
+
+/**
+ * `/live/<name>.flv` → 媒体文件的绝对/相对路径
  * @return false = 路径非法（原因由调用方回 404，并给出可读提示）
  */
 bool resolveMediaPath(const std::string &media_root, const std::string &request_path,
@@ -121,16 +145,58 @@ bool resolveMediaPath(const std::string &media_root, const std::string &request_
     if (!validMediaName(rest)) {
         return false;
     }
-    // 有没有扩展名：没有就补 .mp4（M6-b 的行为保持兼容）
-    std::string file = rest;
-    const size_t dot = rest.rfind('.');
-    if (dot == std::string::npos) {
-        file += ".mp4";
-    } else if (!allowedExtension(rest.substr(dot))) {
-        return false; // 扩展名不在白名单：明确拒绝，不"试试看"
+    std::string why;
+    if (!mediaNameToPath(media_root, rest, full_path, &why)) {
+        return false;
     }
     *name = rest;
-    *full_path = media_root + "/" + file;
+    return true;
+}
+
+/**
+ * `/hls/<name>.m3u8` 与 `/hls/<name>-<seq>.ts` → (name, 媒体路径, seq, 是不是播放列表)
+ * @note 名字规则与 `/live/` **完全一致**（同一套 `mediaNameToPath`）：
+ *       不带扩展名默认 `.mp4`，也支持 `.h264/.mkv/.ts/.aac/.flv`
+ */
+bool resolveHlsPath(const std::string &media_root, const std::string &request_path,
+                    std::string *name, std::string *full_path, uint64_t *seq, bool *is_playlist,
+                    std::string *why) {
+    const std::string prefix = "/hls/";
+    if (request_path.rfind(prefix, 0) != 0) {
+        *why = "路径必须以 /hls/ 开头";
+        return false;
+    }
+    std::string rest = request_path.substr(prefix.size());
+    *is_playlist = false;
+    if (rest.size() > 5 && rest.compare(rest.size() - 5, 5, ".m3u8") == 0) {
+        rest = rest.substr(0, rest.size() - 5);
+        *is_playlist = true;
+    } else if (rest.size() > 3 && rest.compare(rest.size() - 3, 3, ".ts") == 0) {
+        rest = rest.substr(0, rest.size() - 3);
+        const size_t dash = rest.rfind('-');
+        if (dash == std::string::npos || dash + 1 >= rest.size()) {
+            *why = "切片路径应为 /hls/<name>-<seq>.ts";
+            return false;
+        }
+        const std::string digits = rest.substr(dash + 1);
+        if (digits.find_first_not_of("0123456789") != std::string::npos) {
+            *why = "切片序号必须是纯数字";
+            return false;
+        }
+        *seq = std::strtoull(digits.c_str(), nullptr, 10);
+        rest = rest.substr(0, dash);
+    } else {
+        *why = "HLS 只提供 /hls/<name>.m3u8 与 /hls/<name>-<seq>.ts";
+        return false;
+    }
+    if (rest.empty()) {
+        *why = "缺媒体名";
+        return false;
+    }
+    if (!mediaNameToPath(media_root, rest, full_path, why)) {
+        return false;
+    }
+    *name = rest;
     return true;
 }
 
@@ -182,6 +248,7 @@ int main(int argc, char **argv) {
     std::string log_file = "logs/mzmedia.log"; // FR-6.2 的默认值
     bool loop = false;
     double speed = 1.0;
+    uint32_t hls_lease_ms = 60000;   // FR-1.3 的 60s 同量级；可调是为了让验收脚本能验"租约到期释放"
     LogLevel level = LogLevel::Info;
 
     for (int i = 1; i < argc; ++i) {
@@ -212,6 +279,14 @@ int main(int argc, char **argv) {
                 std::fprintf(stderr, "--speed 非法：必须 (0, 1000]（0 不是「不限」）\n");
                 return 2;
             }
+        } else if (key == "--hls-lease-ms") {
+            const int parsed = std::atoi(value());
+            if (parsed < 500 || parsed > 3600000) {
+                // 有界性不可协商：0 不是"无限租约"，而是非法
+                std::fprintf(stderr, "--hls-lease-ms 非法：应为 500..3600000 ms\n");
+                return 2;
+            }
+            hls_lease_ms = static_cast<uint32_t>(parsed);
         } else if (key == "--log-level") {
             if (!parseLogLevel(value(), &level)) {
                 std::fprintf(stderr, "--log-level 非法：%s\n", argv[i]);
@@ -276,6 +351,62 @@ int main(int argc, char **argv) {
 
     // FR-6.1：/api/stats 里带上媒体层的源与订阅统计
     (void) server->setExtraStatsProvider([manager] { return manager->dumpStatsJson(); });
+
+    // ---- M9-b：HLS（一源一份切片 + 租约式空闲释放）----
+    // 租约 60s（FR-1.3 同量级）：任意 /hls/ 请求续租；到期且无订阅者 → 释放源。
+    HlsService::Config hls_config;
+    hls_config.writer.target_duration_ms = 2000;   // FR-3.2
+    hls_config.writer.window = 6;                  // FR-3.2
+    hls_config.lease_ms = hls_lease_ms;
+    hls_config.sweep_ms = (hls_lease_ms < 4000 ? (hls_lease_ms / 4) : 5000);   // 短租约 → 短扫描间隔
+    HlsService::Ptr hls = HlsService::create(manager, poller, hls_config);
+    if (!hls) {
+        std::fprintf(stderr, "HLS 初始化失败（/hls/ 将回 501）\n");
+    } else {
+        (void) server->setExtraStatsProvider([manager, hls] {
+            return manager->dumpStatsJson() + "," + hls->dumpStatsJson();
+        });
+        // 必须在 start() 之前注册 /hls/：HttpServer::start() 里的 501 占位有 findHandler 守卫
+        if (!server->setPrefixRoute(
+                "/hls/", [manager, hls, media_root](const HttpParser &req, HttpResponse &resp) {
+                    std::string name;
+                    std::string path;
+                    uint64_t seq = 0;
+                    bool is_playlist = false;
+                    std::string why;
+                    if (!resolveHlsPath(media_root, req.path(), &name, &path, &seq, &is_playlist,
+                                        &why)) {
+                        resp.setStatus(404);
+                        resp.setBody("404 Not Found：" + why + "\n");
+                        return;
+                    }
+                    std::string body;
+                    std::string error;
+                    if (is_playlist) {
+                        if (!hls->playlist(name, path, &body, &error)) {
+                            resp.setStatus(500);
+                            resp.setBody("500 Internal Server Error：HLS 打不开（" + error + "）\n");
+                            return;
+                        }
+                        resp.setHeader("Cache-Control", "no-cache");
+                        resp.setBody(body);
+                        resp.setContentType("application/vnd.apple.mpegurl");
+                        return;
+                    }
+                    if (!hls->slice(name, seq, &body, &error)) {
+                        // 老切片滑出窗口 → 404 是**正常**的（播放器拿旧 m3u8 会这样请求）
+                        resp.setStatus(404);
+                        resp.setBody("404 Not Found：" + error + "\n");
+                        return;
+                    }
+                    resp.setHeader("Cache-Control", "no-cache");
+                    // 切片在内存里，但要与静态文件一样支持 Range（FR-4.2）
+                    (void) serveMemoryAsStatic(req, resp, body, "video/mp2t");
+                })) {
+            std::fprintf(stderr, "注册 /hls/ 路由失败\n");
+            return 1;
+        }
+    }
 
     // 内置 501 占位是在 HttpServer::start() 里带 findHandler 守卫注册的，
     // 所以**在 start() 之前**注册就能覆盖它（见 docs/DESIGN_M6.md §3.4）
@@ -400,6 +531,8 @@ int main(int argc, char **argv) {
                 static_cast<unsigned>(server->port()));
     std::printf("  HTTP-FLV  : http://127.0.0.1:%u/live/<name>.flv\n",
                 static_cast<unsigned>(server->port()));
+    std::printf("  HLS       : http://127.0.0.1:%u/hls/<name>.m3u8\n",
+                static_cast<unsigned>(server->port()));
     std::printf("  统计      : http://127.0.0.1:%u/api/stats\n",
                 static_cast<unsigned>(server->port()));
     std::printf("  媒体目录  : %s%s\n", media_root.c_str(), isDir(media_root) ? "" : "（不存在！）");
@@ -415,6 +548,9 @@ int main(int argc, char **argv) {
     }
 
     server->shutdown(); // 先关服务器（连接全断）→ 订阅者释放 → 源按空闲规则回收
+    if (hls) {
+        hls->shutdown();  // M9-b：释放 HLS 的切片器/订阅者/源句柄（不等租约到期）
+    }
     InfoP("已退出");
     // 退出前把日志队列刷干净：异步模式下"最后几行"可能还在队列/用户态缓冲里，
     // 不 flush 就会出现"日志文件里看不到退出原因"这种最要命的缺失（M7 实测踩到）

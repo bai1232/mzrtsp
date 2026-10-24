@@ -102,9 +102,13 @@ public:
     uint64_t pcrCount() const {
         return _pcr_count;
     }
-    /// 最近一个包的 dts（90kHz，33 bit）
+    /// 最近一个包的 dts（90kHz，33 bit，**含起点偏移**）
     uint64_t lastDts90k() const {
         return _last_dts90k;
+    }
+    /// 负时间戳被钳到 0 的次数（正常应为 0；非 0 说明源时间轴有负值）
+    uint64_t negativeTsClamped() const {
+        return _negative_ts_clamped;
     }
 
 private:
@@ -137,6 +141,13 @@ private:
     uint64_t _sps_pps_injected = 0;
     uint64_t _pcr_count = 0;
     uint64_t _last_dts90k = 0;
+    /// 时间轴起点偏移（90kHz 刻度）：**不要从 0 开始**。
+    /// 为什么：ffmpeg 的 mpegts demuxer 会把"首包 PTS = 0"当成 33 位回绕，吐出 2^33
+    /// （实测 `ffprobe … packet=pts` 直接给 8589934592）。ffmpeg 自己产的 TS 也从 ~1.4s 起。
+    /// 取 1s（= 90000）给播放器留出前滚空间；切片时长按 **ms 差**算，不受此偏移影响。
+    static constexpr uint64_t kStartOffset90k = 90000;
+    /// 负时间戳（部分 MP4 的编辑列表会给负 dts）被钳到 0 的次数
+    uint64_t _negative_ts_clamped = 0;
 };
 
 } // namespace mzmedia

@@ -34,6 +34,19 @@
 
 namespace mzmedia {
 
+/**
+ * 把**内存里的一段字节**当作静态资源发出去（M9-b）
+ * @param body 响应正文；@param mime Content-Type
+ * @return true = 已按 206/416 处理；false = 按 200 全量返回
+ *
+ * 为什么暴露它：`/hls/<name>-<seq>.ts` 的切片在内存里（不是文件），但 FR-4.2 要求
+ * 切片与静态文件一样支持 `Range`。把 HttpServer 里已经过 `http_test.sh` 验证的那段
+ * 单区间 Range 逻辑（多区间/后缀区间 → 忽略回 200 + Warn；起点越界 → 416）复用出来，
+ * 好过在 app 里再写一份（那必然与 HTTP 层的实现漂移）。
+ */
+bool serveMemoryAsStatic(const HttpParser &req, HttpResponse &resp, const std::string &body,
+                         const std::string &mime);
+
 /// 请求处理函数：拿到已解析的请求，填响应。
 /// 抛异常 → 服务器回 500 并计数（不会把事件循环带崩）
 using HttpHandler = std::function<void(const HttpParser &req, HttpResponse &resp)>;
