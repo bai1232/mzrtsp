@@ -55,6 +55,8 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_transcoder.cpp
         # ---- v0.2.3 流水线分段（用例名 pipeline_*）----
         ${CMAKE_CURRENT_SOURCE_DIR}/test_pipeline_stages.cpp
+        # ---- v0.3-a RTSP 输入（用例名 rtsp_*，不依赖网络）----
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_rtsp_input.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS
@@ -120,6 +122,8 @@ set(MZMEDIA_TEST_GROUPS
         # ---- v0.2.3 流水线分段（SourceSession / PacketStage）----
         # 同步调用、只用真样本（sample.mp4 / sample.ts / bf.mp4）→ 严格组。
         pipeline
+        # ---- v0.3-a RTSP（纯逻辑：URL 判定 / 脱敏 / 未开启时拒绝；不联网）----
+        rtsp
         )
 
 add_executable(mzmedia_unittest ${MZMEDIA_TEST_SOURCES})

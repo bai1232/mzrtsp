@@ -26,6 +26,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
+#include <string>
 #include <string>
 #include <vector>
 
@@ -68,6 +70,25 @@ public:
     };
     enum class ReadResult { Packet, Eof, Error };
 
+    /**
+     * 【M11-a】打开选项（只有网络源用得上）
+     * @note 直接映射成 FFmpeg 的 `AVDictionary`：键名与 `ffmpeg -h demuxer=rtsp` 一致，
+     *       本项目**不另造一套名字**（免得读者要在两份文档之间翻译）。
+     *       典型键：`rtsp_transport=tcp|udp`、`stimeout=<微秒>`、`max_delay=<微秒>`。
+     */
+    struct Options {
+        std::map<std::string, std::string> av_options;
+        /**
+         * 【M11-a】要求"打开阶段就拿到视频参数"（宽高或初始化数据），否则**立刻失败**
+         * @note 为什么需要：SDP 里没有 `sprop-parameter-sets` 时，`avformat_find_stream_info`
+         *       会产生**零个可解析的包**（H264 没有 SPS/PPS 就出不来帧）→ 它既不达 probesize
+         *       也不达 analyzeduration，只能**空转到超时**（实测白等 5–10 s）。
+         *       网络源的参数本来就在 SDP（DESCRIBE）里，所以"打开后就该有"，没有就是没有。
+         *       **本地文件保持默认 false**：MKV/TS 的宽高本来就得靠 find_stream_info 才能确定。
+         */
+        bool require_header_parameters = false;
+    };
+
     Demuxer();
     explicit Demuxer(const Limits &limits);
     ~Demuxer();
@@ -76,6 +97,9 @@ public:
 
     /// @return false = 打不开 / 拿不到流信息 / 超时 / 流数超限（原因见 lastError()，已记日志）
     bool open(const std::string &path);
+    /// 【M11-a】带**打开选项**的重载（网络源：rtsp_transport / stimeout / max_delay …）
+    /// @note 新增重载而不是改原签名：老的调用方（本地文件）一行都不用动
+    bool open(const std::string &path, const Options &options);
     bool opened() const;
     const std::string &path() const;
 

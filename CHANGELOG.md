@@ -5,7 +5,43 @@
 
 ## [Unreleased]
 
-（下一版内容：v0.3 计划见 [docs/ROADMAP.md](docs/ROADMAP.md)）
+（v0.3.0 进行中：**M11-a1 已完成**（RTSP 能连、能拉）；a2 断流重连 / a3 1 小时验收待做。
+设计见 [docs/DESIGN_M11.md](docs/DESIGN_M11.md)）
+
+### Added（**M11-a1：RTSP 输入**，v0.3-a 的第一批）
+- `--rtsp <url>[#name]`（可重复）：把 RTSP 源注册成 `/live/<name>.flv` 与 `/hls/<name>.m3u8`
+  可直接拉的一路源；`--rtsp-timeout-ms`（默认 10000）、`--rtsp-transport auto|tcp|udp`（默认 auto）。
+  **入口只来自命令行**，绝不从 URL query 取地址（SSRF）。
+- `Demuxer::open(path, options)` **新增重载**（老调用方零影响）：把选项交给 FFmpeg
+  （`rtsp_transport` / `stimeout` / `analyzeduration` / `probesize`），未被消费的选项会 **Warn**
+  （拼错的键不再静默）。`Options::require_header_parameters`（网络源专用）：SDP 没给视频参数时
+  **当场失败**，而不是让 `find_stream_info` 空转到超时 —— 实测把"缺 SPS/PPS"的失败耗时从
+  **10.07 s 降到 11 ms**。
+- 网络源用**自己的超时档**（`SourceManager` 按 URL 判定后覆盖 `read_timeout_ms` / `open_timeout_ms`）。
+- 前置校验：宽高为 0 或 H264 无 extradata → **明确拒绝**并点名 `sprop-parameter-sets`。
+- `/api/stats` 增每源 `rtsp` 段：`{enabled,state,url,connects,reconnects,attempts,backoff_ms,last_packet_age_ms}`
+  （本地文件源是 `null`，不造假字段）。
+- **凭据脱敏**：`redactMediaUrl()` 用在**所有出口** —— `Demuxer`/`SourceSession`/`DemuxerProducer`
+  的错误信息、`SourceManager` 的日志与 stats、`HlsService` 的日志、启动横幅。HTTP 响应会把
+  `lastError()` 原样带给客户端，所以只脱敏日志是不够的。
+
+### Added（验收工具，**入库**）
+- `scripts/rtsp_fake_server.py`：最小 RTSP 服务端（**零第三方依赖**，python3 标准库）。
+  能注入：正常流 / `--tcp-only`（UDP SETUP 回 461）/ `--no-sprop`（SDP 缺参数集）/
+  `--after close|silent|hold`（断流与半开）/ `--loop`（关键帧周期性出现，供 HLS 切片）。
+  文档里写明**它能证明什么、不能证明什么**（不能替代真机的时间戳/丢包/鉴权）。
+- `scripts/rtsp_test.sh`（**22 项**）：正常源拉 FLV（`ffprobe` + `ffmpeg` 双判）、同源出 HLS 切片、
+  `/api/stats` 的 `rtsp` 段、**缺参数集 11 ms 当场拒绝**、TCP-only 源自动回退、未注册名字 404、
+  **凭据脱敏**（日志与 stats 里没有明文密码、能看到 `user:***@`）。
+- `tests/test_rtsp_input.cpp`（`rtsp` 组 **3 例**）：URL 判定；脱敏 7 组用例（含"只有用户名"、
+  "密码里带 @"、"本地路径必须 no-op"）；**未开 `--rtsp` 时用不可达 URL 也不联网**、
+  且错误信息里不含密码。
+
+### Tests / 门禁
+- **297 用例 / 26 分组**（原 294 / 25，新增 `rtsp` 组 3 例）；ASAN **26/26**；
+  TSAN **391 用例真问题 0**；脚本全绿（含新增的 `rtsp` 22 项与等价性 11 项）。
+- `transcode_test.sh` 的 NFR-5 速度改为"第一次 <1.0x 就复测一次、取较好值并打印两次数字"
+  （那一轮门禁机器被抢，实测过一次 0.46x；空闲复测 3.95x —— 真回归两次都会低）。
 
 ## [0.2.3] - 2026-10-25
 

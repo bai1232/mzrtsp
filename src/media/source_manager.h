@@ -58,6 +58,8 @@ public:
         Throttle::Config throttle;        // FR-3.5：默认开、1 倍速（压测/单测可调 speed）
         MediaSource::Limits source;       // 每源的队列 / GOP / 人数上限（推导值在 Limits 里）
         DemuxerProducer::Config producer; // 解封装上限（流数 / 单包 / 超时 / 循环重开）
+        /// 【M11-a】RTSP（网络源）：开关、超时、传输方式 —— 由 app 从命令行填
+        DemuxerProducer::RtspConfig rtsp;
         /// 【M10-b / FR-1.3】同时最多几路源在转码
         /// @note **0 非法**（它不是"不限"）：转码吃满 CPU 会让整台机器不可用，
         ///       所以这是硬上限；应用层按 `nproc-1` 给初值，脚本可调小做确定性验收

@@ -157,9 +157,31 @@ public:
 
 | 批次 | 内容 | 验收 |
 |---|---|---|
-| **M11-a1**：能连上、能拉 | `Demuxer::open(path, options)` 重载 + 网络流 Limits 档 + §4.2 选项 + §4.8 前置校验 + `--rtsp` 入口 + `rtsp` 观测字段（状态恒 `playing`） | 假服务端 4 场景（UDP / TCP-only / 无 SPS-PPS / 关连接）；`ffprobe`/`ffmpeg` 从 `/live/<name>.flv` 拉到合法 FLV；`hls` 也能切 |
+| **M11-a1 ✅ 已完成**：能连上、能拉 | `Demuxer::open(path, options)` 重载 + 网络流 Limits 档 + §4.2 选项 + §4.8 前置校验 + `--rtsp` 入口 + `rtsp` 观测字段（状态恒 `playing`） | 假服务端 4 场景（UDP / TCP-only / 无 SPS-PPS / 关连接）；`ffprobe`/`ffmpeg` 从 `/live/<name>.flv` 拉到合法 FLV；`hls` 也能切 |
 | **M11-a2**：断流能自愈 | `ReconnectPolicy`（新文件）+ `SourceSession` 接入 + 时间戳接续 + 状态机 + 退避日志 | 假服务端：`--after close` / `--after silent` → 自动重连、观众不掉线、重连后 dts 严格递增；退避序列可断言（日志或 stats） |
 | **M11-a3**：验收与收尾 | `scripts/rtsp_test.sh`（假服务端驱动，含"半开"场景）+ 入库假服务端 + 文档（TESTING/ROADMAP/ACCEPTANCE）+ 全量门禁 | 脚本全绿；`refactor_equiv_check.sh` 11/11（证明本地文件路径零影响）；1 小时长跑（RTSP 源） |
+
+## 5.1 M11-a1 实测记录（2026-10-25）
+
+| 项 | 结果 |
+|---|---|
+| 正常源 → `/live/cam1.flv` | **200**，`ffprobe` 认 `h264 320x240`，`ffmpeg -f null -` **零 error** |
+| 同源 → `/hls/cam1.m3u8` | 播放列表有切片（假源需 `--loop` 让关键帧周期出现），切片 `h264` 且解码零 error |
+| `/api/stats` 的 `rtsp` 段 | `state=playing`、`connects=1`、`last_packet_age_ms` 实时更新 |
+| **缺 SPS/PPS** | **11 ms** 就返回 500 + 点名 `sprop-parameter-sets`（修前：`find_stream_info` 空等到 open 超时，实测 **10.07 s**） |
+| TCP-only 源（461） | 仍能拉（FFmpeg 自动回退 TCP） |
+| 未注册名字 | 404（URL 不能从请求注入） |
+| **凭据脱敏** | 日志与 stats 均无明文密码；日志里可见 `user:***@` |
+| 脚本 | `scripts/rtsp_test.sh` **22/22**；`scripts/rtsp_fake_server.py` 已入库（零第三方依赖） |
+
+实现要点（与设计的两处偏差，都是**改进**）：
+1. `Demuxer::Options::require_header_parameters`（设计里没有）：网络源在**打开阶段**就要求有
+   视频参数，否则立刻失败 —— 否则 `find_stream_info` 会因为"H264 没有 SPS/PPS 解不出帧"
+   而**既不达 probesize 也不达 analyzeduration**，只能空转到超时（实测 10 s）。
+   本地文件默认关闭，行为不变（MKV/TS 的宽高本来就得靠 `find_stream_info`）。
+2. 脱敏从"日志"扩到"**所有出口**"：`SourceSession::setError` / `DemuxerProducer::setError`
+   / `SourceManager` 的日志与 stats / `HlsService` 的日志 —— 因为 HTTP 响应会把
+   `lastError()` 原样带给客户端。
 
 ## 6. 测试计划
 

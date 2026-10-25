@@ -169,6 +169,20 @@ std::string exeName();
  */
 bool fileExists(const std::string &path);
 
+/**
+ * 【M11-a】是不是**网络源 URL**（`rtsp://` / `rtsps://`）
+ * @note 只判前缀，不做 URI 解析：本项目只需要区分"文件路径"与"要交给 FFmpeg 的 URL"，
+ *       多写一层解析没有收益，反而多一处可能出错的地方
+ */
+bool isNetworkMediaUrl(const std::string &path);
+
+/**
+ * 【M11-a】把 URL 里的凭据换成 `***`：`rtsp://user:pass@host/x` → `rtsp://user:***@host/x`
+ * @note 用于**日志与 `/api/stats`**；源键仍用完整 URL（否则不同凭据会撞键）。
+ *       没有凭据时原样返回（不改变任何字符）。
+ */
+std::string redactMediaUrl(const std::string &url);
+
 /// 是否是目录（判断时跟随符号链接）
 bool isDir(const std::string &path);
 

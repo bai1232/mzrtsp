@@ -63,6 +63,12 @@ public:
 
     /// @return false = 打不开（原因见 lastError()）
     bool open(const std::string &path);
+    /// 【M11-a】带打开选项的重载（网络源：rtsp_transport / stimeout …）
+    bool open(const std::string &path, const Demuxer::Options &options);
+    /// 源是不是网络源（`rtsp://` / `rtsps://`）：上层据此决定"要不要前置校验 SPS/PPS"
+    bool network() const {
+        return _network;
+    }
     /// 关闭（幂等）；@return false = 本来就没打开
     bool close();
     bool opened() const {
@@ -185,6 +191,7 @@ private:
     /// 只有源线程碰：一趟的 dts 轨迹
     std::vector<PassTrack> _pass;
     std::function<void(int64_t)> _on_seam; ///< 接缝通知（转码对齐时间轴用）
+    bool _network = false;                 ///< 网络源（rtsp://）：校验/超时的口径不同
 
     // ---- 打开时的流参数快照：循环重开时**校验**它没变（不是刷新它）----
     // 为什么不刷新：输出层持有这两份快照的裸指针（`FlvMuxer::Streams`），刷新 = 跨线程写。

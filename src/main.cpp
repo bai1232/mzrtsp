@@ -67,6 +67,9 @@ const char *kUsage =
     "  --transcode-height <n>  默认目标高度（720）：没给 h= 时当「上限」用（源更高才缩）；\n"
     "                      0 = 只重编码不缩放；显式 h= 须偶数且不高过源\n"
     "  --transcode-max <n> 同时最多几路源在转码（默认 nproc-1；0 不是「不限」，是非法）\n"
+    "  --rtsp <url>[#name] 以 RTSP 为输入（可重复；name 缺省 rtsp1、rtsp2…，用 /live/<name>.flv 拉）\n"
+    "  --rtsp-timeout-ms <n>  网络流读超时（默认 10000；> 这个时间没有包就判定断流）\n"
+    "  --rtsp-transport <t>   auto|tcp|udp（默认 auto = UDP 优先、被拒自动回退 TCP）\n"
     "  --hls-lease-ms <n>  HLS 拉流请求的租约（默认 60000；到期且没人拉就释放源，FR-1.3）\n"
     "  --log-level <l>     trace|debug|info|warn|error|fatal（默认 info）\n"
     "  --log-file <path>   日志文件（默认 logs/mzmedia.log，64MB×5 滚动；FR-6.2）\n"
@@ -76,6 +79,8 @@ const char *kUsage =
     "  mzmedia --loop\n"
     "  curl -N http://127.0.0.1:8080/live/sample.flv | ffplay -\n"
     "  mzmedia --transcode --transcode-height 480\n"
+    "  mzmedia --rtsp rtsp://127.0.0.1:8554/live#cam1\n"
+    "  ffplay -f flv http://127.0.0.1:8080/live/cam1.flv\n"
     "  curl -N 'http://127.0.0.1:8080/live/sample.flv?transcode=1&h=480' | ffplay -\n"
     "  ffprobe -f flv http://127.0.0.1:8080/live/sample.mp4.flv   # H264 裸流也能拉\n";
 
@@ -349,6 +354,12 @@ int main(int argc, char **argv) {
     double speed = 1.0;
     uint32_t hls_lease_ms = 60000;   // FR-1.3 的 60s 同量级；可调是为了让验收脚本能验"租约到期释放"
     LogLevel level = LogLevel::Info;
+    // 【M11-a】RTSP 输入：命令行注册"名字 → URL"（**绝不**从 URL query 取地址，避免 SSRF）
+    bool rtsp_enabled = false;
+    int rtsp_timeout_ms = 10000;
+    DemuxerProducer::RtspConfig::Transport rtsp_transport =
+        DemuxerProducer::RtspConfig::Transport::Auto;
+    std::vector<std::pair<std::string, std::string>> rtsp_sources; // (name, url)
     // 【M10-b / FR-7.1】转码：默认**关**（不带 --transcode 时行为与 v0.1 完全一致）
     bool transcode_allowed = false;
     int transcode_height = 720;      // 默认把 1080p 降到 720p（NFR-5 的口径）
@@ -407,6 +418,54 @@ int main(int argc, char **argv) {
                 return 2;
             }
             transcode_max = static_cast<uint32_t>(parsed);
+        } else if (key == "--rtsp") {
+            const std::string raw = value();
+            // 形式：<url>[#<name>]；名字只允许 [A-Za-z0-9_.-]（与 /live/ 同一套白名单）
+            std::string url = raw;
+            std::string name;
+            const size_t hash = raw.rfind('#');
+            if (hash != std::string::npos) {
+                url = raw.substr(0, hash);
+                name = raw.substr(hash + 1);
+            }
+            if (!isNetworkMediaUrl(url)) {
+                std::fprintf(stderr, "--rtsp 只接受 rtsp:// 或 rtsps:// 开头的 URL：%s\n", raw.c_str());
+                return 2;
+            }
+            if (name.empty()) {
+                name = "rtsp" + std::to_string(rtsp_sources.size() + 1);
+            }
+            if (!validMediaName(name)) {
+                std::fprintf(stderr, "--rtsp 的名字非法：%s（只允许 [A-Za-z0-9_.-]）\n", name.c_str());
+                return 2;
+            }
+            for (const auto &item : rtsp_sources) {
+                if (item.first == name) {
+                    std::fprintf(stderr, "--rtsp 名字重复：%s\n", name.c_str());
+                    return 2;
+                }
+            }
+            rtsp_sources.emplace_back(name, url);
+            rtsp_enabled = true;
+        } else if (key == "--rtsp-timeout-ms") {
+            const int parsed = std::atoi(value());
+            if (parsed < 2000 || parsed > 60000) {
+                std::fprintf(stderr, "--rtsp-timeout-ms 非法：应为 2000..60000（0 不是「不限」）\n");
+                return 2;
+            }
+            rtsp_timeout_ms = parsed;
+        } else if (key == "--rtsp-transport") {
+            const std::string text = value();
+            if (text == "auto") {
+                rtsp_transport = DemuxerProducer::RtspConfig::Transport::Auto;
+            } else if (text == "tcp") {
+                rtsp_transport = DemuxerProducer::RtspConfig::Transport::Tcp;
+            } else if (text == "udp") {
+                rtsp_transport = DemuxerProducer::RtspConfig::Transport::Udp;
+            } else {
+                std::fprintf(stderr, "--rtsp-transport 非法：%s（auto|tcp|udp）\n", text.c_str());
+                return 2;
+            }
         } else if (key == "--hls-lease-ms") {
             const int parsed = std::atoi(value());
             if (parsed < 500 || parsed > 3600000) {
@@ -478,6 +537,10 @@ int main(int argc, char **argv) {
     manager_config.throttle.speed = speed;
     manager_config.producer.loop = loop;
     manager_config.max_transcoding = transcode_max; // FR-1.3：转码并发是硬上限，0 会被拒
+    // 【M11-a】RTSP：开关 + 网络流超时 + 传输方式
+    manager_config.rtsp.enabled = rtsp_enabled;
+    manager_config.rtsp.timeout_ms = rtsp_timeout_ms;
+    manager_config.rtsp.transport = rtsp_transport;
     if (!manager->setConfig(manager_config)) {
         ErrorP("SourceManager 配置非法（speed=%f loop=%d max_transcoding=%u）", speed, loop ? 1 : 0,
                transcode_max);
@@ -503,8 +566,8 @@ int main(int argc, char **argv) {
         });
         // 必须在 start() 之前注册 /hls/：HttpServer::start() 里的 501 占位有 findHandler 守卫
         if (!server->setPrefixRoute(
-                "/hls/", [manager, hls, media_root, transcode_allowed, transcode_height](
-                             const HttpParser &req, HttpResponse &resp) {
+                "/hls/", [manager, hls, media_root, transcode_allowed, transcode_height,
+                          rtsp_sources](const HttpParser &req, HttpResponse &resp) {
                     // 【M10-c】HLS 也支持转码：`/hls/<name>.m3u8?transcode=1&h=720`
                     // 切片 URI 会带上**同一份**查询串（见 HlsService），播放器照抄即可
                     SourceManager::TranscodeSpec spec;
@@ -535,6 +598,13 @@ int main(int argc, char **argv) {
                         resp.setStatus(404);
                         resp.setBody("404 Not Found：" + why + "\n");
                         return;
+                    }
+                    // 【M11-a】RTSP 源：名字命中注册表 → 用 URL（与 /live/ 同一套规则）
+                    for (const auto &item : rtsp_sources) {
+                        if (item.first == name) {
+                            path = item.second;
+                            break;
+                        }
                     }
                     std::string body;
                     std::string error;
@@ -568,7 +638,7 @@ int main(int argc, char **argv) {
     // 所以**在 start() 之前**注册就能覆盖它（见 docs/DESIGN_M6.md §3.4）
     if (!server->setPrefixRoute(
             "/live/",
-            [poller, manager, media_root, transcode_allowed, transcode_height](
+            [poller, manager, media_root, transcode_allowed, transcode_height, rtsp_sources](
                 const HttpParser &req, HttpResponse &resp) {
                 std::string name;
                 std::string path;
@@ -579,7 +649,16 @@ int main(int argc, char **argv) {
                                  "也支持 .h264/.mkv/.ts/.aac）\n");
                     return;
                 }
-                if (!fileExists(path)) {
+                // 【M11-a】RTSP 源：名字命中命令行注册表 → 用 URL 取代文件路径（**跳过 fileExists**）
+                bool is_rtsp = false;
+                for (const auto &item : rtsp_sources) {
+                    if (item.first == name) {
+                        path = item.second;
+                        is_rtsp = true;
+                        break;
+                    }
+                }
+                if (!is_rtsp && !fileExists(path)) {
                     resp.setStatus(404);
                     resp.setBody("404 Not Found：没有这个媒体文件（" + name + "）\n");
                     return;
@@ -758,6 +837,14 @@ int main(int argc, char **argv) {
     }
     std::printf("  命令行拉流: curl -N http://127.0.0.1:%u/live/sample.flv | ffplay -\n",
                 static_cast<unsigned>(server->port()));
+    if (!rtsp_sources.empty()) {
+        std::printf("  RTSP 输入 :\n");
+        for (const auto &item : rtsp_sources) {
+            std::printf("    %-10s %s\n", item.first.c_str(), redactMediaUrl(item.second).c_str());
+        }
+        std::printf("               拉流：/live/%s.flv 或 /hls/%s.m3u8\n",
+                    rtsp_sources.front().first.c_str(), rtsp_sources.front().first.c_str());
+    }
     std::printf("  Ctrl-C 退出\n\n");
     std::fflush(stdout);
 

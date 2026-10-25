@@ -225,7 +225,7 @@ std::shared_ptr<HlsService::Entry> HlsService::acquireEntry(
         }
         _entries.emplace(key, entry);
     }
-    InfoP("HlsService[%s]: 已创建 HLS 流（源 %s%s）", key.c_str(), path.c_str(),
+    InfoP("HlsService[%s]: 已创建 HLS 流（源 %s%s）", key.c_str(), redactMediaUrl(path).c_str(),
           spec.enabled ? "，转码" : "");
     return entry;
 }

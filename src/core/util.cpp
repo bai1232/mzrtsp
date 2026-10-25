@@ -276,6 +276,28 @@ std::string exeName() {
 // 文件系统
 // ---------------------------------------------------------------------------
 
+bool isNetworkMediaUrl(const std::string &path) {
+    return path.rfind("rtsp://", 0) == 0 || path.rfind("rtsps://", 0) == 0;
+}
+
+std::string redactMediaUrl(const std::string &url) {
+    // 凭据只在 authority 段里（`scheme://user:pass@host`）→ 先找 `://`，再找它之后的第一个 `@`
+    const size_t scheme = url.find("://");
+    if (scheme == std::string::npos) {
+        return url; // 不是 URL（例如本地路径）：原样返回
+    }
+    const size_t at = url.find('@', scheme + 3);
+    if (at == std::string::npos) {
+        return url; // 没有凭据
+    }
+    const size_t colon = url.find(':', scheme + 3);
+    if (colon == std::string::npos || colon > at) {
+        // 只有 user 没有 password（`user@host`）：也把 user 隐掉，避免泄露账号
+        return url.substr(0, scheme + 3) + "***" + url.substr(at);
+    }
+    return url.substr(0, colon + 1) + "***" + url.substr(at);
+}
+
 bool fileExists(const std::string &path) {
     struct stat st;
     return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);

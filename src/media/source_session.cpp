@@ -61,6 +61,10 @@ int64_t SourceSession::estimateFrameDurationMs(const StreamInfo &info) {
 }
 
 bool SourceSession::open(const std::string &path) {
+    return open(path, Demuxer::Options{});
+}
+
+bool SourceSession::open(const std::string &path, const Demuxer::Options &options) {
     if (path.empty()) {
         setError("path 为空");
         ErrorL << "SourceSession::open 失败：" << lastError();
@@ -71,11 +75,12 @@ bool SourceSession::open(const std::string &path) {
         ErrorL << "SourceSession::open 失败：" << lastError();
         return false;
     }
-    if (!_demux.open(path)) {
+    if (!_demux.open(path, options)) {
         setError(_demux.lastError()); // 不吞掉下层原因
         return false;
     }
     _path = path;
+    _network = isNetworkMediaUrl(path);
     _opened_at_ms.store(static_cast<int64_t>(getCurrentMillisecond()));
     _loop_offset_ms.store(0);
     _pass.assign(_demux.streams().size(), PassTrack{});

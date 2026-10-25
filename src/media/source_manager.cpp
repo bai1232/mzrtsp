@@ -156,7 +156,7 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path, const Transcode
                               std::to_string(config.max_transcoding) +
                               " 路）——不降级成直通（那会给出一路「没转」的流）";
                 ++_total_transcode_rejected;
-                WarnL << "SourceManager::acquire 被拒：" << key << " → " << _last_error;
+                WarnL << "SourceManager::acquire 被拒：" << redactMediaUrl(key) << " → " << _last_error;
                 return nullptr;
             }
         }
@@ -169,6 +169,16 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path, const Transcode
     fresh->spec = spec;
     // 转码规格就地并进解封装配置：producer 是**唯一**知道怎么转的那一层
     DemuxerProducer::Config producer_config = config.producer;
+    // 【M11-a】网络源用**自己的超时档**：一次读超过 rtsp.timeout_ms 没有包 = 断流。
+    // 本地文件沿用原来的 5s（读磁盘不会"静默"这么久；网络会）。
+    producer_config.rtsp = config.rtsp;
+    if (isNetworkMediaUrl(path) && config.rtsp.timeout_ms > 0) {
+        producer_config.demux.read_timeout_ms = config.rtsp.timeout_ms;
+        // 打开（DESCRIBE/SETUP/PLAY + find_stream_info）也要给足时间：实测一步就要 1.1 s
+        if (producer_config.demux.open_timeout_ms < config.rtsp.timeout_ms) {
+            producer_config.demux.open_timeout_ms = config.rtsp.timeout_ms;
+        }
+    }
     producer_config.transcode.enabled = spec.enabled;
     producer_config.transcode.out_height = spec.out_height;
     producer_config.transcode.max_height = spec.max_height;
@@ -181,7 +191,7 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path, const Transcode
             _last_error = reason;
         }
         ++_total_acquire_rejected;
-        WarnL << "SourceManager::acquire 失败（不注册源）：" << key << " → " << reason;
+        WarnL << "SourceManager::acquire 失败（不注册源）：" << redactMediaUrl(key) << " → " << reason;
         return nullptr;
     }
 
@@ -213,7 +223,7 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path, const Transcode
             _last_error = "源线程启动失败";
         }
         ++_total_acquire_rejected;
-        WarnL << "SourceManager::acquire 失败：源线程启动失败（" << key << "）";
+        WarnL << "SourceManager::acquire 失败：源线程启动失败（" << redactMediaUrl(key) << "）";
         return nullptr;
     }
 
@@ -239,7 +249,7 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path, const Transcode
         ++_total_created;
     }
 
-    InfoL << "源已创建（懒启动）：" << key; // FR-6.3：关键事件（源创建）必须落日志
+    InfoL << "源已创建（懒启动）：" << redactMediaUrl(key); // FR-6.3：关键事件（源创建）必须落日志
     return makeHandle(fresh);
 }
 
@@ -325,7 +335,7 @@ void SourceManager::onHandleReleased(const std::string &key) {
         // poller 已退出：**绝不能静默"永不释放"**（那就是泄漏）→ 退化为立即释放
         // （poller 都没了 = 正在关停，"保证观看"已无意义，所以这里不看订阅者）
         ++_total_idle_schedule_failed;
-        WarnL << "SourceManager：poller 已退出，源 " << key << " 退化为立即释放";
+        WarnL << "SourceManager：poller 已退出，源 " << redactMediaUrl(key) << " 退化为立即释放";
         releaseEntry(key, true);
     }
 }
@@ -359,7 +369,7 @@ void SourceManager::armIdleTimer(const std::string &key) {
     });
     if (!task) {
         ++_total_idle_schedule_failed;
-        WarnL << "SourceManager：定时器被拒（poller 已退出），源 " << key << " 立即释放";
+        WarnL << "SourceManager：定时器被拒（poller 已退出），源 " << redactMediaUrl(key) << " 立即释放";
         releaseEntry(key, true);
         return;
     }
@@ -426,7 +436,7 @@ bool SourceManager::tryIdleRelease(const std::string &key, uint32_t idle_ms) {
     } else {
         scheduleIdleRecheck(key, idle_ms);
     }
-    InfoL << "源 " << key << " 空闲计时到期，但还有 " << viewers << " 个订阅者在看 → 推迟释放（第 "
+    InfoL << "源 " << redactMediaUrl(key) << " 空闲计时到期，但还有 " << viewers << " 个订阅者在看 → 推迟释放（第 "
           << _total_idle_deferred.load() << " 次）";
     return false;
 }
@@ -447,7 +457,7 @@ void SourceManager::scheduleIdleRecheck(const std::string &key, uint32_t delay_m
         });
     if (!task) {
         ++_total_idle_schedule_failed;
-        WarnL << "SourceManager：复查定时器被拒（poller 已退出），源 " << key
+        WarnL << "SourceManager：复查定时器被拒（poller 已退出），源 " << redactMediaUrl(key)
               << " 留到 releaseAll() 再回收";
         return;
     }
@@ -514,9 +524,9 @@ void SourceManager::releaseEntry(const std::string &key, bool idle_triggered) {
     stopEntry(entry); // 锁外：join 可能耗时
 
     if (idle_triggered) {
-        InfoL << "源空闲释放：" << key; // FR-6.3：关键事件（源释放）必须落日志
+        InfoL << "源空闲释放：" << redactMediaUrl(key); // FR-6.3：关键事件（源释放）必须落日志
     } else {
-        InfoL << "源已释放：" << key;
+        InfoL << "源已释放：" << redactMediaUrl(key);
     }
 }
 
@@ -632,7 +642,8 @@ std::string SourceManager::dumpStatsJson() const {
             out += ",";
         }
         first = false;
-        out += "{\"path\":\"" + jsonEscape(item.file) + "\",\"key\":\"" + jsonEscape(item.key) +
+        out += "{\"path\":\"" + jsonEscape(redactMediaUrl(item.file)) + "\",\"key\":\"" +
+               jsonEscape(redactMediaUrl(item.key)) +
                "\"," + item.source->dumpStatsJson();
         // M6-c：把"输入侧"的信息也带上（解码/循环/Annex-B 是否发生，一眼能看出来）
         if (item.producer) {
@@ -648,6 +659,8 @@ std::string SourceManager::dumpStatsJson() const {
             out += ",\"skipped_unknown\":" + std::to_string(p.skippedUnknownStreams());
             out += ",\"ts_failures\":" + std::to_string(p.timestampFailures());
             // 【v0.2.1】时间戳守卫的观测：pts 乱序是 B 帧的正常现象（不改正数据），dts 钳制才异常
+            // 【M11-a】RTSP 状态（本地文件源是 null）
+            out += ",\"rtsp\":" + p.rtspStatsJson();
             out += ",\"ts\":{\"pts_out_of_order\":" + std::to_string(p.ptsOutOfOrder());
             out += ",\"dts_clamped\":" + std::to_string(p.dtsClamped()) + "}";
             out += ",\"annex_b_video\":" + std::string(p.annexBVideo() ? "true" : "false");

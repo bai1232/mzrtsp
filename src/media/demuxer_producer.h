@@ -60,10 +60,23 @@ public:
         int max_out_packets = 64;
     };
 
+    /// 【M11-a】RTSP 输入（网络源）的开关与打开参数
+    struct RtspConfig {
+        /// 默认 **关**：不带 `--rtsp` 时，`rtsp://` 源一律明确拒绝（不静默尝试联网）
+        bool enabled = false;
+        /// 网络流的读超时（毫秒）：一次读超过这么久没有包 = 断流（默认 10s，见 DESIGN_M11 §4.3）
+        int timeout_ms = 10000;
+        /// 传输方式：`auto`（FFmpeg 默认：UDP 优先、被拒自动回退 TCP）/ `tcp` / `udp`
+        enum class Transport { Auto = 0, Tcp = 1, Udp = 2 };
+        Transport transport = Transport::Auto;
+    };
+
     struct Config {
         Demuxer::Limits demux; ///< 流数 / 单包 / open 与 read 超时
         /// 循环重开（M6-c）：读到文件尾把文件重新打开，时间戳接着往后接
         bool loop = false;
+        /// 【M11-a】RTSP（网络源）
+        RtspConfig rtsp;
         /// 【M10-b】转码
         TranscodeConfig transcode;
         /// 兼容别名：老代码写 `Config::Transcode` 的地方继续可用
@@ -144,6 +157,13 @@ public:
     bool transcodeScaling() const;
     /// JSON 片段（不含外层花括号）：供 `/api/stats` 直接拼接
     std::string transcodeStatsJson() const;
+    /// 【M11-a】`"rtsp":{...}` 或 `"rtsp":null`（本地文件源）
+    std::string rtspStatsJson() const;
+
+    /// 是不是网络源（`rtsp://`）；非网络源时 `rtspStatsJson()` 返回 `null`
+    bool networkSource() const {
+        return _network;
+    }
 
     std::string lastError() const;
 
@@ -183,6 +203,10 @@ private:
     bool _has_audio_info = false;
     bool _annexb_video = false;
     bool _adts_audio = false;
+
+    // ---- 【M11-a】网络源状态（a1：只有 playing；a2 起有 reconnecting/failed）----
+    bool _network = false;
+    int64_t _last_packet_ms = 0; ///< 最近一次读到包的时刻（`last_packet_age_ms` 用）
 };
 
 } // namespace mzmedia

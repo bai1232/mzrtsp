@@ -140,6 +140,23 @@ bool DemuxerProducer::transcodeVfr() const {
 bool DemuxerProducer::transcodeScaling() const {
     return _transcode != nullptr && _transcode->scaling();
 }
+std::string DemuxerProducer::rtspStatsJson() const {
+    if (!_network) {
+        return "null"; // 本地文件源：没有这个字段的内容（不制造假数据）
+    }
+    const int64_t now = static_cast<int64_t>(getCurrentMillisecond());
+    const int64_t age = (_last_packet_ms > 0 && now > _last_packet_ms) ? (now - _last_packet_ms) : 0;
+    std::string out = "{\"enabled\":true,\"state\":\"playing\"";
+    out += ",\"url\":\"" + redactMediaUrl(_session.path()) + "\"";
+    out += ",\"connects\":1";      // a1：只有首次连接；a2 起由重连策略维护
+    out += ",\"reconnects\":0";
+    out += ",\"attempts\":0";
+    out += ",\"backoff_ms\":0";
+    out += ",\"last_packet_age_ms\":" + std::to_string(age);
+    out += "}";
+    return out;
+}
+
 std::string DemuxerProducer::transcodeStatsJson() const {
     if (_transcode == nullptr) {
         return "\"enabled\":false,\"in_hevc\":false,\"out_width\":0,\"out_height\":0,"
@@ -254,9 +271,81 @@ bool DemuxerProducer::buildChains() {
 }
 
 bool DemuxerProducer::open(const std::string &path) {
-    if (!_session.open(path)) {
+    // 【M11-a】网络源（rtsp://）：开关、超时、传输方式都在这里生效
+    _network = isNetworkMediaUrl(path);
+    Demuxer::Options options;
+    if (_network) {
+        if (!_config.rtsp.enabled) {
+            // **不静默尝试联网**：没开就是没开（否则一个拼错的 URL 会去连内网/公网）
+            setError("这个源是 RTSP（" + redactMediaUrl(path) +
+                     "），但服务端没有开启 RTSP 输入（启动时缺 --rtsp）→ 明确拒绝");
+            ErrorL << "DemuxerProducer::open 失败：" << lastError();
+            _network = false; // 不留"这是网络源"的半状态（统计/校验都不该看见它）
+            return false;
+        }
+        switch (_config.rtsp.transport) {
+        case RtspConfig::Transport::Tcp:
+            options.av_options["rtsp_transport"] = "tcp";
+            break;
+        case RtspConfig::Transport::Udp:
+            options.av_options["rtsp_transport"] = "udp";
+            break;
+        case RtspConfig::Transport::Auto:
+            break; // 不设 = FFmpeg 默认（UDP 优先、被拒自动回退 TCP，实测过）
+        }
+        if (_config.rtsp.timeout_ms > 0) {
+            // FFmpeg 4.4 的 socket 级 TCP I/O 超时叫 stimeout（**微秒**）；5.x 改名 timeout
+            options.av_options["stimeout"] = std::to_string(_config.rtsp.timeout_ms * 1000);
+        }
+        // 探测上限：默认 FFmpeg 会一直读到"能确定参数"为止，对端参数不全时会**烧掉整个 open 超时**
+        // （实测：SDP 缺 sprop-parameter-sets 时白等 5.1 s）。网络源给 2 s 就够拿到 SDP 里的参数了。
+        // 参数本来就在 SDP 里（DESCRIBE），探测只需要一小段：给 1 s / 0.5 MB
+        options.av_options["analyzeduration"] = "1000000";
+        options.av_options["probesize"] = "500000";
+        // 参数没有就当场失败（否则 find_stream_info 空转到 open 超时，实测白等 5–10 s）
+        options.require_header_parameters = true;
+        InfoP("DemuxerProducer: 打开 RTSP 源 %s（transport=%s，读超时 %d ms）",
+              redactMediaUrl(path).c_str(),
+              _config.rtsp.transport == RtspConfig::Transport::Tcp    ? "tcp"
+              : _config.rtsp.transport == RtspConfig::Transport::Udp  ? "udp"
+                                                                              : "auto",
+              _config.rtsp.timeout_ms);
+    } else {
+        options = Demuxer::Options{};
+    }
+
+    if (!_session.open(path, options)) {
         setError(_session.lastError()); // 不吞掉下层原因
+        if (_network) {
+            // 网络源的错误信息里也可能带凭据 → 脱敏后再落日志
+            const std::string safe = redactMediaUrl(lastError());
+            ErrorL << "DemuxerProducer::open 失败（网络源）：" << safe;
+        }
         return false;
+    }
+    // 【M11-a】网络源的**前置校验**（DESIGN_M11 §4.8）：宁可现在拒绝，也不要让观众拿到 415 黑盒
+    if (_network) {
+        const StreamInfo *video = _session.firstVideo();
+        if (video != nullptr) {
+            if (video->width <= 0 || video->height <= 0) {
+                setError("对端没有给出可用的视频参数（宽高 = " + std::to_string(video->width) + "x" +
+                         std::to_string(video->height) +
+                         "）→ 明确拒绝：多半是 SDP 缺 sprop-parameter-sets / 码流里没有 SPS-PPS");
+                (void) _session.close();
+                _network = false;
+                ErrorL << "DemuxerProducer::open 失败：" << lastError();
+                return false;
+            }
+            if (video->codec_id == AV_CODEC_ID_H264 &&
+                (!video->extradata || video->extradata->empty())) {
+                setError("对端没有给出 SPS/PPS（SDP 缺 sprop-parameter-sets）→ 构造不出 avcC，"
+                         "明确拒绝（不去码流里猜参数集）");
+                (void) _session.close();
+                _network = false;
+                ErrorL << "DemuxerProducer::open 失败：" << lastError();
+                return false;
+            }
+        }
     }
     if (!buildChains()) {
         (void) _session.close(); // 不留半开的对象
@@ -404,6 +493,9 @@ SourcePump::ReadResult DemuxerProducer::read(MediaPacket::Ptr *packet, std::stri
         }
         if (_pending.empty()) {
             continue; // 编解码器还在攒帧（正常现象，不是错误）
+        }
+        if (_network) {
+            _last_packet_ms = static_cast<int64_t>(getCurrentMillisecond());
         }
         return servePending(packet);
     }

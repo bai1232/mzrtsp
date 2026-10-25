@@ -60,6 +60,10 @@ const std::atomic<bool> *Demuxer::setAbortFlag(const std::atomic<bool> *flag) {
 }
 
 bool Demuxer::open(const std::string &path) {
+    return open(path, Options{});
+}
+
+bool Demuxer::open(const std::string &path, const Options &options) {
     if (opened()) {
         _last_error = "已经打开过，需先销毁再开新文件";
         ErrorP("Demuxer: open 在已打开状态下调用");
@@ -75,7 +79,27 @@ bool Demuxer::open(const std::string &path) {
     ctx->interrupt_callback.opaque = this;
     _deadline_ms = static_cast<int64_t>(getCurrentMillisecond()) + _limits.open_timeout_ms;
 
-    const int err = ::avformat_open_input(&ctx, path.c_str(), nullptr, nullptr);
+    // 【M11-a】把选项交给 FFmpeg（空表 = 与以前完全一样：本地文件路径不受影响）
+    AVDictionary *av_options = nullptr;
+    for (const auto &kv : options.av_options) {
+        if (!kv.first.empty() && !kv.second.empty()) {
+            (void) ::av_dict_set(&av_options, kv.first.c_str(), kv.second.c_str(), 0);
+        }
+    }
+    const int err = ::avformat_open_input(&ctx, path.c_str(), nullptr, &av_options);
+    // FFmpeg 会把**没被消费**的选项留在表里：只 Warn 不失败（有些选项在某些协议上无意义），
+    // 但要让它可见 —— 静默忽略一个拼错的选项，排查成本比报错高得多。
+    if (av_options != nullptr) {
+        const AVDictionaryEntry *leftover = nullptr;
+        size_t leftover_count = 0;
+        while ((leftover = ::av_dict_get(av_options, "", leftover, AV_DICT_IGNORE_SUFFIX)) != nullptr) {
+            WarnP("Demuxer: 打开选项 %s=%s 没有被使用（协议不支持？键名拼错？）", leftover->key,
+                  leftover->value);
+            ++leftover_count;
+        }
+        (void) leftover_count;
+        ::av_dict_free(&av_options);
+    }
     if (err < 0) {
         ::avformat_free_context(ctx);   // 失败时 ctx 仍归我们
         _last_error = "avformat_open_input 失败: " + avErrStr(err);
@@ -83,6 +107,27 @@ bool Demuxer::open(const std::string &path) {
         return false;
     }
     _fmt.reset(ctx);   // 成功：交给 RAII（释放用 avformat_close_input）
+
+    // 【M11-a】网络源：SDP 给不出视频参数时**立刻失败**，不要空转到超时（实测会白等 5–10 s）
+    if (options.require_header_parameters) {
+        for (unsigned i = 0; i < _fmt->nb_streams; ++i) {
+            const AVCodecParameters *par = _fmt->streams[i]->codecpar;
+            if (par->codec_type != AVMEDIA_TYPE_VIDEO) {
+                continue;
+            }
+            const bool has_extra = par->extradata != nullptr && par->extradata_size > 0;
+            if ((par->width <= 0 || par->height <= 0) && !has_extra) {
+                _last_error = "打开阶段没有拿到视频参数（宽高 = " + std::to_string(par->width) + "x" +
+                              std::to_string(par->height) + "，初始化数据 " +
+                              std::to_string(par->extradata_size) +
+                              " 字节）→ 多半是 SDP 缺 sprop-parameter-sets；"
+                              "不做 find_stream_info（那会空转到超时）";
+                ErrorP("Demuxer: %s", _last_error.c_str());
+                _fmt.reset();
+                return false;
+            }
+        }
+    }
 
     _deadline_ms = static_cast<int64_t>(getCurrentMillisecond()) + _limits.open_timeout_ms;
     const int info_err = ::avformat_find_stream_info(_fmt.get(), nullptr);
