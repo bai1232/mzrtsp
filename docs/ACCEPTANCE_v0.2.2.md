@@ -102,4 +102,22 @@
 
 ### 7.1 tag 独立构建与测试（`VERSIONING.md` §5）
 
-（tag 推送后的实跑记录填在这一节。）
+tag 推送后**从本地仓库重新 clone**（不依赖工作区任何未提交改动）：
+
+```bash
+git clone --branch v0.2.2 /home/bpy/MyZltoolkit /tmp/v022_verify && cd /tmp/v022_verify
+./scripts/make_samples.sh          # 样本不入库
+cmake -B build && cmake --build build -j4
+cd build && ctest --output-on-failure
+```
+
+| 步骤 | 实测 |
+|---|---|
+| clone | `clone=0`；`HEAD=96ed5aa`；`git describe --tags` = **`v0.2.2`** |
+| `make_samples.sh` | `samples=0` |
+| `cmake -B build` + `cmake --build build -j4` | `configure=0`、`build=0`，**`warnings=0`** |
+| `ctest` | **24/24 通过**（288 用例） |
+| 单进程全量 | **288/288、63,275 断言** |
+
+> 回滚性：`git checkout v0.2.1` 能独立构建（转码只做 `/live/`、`/hls/*?transcode=1` 回到 400）；
+> `v0.2.0`/`v0.1.1` 同理。
