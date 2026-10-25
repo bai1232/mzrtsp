@@ -7,6 +7,34 @@
 
 （下一版内容：v0.3 计划见 [docs/ROADMAP.md](docs/ROADMAP.md)）
 
+## [0.2.2] - 2026-10-25
+
+> 发布证据见 **[docs/ACCEPTANCE_v0.2.2.md](docs/ACCEPTANCE_v0.2.2.md)**。
+> v0.2 里程碑的**收尾**：补上 M10-c —— 转码输出也能走 HLS（此前 `/hls/*?transcode=1` 明确 400）。
+
+### Added（**M10-c：转码 + HLS**）
+- `/hls/<name>.m3u8?transcode=1[&h=720]`：**同一个 URL 形态**，与 `/live/` 共用一套参数解析
+  （`parseTranscodeQuery`）与同一套拒绝语义 —— 未开 `--transcode` → **501**（不降级成直通）；
+  非法/未知/重复参数 → **400**；转码并发已满 → **503**；`h=720` 缺省时把 `--transcode-height`
+  当上限（与 `/live/` 完全一致）。
+- **切片 URI 带上同一份规格**（`/hls/tx.mp4-3.ts?transcode=1&h=120`）：播放器只认播放列表里
+  给出的地址，规格必须落在**每个切片**上，否则切片请求会退化成直通（画面突然变回原分辨率，
+  且服务端不报错）。`HlsWriter::Config::uri_query` 负责这件事。
+- HLS 的流键 = `HlsService::streamKey(名字, 规格)`，与 `SourceManager::sourceKey` **同构**：
+  同名不同规格 = 两条独立的 HLS 流（直通与转码可以**同时**被看）。
+- 转码 + HLS **复用** `/live/` 那条链路：`SourceManager::acquire(path, spec)`（独立源键 +
+  并发硬上限 + EOS 让出名额）→ 一行新的调度逻辑都没有。
+- `/api/stats` 的 `hls.playlists[]` 增 `key` 与 `transcode{enabled,out_height}`
+  （一个 `name` 可能对应两条流）。
+
+### Tests
+- 单测 +2（286 → 288）：`hls_slice_uri_carries_transcode_query`（每一条切片 URI 都要带规格 +
+  不带规格时的反向对照）、`hls_service_stream_key_distinguishes_transcode`（流键与源键同构）。
+- `hls_test.sh` **32 → 40 项**：新增 §10 —— 未开转码 → 501；转码 m3u8 的切片 URI 带规格；
+  切片的编码/高度（1080p → 120p）；**直通 HLS 不受影响**（同服务上仍是 1920x1080）；
+  `ffmpeg` 直接读转码 m3u8 解码 4 秒零 error；stats 里同名两条流（直通 + 转码）。
+- 变异验证：把 `uri_query` 从切片 URI 里去掉 → 用例**立红**。
+
 ## [0.2.1] - 2026-10-25
 
 > 发布证据见 **[docs/ACCEPTANCE_v0.2.1.md](docs/ACCEPTANCE_v0.2.1.md)**（修前/修后实测 + 变异验证 + 门禁）。
@@ -36,7 +64,7 @@
 - 单测 **+5 例**（281 → 286）：`ffmpeg_bframes_pts_are_preserved_and_dts_stays_monotonic`、
   `producer_bframes_pts_pass_through_unclamped`、`producer_loop_with_negative_first_dts_does_not_regress`、
   `flv_bframes_composition_time_comes_from_source`、`mpegts_negative_first_dts_is_shifted_not_clamped`。
-- `flv_http_test.sh` **96 → 101 项**：新增 §12「B 帧源」—— 25 个视频 tag 的 cts 必须与源一致、
+- `flv_http_test.sh` **96 → 104 项**：新增 §12「B 帧源」—— 25 个视频 tag 的 cts 必须与源一致、
   `ffmpeg -f null -` 零输出、`/api/stats` 的 `pts_out_of_order>0 且 dts_clamped=0`、
   **循环 + 负首 dts 的接缝不倒退**。
 - 变异验证 3 组：把 pts 钳回去 / 趟偏移退回旧公式 / TS 退回逐包钳 0 → 对应用例**全部变红**。

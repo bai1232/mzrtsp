@@ -21,6 +21,7 @@
 #include "ffmpeg/aac_util.h"
 #include "ffmpeg/h264_util.h"
 #include "media/media_packet.h"
+#include "output/hls_service.h"
 #include "output/hls_writer.h"
 
 #include <cstdint>
@@ -265,4 +266,69 @@ MZ_TEST(hls_rejects_bad_config_and_streams) {
         MZ_ASSERT_TRUE(HlsWriter::create(makeConfig(), MpegTsMuxer::Streams{nullptr, nullptr}) ==
                        nullptr);
     }
+}
+
+MZ_TEST(hls_slice_uri_carries_transcode_query) {
+    // 【M10-c】转码流的切片 URI 必须带上同一份规格（`?transcode=1&h=120`）。
+    // 为什么这条是硬要求：播放器**只认播放列表里给出的 URI**。少带一个参数，
+    // 播放器就会去请求直通切片 —— 画面突然变回原分辨率（甚至来回跳），服务端不会报错。
+    // 什么情况会红：`uri_query` 没拼进切片 URI（大小写/分隔符写错也算）。
+    StreamInfo video = makeVideoInfo();
+    HlsWriter::Config config = makeConfig();
+    config.name = "tx.mp4";
+    config.uri_query = "?transcode=1&h=120";
+    HlsWriter::Ptr writer = HlsWriter::create(config, MpegTsMuxer::Streams{&video, nullptr});
+    MZ_ASSERT_TRUE(writer != nullptr);
+    if (!writer) {
+        return;
+    }
+    (void) writer->onPacket(*videoPacket(video.index, true, 0, 0));
+    (void) writer->onPacket(*videoPacket(video.index, true, 2000, 2000));
+    writer->finish();
+
+    const std::string playlist = writer->playlist();
+    // 每一条切片 URI 都要带规格（不能只带第一条）
+    size_t pos = 0;
+    int uri_count = 0;
+    while ((pos = playlist.find("/hls/tx.mp4-", pos)) != std::string::npos) {
+        const size_t eol = playlist.find('\n', pos);
+        const std::string line = playlist.substr(pos, std::string::npos == eol ? std::string::npos
+                                                                             : eol - pos);
+        MZ_ASSERT_TRUE(line.find(".ts?transcode=1&h=120") != std::string::npos);
+        ++uri_count;
+        pos = eol == std::string::npos ? playlist.size() : eol;
+    }
+    MZ_ASSERT_EQ(uri_count, 2);   // 两片，各一条
+    // 不带 uri_query 的播放列表里不能出现参数（反向对照）
+    StreamInfo video2 = makeVideoInfo();
+    HlsWriter::Config plain = makeConfig();
+    plain.name = "plain.mp4";
+    HlsWriter::Ptr plain_writer = HlsWriter::create(plain, MpegTsMuxer::Streams{&video2, nullptr});
+    MZ_ASSERT_TRUE(plain_writer != nullptr);
+    if (plain_writer) {
+        (void) plain_writer->onPacket(*videoPacket(video2.index, true, 0, 0));
+        (void) plain_writer->onPacket(*videoPacket(video2.index, true, 2000, 2000));
+        plain_writer->finish();
+        MZ_ASSERT_TRUE(plain_writer->playlist().find('?') == std::string::npos);
+    }
+}
+
+MZ_TEST(hls_service_stream_key_distinguishes_transcode) {
+    // 【M10-c】HLS 的流键与 SourceManager 的源键同构：
+    //   不转码 = 名字本身；转码 = `名字|规格`。两条流必须能共存（同名不同规格是两条流）。
+    SourceManager::TranscodeSpec none;
+    MZ_ASSERT_STR_EQ(HlsService::streamKey("movie.mp4", none), "movie.mp4");
+
+    SourceManager::TranscodeSpec h120;
+    h120.enabled = true;
+    h120.out_height = 120;
+    MZ_ASSERT_STR_EQ(HlsService::streamKey("movie.mp4", h120), "movie.mp4|h=120");
+
+    SourceManager::TranscodeSpec src;
+    src.enabled = true;   // 只重编码，不缩放
+    MZ_ASSERT_STR_EQ(HlsService::streamKey("movie.mp4", src), "movie.mp4|src");
+
+    // 与源键一致：HlsService 与 SourceManager 用的必须是同一套描述（否则一处转一处不转）
+    MZ_ASSERT_STR_EQ(HlsService::streamKey("movie.mp4", h120),
+                     "movie.mp4|" + h120.describe());
 }

@@ -6,7 +6,7 @@
 
 | 范围内（M10-a **已完成**） | 范围内（M10-b **已完成**） | 明确不做 |
 |---|---|---|
-| `Transcoder`：H264/HEVC 解码 → `libswscale` 缩放/像素格式转换 → x264 编码（`veryfast` + `zerolatency` + 无 B 帧）→ 现场构造 `avcC` + 逐包转 AVCC | 接进 `DemuxerProducer`（视频转、音频透传）与 `SourceManager`（转码源 = 独立源键、并发硬上限、播完即让出名额）、`CodecMatrix` 的能力感知分支、`--transcode`/`--transcode-height`/`--transcode-max`、`?transcode=1&h=`、`/api/stats` 的 `transcode.speed` | 音频转码、多音轨、多码率 ABR、GPU 转码、**转码 + HLS**（M10-c） |
+| `Transcoder`：H264/HEVC 解码 → `libswscale` 缩放/像素格式转换 → x264 编码（`veryfast` + `zerolatency` + 无 B 帧）→ 现场构造 `avcC` + 逐包转 AVCC | 接进 `DemuxerProducer`（视频转、音频透传）与 `SourceManager`（转码源 = 独立源键、并发硬上限、播完即让出名额）、`CodecMatrix` 的能力感知分支、`--transcode`/`--transcode-height`/`--transcode-max`、`?transcode=1&h=`、`/api/stats` 的 `transcode.speed` | 音频转码、多音轨、多码率 ABR、GPU 转码、**HLS 的转码变体清单/自适应码率**（转码 + HLS 本身已在 M10-c 做到，见 §8.11） |
 
 **M10-a 验收**（`scripts/transcode_test.sh`，**12 项**全过）：
 
@@ -107,7 +107,7 @@ const StreamInfo &videoInfo() const;             // H264 + 现场构造的 avcC 
 |---|---|---|
 | **M10-a** ✅ | `Transcoder` + `examples/transcode_demo` + `scripts/transcode_test.sh` + 1080p 样本（`make_samples.sh`）+ `transcode` 组 3 例 | `transcode_test.sh` **12/12**；NFR-5 **2.89x** |
 | **M10-b** ✅ | 接进 `DemuxerProducer`（视频走解码→编码，音频透传）→ `SourceManager`（转码源 = 独立源键 / 并发硬上限 / 播完让出名额）；`CodecMatrix` 的能力感知分支（HEVC → H264）；`--transcode`/`--transcode-height`/`--transcode-max`；`?transcode=1&h=`；`/api/stats` 的 `transcode.speed` | `flv_http_test.sh` **96/96**（+28 项）；`producer` 14 例 / `srcmgr` 15 例 / `ffmpeg` 36 例 |
-| **M10-c** ⏳ | 转码 + HLS（转码输出也进 `HlsService`，`/hls/x-720p.m3u8`） | 待定 |
+| **M10-c** ✅ | 转码 + HLS：`/hls/<name>.m3u8?transcode=1&h=`，切片 URI 带同一份规格，流键与源键同构（见 §8.11） | `hls_test.sh` **40/40**（+8 项）+ `hls` 组 2 例 |
 
 ## 5. 测试计划
 
@@ -184,7 +184,7 @@ URL: /live/x.mp4.flv?transcode=1&h=720
 | `?transcode=abc` / 未知参数 / 重复参数 | **400** | 拼错的参数静默忽略是最难查的一类问题 |
 | `?transcode=1` 但服务端没开 `--transcode` | **501** | **绝不降级成直通**：那会让用户以为"转过了" |
 | 转码并发已满 | **503** | 同样不降级；`lastError()` 说明"正在转 N/M 路" |
-| `/hls/x.m3u8?transcode=1` | **400** | 转码 + HLS 属 M10-c；不"看起来生效了" |
+| `/hls/x.m3u8?transcode=1` | **200**（M10-c 起；切片 URI 带同一份规格） | 与 `/live/` 同一套语义：未开 `--transcode` → 501、并发满 → 503、参数错 → 400 |
 
 ### 8.4 一次输入 → 0..N 个输出（`read()` 的形状）
 
@@ -204,7 +204,9 @@ URL: /live/x.mp4.flv?transcode=1&h=720
   **实测踩到**：`--loop` 下视频跑到 **14.0s**、音频才 **8.1s**，音画彻底错位；
 - 但两条轴也不能完全各走各的：音频的趟偏移是 `pass_end`（真实媒体时长），
   视频的是 `帧数 × 步长`，两者可能差几毫秒~几十毫秒（音频 1024 样本/帧 ≈ 23.22ms 这种小数帧长会累积）。
-  所以接缝处补一个差额：`_tx_ts_shift += pass_end − 这一趟转出的媒体时长`；
+  所以接缝处补一个差额：`_tx_ts_shift += 这一趟的真实长度 − 这一趟转出的媒体时长`
+  （真实长度 = `pass_end − pass_start`；**v0.2.1 才加上 `pass_start`** —— 首包 dts 为负的源
+  会在接缝处倒退，见 `ACCEPTANCE_v0.2.1.md` §0.3）；
 - 实测（`--loop --speed 4` 拉 4 秒）：视频末包 **15.923s** vs 音频末包 **15.950s**（差 ≈ 一帧）；
 - 回归用例：`producer_transcode_loop_keeps_audio_and_video_aligned`（界 300ms —— 正常 ≈80ms，
   双计的 bug 会让 gap 直接跳到 ~2000ms）。
@@ -261,11 +263,31 @@ speed = out_media_ms / cost_ms
 
 | # | 限制 | 现状 |
 |---|---|---|
-| 1 | 转码 + HLS | **未做**（M10-c）；`/hls/` 带转码参数明确 400 |
+| 1 | 转码 + HLS | ✅ **M10-c 已做**（见 §8.11）。仍未做：**HLS 的转码变体清单**（一个 m3u8 列多档清晰度，`#EXT-X-STREAM-INF`）、按客户端的自适应码率 |
 | 2 | 音频转码 | **不做**（SPEC §9）；音频不是 AAC 的源 → 转码请求**明确拒绝** |
 | 3 | HEVC 的 Annex-B 裸流（TS） | 需要现场构造 hvcC（与 avcC 对称的另一套格式）→ **明确拒绝**，无实测样本前不做 |
 | 4 | 转码跑在**源线程**上（不是 ThreadPool） | 单路 3.26x 余量够用；"一源一份 + 并发硬上限"已保证不会把机器打满。改成线程池属性能优化，不是行为缺口 |
 | 5 | libx264 的 banner 打到 stderr | 无 per-context 日志选项（`-h encoder=libx264` 里没有 log_level）；纯噪声，不影响功能 |
-| 6 | `Demuxer` 对 pts 的钳制 | 仍会弄错 B 帧源的 CompositionTime（remux 路径）；本批只在转码器侧绕开 |
+| 6 | `Demuxer` 对 pts 的钳制 | ✅ **v0.2.1 已修**（pts 不再钳 → B 帧的 CompositionTime 与源一致），见 `ACCEPTANCE_v0.2.1.md` |
 | 7 | 循环 + 转码的长期漂移 | 每趟按 `pass_end − 帧数×步长` 补差额，单趟误差 < 1 帧；**没有**小时级长跑实测（`--loop` 的真实场景） |
 | 8 | `?transcode=1` 的源键带 `auto=<高度>` | 同一文件用不同 `--transcode-height` 起停会得到**不同**源键（旧源的键会留在 stats 里直到空闲释放）。这是刻意的：不同目标高度确实是不同的输出 |
+
+### 8.11 M10-c：转码 + HLS（已完成）
+
+| 项 | 契约 |
+|---|---|
+| URL | `/hls/<name>.m3u8?transcode=1[&h=720]`（切片：`/hls/<name>-<seq>.ts?transcode=1&h=120`） |
+| 参数解析 | 与 `/live/` **同一套** `parseTranscodeQuery()`：非法/未知/重复 → 400；`h` 缺省时把 `--transcode-height` 当**上限** |
+| 开关 | 未开 `--transcode` → **501**（不降级成直通） |
+| 并发 | 走 `SourceManager` 的转码并发上限（与 `/live/` 共用名额）；满了 → **503** |
+| 流键 | `HlsService::streamKey(name, spec)`，与 `SourceManager::sourceKey` **同构**：同名不同规格 = 两条独立 HLS 流 |
+| 切片 URI | **必须**带上同一份规格（`HlsWriter::Config::uri_query`）—— 播放器只认播放列表给出的地址，少一个参数就会退化成直通 |
+| stats | `hls.playlists[]` 增 `key` 与 `transcode{enabled,out_height}`（一个 `name` 可能两条流） |
+
+**为什么切片 URI 要带参数（而不是靠"服务端记住谁是谁"）**：HLS 是无状态的拉模型，播放器会
+按自己理解的方式去请求切片（可能换连接、换 IP、隔几分钟回来）。把规格写进 URI 是唯一**自解释**
+的做法；服务端只需要解析参数，不需要"猜这个播放器之前要的是哪一路"。
+
+**为什么能一行不写调度**：`/live/` 的转码已经收敛成"`acquire(path, spec)`"这一个入口
+（独立源键 + 并发上限 + EOS 让出名额），HLS 只是**另一个消费者**。M10-c 的改动集中在
+"把 spec 传下去"与"把 spec 写进 URI"，没有新的线程/定时器/生命周期逻辑。

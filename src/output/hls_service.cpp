@@ -16,6 +16,25 @@
 
 namespace mzmedia {
 
+namespace {
+
+/// JSON 字符串转义（名字只允许 `[A-Za-z0-9_.-]` + `|h=120` 这类后缀，但转义一次不亏）
+std::string jsonEscaped(const std::string &in) {
+    std::string out;
+    out.reserve(in.size() + 8);
+    for (const char c : in) {
+        switch (c) {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        default: out += c; break;
+        }
+    }
+    return out;
+}
+
+} // namespace
+
 HlsService::HlsService(const SourceManager::Ptr &manager, const EventPoller::Ptr &poller,
                        const Config &config)
     : _manager(manager)
@@ -111,12 +130,20 @@ void HlsService::sweepInLoop() {
     doomed.clear();
 }
 
-std::shared_ptr<HlsService::Entry> HlsService::acquireEntry(const std::string &name,
-                                                           const std::string &path,
-                                                           std::string *error) {
+std::string HlsService::streamKey(const std::string &name,
+                                  const SourceManager::TranscodeSpec &spec) {
+    // 与 SourceManager::sourceKey 同构：不转码就是名字本身，转码就带规格后缀
+    const std::string desc = spec.describe();
+    return desc.empty() ? name : name + "|" + desc;
+}
+
+std::shared_ptr<HlsService::Entry> HlsService::acquireEntry(
+    const std::string &name, const std::string &path, const SourceManager::TranscodeSpec &spec,
+    std::string *error) {
+    const std::string key = streamKey(name, spec);
     {
         std::lock_guard<std::mutex> lck(_mutex);
-        auto it = _entries.find(name);
+        auto it = _entries.find(key);
         if (it != _entries.end()) {
             touchLocked(*it->second);
             return it->second;
@@ -124,14 +151,16 @@ std::shared_ptr<HlsService::Entry> HlsService::acquireEntry(const std::string &n
     }
 
     // 建源 + 切片器（**不要在持锁时做**：acquire 会 open 文件、可能耗时）
-    MediaSource::Ptr source = _manager->acquire(path);
+    // 【M10-c】转码规格**原样交给 SourceManager**：于是"转码 + HLS"复用的就是 /live/ 那条链路
+    // （独立源键 + 并发硬上限 + 播完让出名额），一行新的调度逻辑都不需要
+    MediaSource::Ptr source = _manager->acquire(path, spec);
     if (!source) {
         if (error != nullptr) {
             *error = "源打不开（" + _manager->lastError() + "）";
         }
         return nullptr;
     }
-    const SourceManager::MuxerStreams streams = _manager->muxerStreamsFor(path);
+    const SourceManager::MuxerStreams streams = _manager->muxerStreamsFor(path, spec);
     if (streams.video == nullptr && streams.audio == nullptr) {
         if (error != nullptr) {
             *error = "这个源没有音视频流";
@@ -140,6 +169,13 @@ std::shared_ptr<HlsService::Entry> HlsService::acquireEntry(const std::string &n
     }
     HlsWriter::Config writer_config = _config.writer;
     writer_config.name = name;
+    // 切片 URI 带上同一份规格（否则播放器请求切片时会退化成直通，看到的是原始分辨率）
+    if (spec.enabled) {
+        writer_config.uri_query = "?transcode=1";
+        if (spec.out_height > 0) {
+            writer_config.uri_query += "&h=" + std::to_string(spec.out_height);
+        }
+    }
     HlsWriter::Ptr writer = HlsWriter::create(
         writer_config, MpegTsMuxer::Streams{streams.video, streams.audio});
     if (!writer) {
@@ -176,18 +212,21 @@ std::shared_ptr<HlsService::Entry> HlsService::acquireEntry(const std::string &n
     entry->source = source;
     entry->subscriber = subscriber;
     entry->writer = writer;
+    entry->name = name;
+    entry->spec = spec;
     entry->last_access_ms = getCurrentMillisecond();
     {
         std::lock_guard<std::mutex> lck(_mutex);
-        // 并发：另一个请求可能刚建好了同一个名字 → 以先到的为准，本条目直接丢弃（会退订）
-        auto it = _entries.find(name);
+        // 并发：另一个请求可能刚建好了同一个 key → 以先到的为准，本条目直接丢弃（会退订）
+        auto it = _entries.find(key);
         if (it != _entries.end()) {
             touchLocked(*it->second);
             return it->second;
         }
-        _entries.emplace(name, entry);
+        _entries.emplace(key, entry);
     }
-    InfoP("HlsService[%s]: 已创建 HLS 流（源 %s）", name.c_str(), path.c_str());
+    InfoP("HlsService[%s]: 已创建 HLS 流（源 %s%s）", key.c_str(), path.c_str(),
+          spec.enabled ? "，转码" : "");
     return entry;
 }
 
@@ -195,7 +234,8 @@ void HlsService::touchLocked(Entry &entry) {
     entry.last_access_ms = getCurrentMillisecond();
 }
 
-bool HlsService::playlist(const std::string &name, const std::string &path, std::string *out,
+bool HlsService::playlist(const std::string &name, const std::string &path,
+                          const SourceManager::TranscodeSpec &spec, std::string *out,
                           std::string *error) {
     if (out == nullptr) {
         if (error != nullptr) {
@@ -203,7 +243,7 @@ bool HlsService::playlist(const std::string &name, const std::string &path, std:
         }
         return false;
     }
-    auto entry = acquireEntry(name, path, error);
+    auto entry = acquireEntry(name, path, spec, error);
     if (!entry) {
         return false;
     }
@@ -211,7 +251,8 @@ bool HlsService::playlist(const std::string &name, const std::string &path, std:
     return true;
 }
 
-bool HlsService::slice(const std::string &name, uint64_t seq, std::string *out, std::string *error) {
+bool HlsService::slice(const std::string &name, const SourceManager::TranscodeSpec &spec,
+                       uint64_t seq, std::string *out, std::string *error) {
     if (out == nullptr) {
         if (error != nullptr) {
             *error = "输出为空";
@@ -221,7 +262,7 @@ bool HlsService::slice(const std::string &name, uint64_t seq, std::string *out, 
     std::shared_ptr<Entry> entry;
     {
         std::lock_guard<std::mutex> lck(_mutex);
-        auto it = _entries.find(name);
+        auto it = _entries.find(streamKey(name, spec));
         if (it == _entries.end()) {
             if (error != nullptr) {
                 *error = "没有这个 HLS 流（播放器必须先取 m3u8）";
@@ -294,7 +335,12 @@ std::string HlsService::dumpStatsJson() const {
             json += ",";
         }
         first = false;
-        json += "{\"name\":\"" + item.first + "\"";
+        // 【M10-c】一个名字可能有两条流（直通 + 转码）：`name` 是媒体名，`key` 才唯一
+        json += "{\"name\":\"" + jsonEscaped(item.second->name) + "\"";
+        json += ",\"key\":\"" + jsonEscaped(item.first) + "\"";
+        json += ",\"transcode\":{\"enabled\":";
+        json += item.second->spec.enabled ? "true" : "false";
+        json += ",\"out_height\":" + std::to_string(item.second->spec.out_height) + "}";
         if (item.second->writer) {
             json += ",\"slices\":" + std::to_string(item.second->writer->sliceCount());
             json += ",\"produced\":" + std::to_string(item.second->writer->slicesProduced());

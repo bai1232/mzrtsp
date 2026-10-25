@@ -27,7 +27,7 @@
 | **M8 ✅ MKV / TS 输入（FR-2.2）** | 复用 M4 的 `Demuxer`，`CodecMatrix` 增补组合。TS 的 AAC 是 ADTS（无 extradata）→ 新增 `aac_util`（ADTS 头解析 / ASC 构造 / 逐帧剥头）+ `DemuxerProducer` 的音频 REPACK（用一次性探针 Demuxer 取首帧 ADTS 头，**不改主读游标**）。**实测**：MKV / TS / 纯视频 TS 三条都能拉出合法 FLV；ASC=`12 08`；见 `CODEC_MATRIX.md` §6.1 |
 | **HLS 输出**（**FR-3.2** / **FR-4.1** / **FR-4.2** / **FR-3.4**） | **M9-a ✅** `MpegTsMuxer` + **M9-b ✅** `HlsWriter`/`HlsService`：2s 目标切片（只切视频关键帧）、窗口 6 片滚动、`.m3u8`（`TARGETDURATION`=实测最大 / `MEDIA-SEQUENCE` 前进 / EOS 加 `ENDLIST`）、`/hls/` 路由 + 切片 Range、租约 60s 空闲释放。验收 `ts_mux_test.sh` **29/29** + `hls_test.sh` **32/32**（含播放页与 `hls.js` 入库的逐字节比对 + 内联 JS 的 `node --check`）。设计见 `docs/DESIGN_M9.md` |
 | **转码**（**NFR-5** / **FR-6.1**（实时倍数）/ **FR-7.1**（转码开关）） | **M10-a ✅** `Transcoder`（`src/ffmpeg/transcoder.*`）：解码 → `libswscale` → x264（`veryfast`+`zerolatency`+无 B 帧，`GLOBAL_HEADER`），现场由编码器 extradata 构造 `avcC`、逐包转 AVCC，**自己生成 CFR 输出时间轴**（输入 pts 会被 `Demuxer` 的单调守卫钳坏，详见 `docs/DESIGN_M10.md` §3.3）。**实测**：1920x1080→1280x720，125 帧一帧不少，`ffmpeg -f null -` 零 error，`speed` **2.89x**（74 帧/s）≥ NFR-5 的 1.0x；`transcode_test.sh` **12/12**；需先 `apt install libswscale-dev`（已装，CMake 缺库直接 `FATAL_ERROR`） |
-| 转码调度（**FR-1.3** / **FR-7.1**） | **M10-b ✅** 接进 `DemuxerProducer`（视频过 `Transcoder`、音频透传）与 `SourceManager`（转码源 = **独立源键**，`路径|h=720`）：lazy 启动（`acquire` 才建编解码器）、并发**硬上限**（默认 `nproc-1`，`0` 非法）、EOS 后让出名额；`--transcode` / `--transcode-height` / `--transcode-max`；URL `?transcode=1&h=`；`/api/stats` 的 `transcode.speed`。**不做**：转码+HLS（M10-c）、音频转码（SPEC §9） |
+| 转码调度（**FR-1.3** / **FR-7.1**） | **M10-b ✅** 接进 `DemuxerProducer`（视频过 `Transcoder`、音频透传）与 `SourceManager`（转码源 = **独立源键**，`路径|h=720`）：lazy 启动（`acquire` 才建编解码器）、并发**硬上限**（默认 `nproc-1`，`0` 非法）、EOS 后让出名额；`--transcode` / `--transcode-height` / `--transcode-max`；URL `?transcode=1&h=`；`/api/stats` 的 `transcode.speed`。**不做**：音频转码（SPEC §9）；HLS 侧的转码见 M10-c |
 | 验收（**NFR-5** / **SC-2** 的第二次验证） | **M10-a ✅** 转码 ≥1.0x 实时（1080p→720p x264 veryfast **2.89x** 端到端 / 服务内 `speed` **3.26x**）；**M10-b ✅** 转码流能播（`ffprobe` 认 h264 + aac、`ffmpeg -f null -` 零 error、HEVC→H264 生效）；新增输出/输入**不改 `media/` 分发层、`network/`**（`Transcoder` 只碰 `ffmpeg/`；转码源复用同一套 `MediaSource`） |
 
 ## v0.2.1 —— B 帧源的时间戳（✅ **已发布 2026-10-25**，tag `v0.2.1`）
@@ -40,6 +40,16 @@
 | `MpegTsMuxer` 逐包把负时间戳钳到 0 | 前几帧 dts 差异被抹掉（`-80,-40,0,40` → `0,0,0,40`，三个 PES 的 dts 完全相同） | 首包确定**整体平移量**，之后所有包 + base（差值不变）；仍为负的才钳 0 并计数 |
 | 循环重开的趟偏移没算首包 dts | 首包 dts 为负的源在**每个接缝倒退**（961 → 921 ms），循环播放每次抖一下 | 偏移改用 `pass_end − pass_start`；转码路径的接缝修正改成增量 |
 | **验收缺口**（根因）| 所有脚本/用例都用**无 B 帧**的 `sample.mp4` → 门禁全绿却测不到这条 | 新增 `bf.mp4` 的分层用例 5 例 + `flv_http_test.sh` §12（5 项），并加了 3 组变异验证 |
+
+## v0.2.2 —— 转码 + HLS（✅ **已发布 2026-10-25**，tag `v0.2.2`，v0.2 里程碑收尾）
+
+> 证据见 **[docs/ACCEPTANCE_v0.2.2.md](ACCEPTANCE_v0.2.2.md)**。此前 `/hls/*?transcode=1` 是
+> 明确 400（"属 M10-c"）；本版补齐 —— **HLS 与 FLV 现在都能要转码流**，且共用同一套参数、
+> 拒绝语义与并发上限。
+
+| 任务 | 说明 |
+|---|---|
+| **M10-c ✅ 转码 + HLS** | `/hls/<name>.m3u8?transcode=1[&h=720]`；切片 URI 带同一份规格（`HlsWriter::Config::uri_query`）；流键 `HlsService::streamKey(name, spec)` 与 `SourceManager::sourceKey` 同构 → 同名可同时有直通与转码两路；`/api/stats` 的 `hls.playlists[]` 增 `key`/`transcode`。验收 `hls_test.sh` **40/40** + `hls` 组 2 例 |
 
 ## v0.3.0 —— RTSP 输入 + 解码处理
 

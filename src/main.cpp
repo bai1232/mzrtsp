@@ -503,15 +503,27 @@ int main(int argc, char **argv) {
         });
         // 必须在 start() 之前注册 /hls/：HttpServer::start() 里的 501 占位有 findHandler 守卫
         if (!server->setPrefixRoute(
-                "/hls/", [manager, hls, media_root](const HttpParser &req, HttpResponse &resp) {
-                    // 【M10-b】转码只做 /live/（HLS + 转码属 M10-c）。带相关参数时**明确拒绝**，
-                    // 而不是让它看起来生效了 —— 静默忽略参数是最难查的一类问题
-                    if (req.query().find("transcode") != std::string::npos ||
-                        req.query().find("h=") != std::string::npos) {
+                "/hls/", [manager, hls, media_root, transcode_allowed, transcode_height](
+                             const HttpParser &req, HttpResponse &resp) {
+                    // 【M10-c】HLS 也支持转码：`/hls/<name>.m3u8?transcode=1&h=720`
+                    // 切片 URI 会带上**同一份**查询串（见 HlsService），播放器照抄即可
+                    SourceManager::TranscodeSpec spec;
+                    std::string query_why;
+                    if (!parseTranscodeQuery(req.query(), &spec, &query_why)) {
                         resp.setStatus(400);
-                        resp.setBody("400 Bad Request：HLS 暂不支持转码参数（转码 + HLS 属 M10-c）；"
-                                     "转码请用 /live/<name>.flv?transcode=1&h=...\n");
+                        resp.setBody("400 Bad Request：" + query_why +
+                                     "\n→ 形式：/hls/<name>.m3u8?transcode=1&h=720\n");
                         return;
+                    }
+                    if (spec.enabled) {
+                        if (!transcode_allowed) {
+                            resp.setStatus(501);
+                            resp.setBody("501 Not Implemented：本实例没有开启转码（启动时缺 "
+                                         "--transcode）\n→ 用 `mzmedia --transcode` 启动；"
+                                         "或去掉 ?transcode=1 拉原始码流\n");
+                            return;
+                        }
+                        spec.max_height = transcode_height; // 没给 h= → 上限（与 /live/ 一致）
                     }
                     std::string name;
                     std::string path;
@@ -527,7 +539,7 @@ int main(int argc, char **argv) {
                     std::string body;
                     std::string error;
                     if (is_playlist) {
-                        if (!hls->playlist(name, path, &body, &error)) {
+                        if (!hls->playlist(name, path, spec, &body, &error)) {
                             resp.setStatus(500);
                             resp.setBody("500 Internal Server Error：HLS 打不开（" + error + "）\n");
                             return;
@@ -537,7 +549,7 @@ int main(int argc, char **argv) {
                         resp.setContentType("application/vnd.apple.mpegurl");
                         return;
                     }
-                    if (!hls->slice(name, seq, &body, &error)) {
+                    if (!hls->slice(name, spec, seq, &body, &error)) {
                         // 老切片滑出窗口 → 404 是**正常**的（播放器拿旧 m3u8 会这样请求）
                         resp.setStatus(404);
                         resp.setBody("404 Not Found：" + error + "\n");

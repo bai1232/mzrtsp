@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.15)
 
 project(mzmedia
-        VERSION 0.2.1
+        VERSION 0.2.2
         DESCRIPTION "多格式流媒体文件服务器：输入多种媒体文件，输出多种流媒体格式，按需转封装或转码"
         LANGUAGES CXX)
 

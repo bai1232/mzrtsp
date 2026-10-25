@@ -477,9 +477,14 @@ for q in 'h=120' 'transcode=abc' 'transcode=1&h=121' 'transcode=1&h=64' 'transco
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/live/movie.flv?$q")"
     check "非法查询参数 ?${q} → 400" "$code" "400"
 done
-# HLS 不接受转码参数（转码 + HLS 属 M10-c）：**明确拒绝**，不是"看起来生效了"
+# 【M10-c】HLS **也**支持转码：与 /live/ 同一套语义 —— 未开 --transcode 时 501（不降级），
+# 参数错了仍是 400。转码成功的路径在 `scripts/hls_test.sh` §10 验（那里起了带 --transcode 的实例）。
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/hls/movie.m3u8?transcode=1")"
-check "HLS + 转码参数 → 400（属 M10-c）" "$code" "400"
+check "HLS + ?transcode=1（未开转码）→ 501" "$code" "501"
+for q in 'h=120' 'transcode=abc' 'foo=1'; do
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/hls/movie.m3u8?$q")"
+    check "HLS 非法查询参数 ?${q} → 400" "$code" "400"
+done
 
 echo "== 11) 转码（M10-b / NFR-5）：缩放 / HEVC → H264 / 并发上限 / speed =="
 cp "$SAMPLE" "$MEDIA_DIR/tx.mp4"    # 转码用（会被拉两次：默认上限 + 显式 h）

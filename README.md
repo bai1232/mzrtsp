@@ -13,6 +13,7 @@
 | **v0.1.1** | 补丁：`Connection: close` 与畸形请求之后**真的关闭连接**（RFC 7230 §6.6） | ✅ **已发布**（tag `v0.1.1`；证据见 [docs/ACCEPTANCE_v0.1.1.md](docs/ACCEPTANCE_v0.1.1.md)） |
 | **v0.2.0** | MKV / TS 输入、**HLS** 输出、**转码**（含 HEVC → H264） | ✅ **已发布**（tag `v0.2.0`；验收证据见 [docs/ACCEPTANCE_v0.2.0.md](docs/ACCEPTANCE_v0.2.0.md)） |
 | **v0.2.1** | 补丁：**B 帧源**的时间戳（pts 不再被钳 → 显示顺序正确；TS 负时间戳整体平移；循环接缝不倒退） | ✅ **已发布**（tag `v0.2.1`；证据见 [docs/ACCEPTANCE_v0.2.1.md](docs/ACCEPTANCE_v0.2.1.md)） |
+| **v0.2.2** | v0.2 收尾：**转码 + HLS**（`/hls/x.m3u8?transcode=1&h=720`） | ✅ **已发布**（tag `v0.2.2`；证据见 [docs/ACCEPTANCE_v0.2.2.md](docs/ACCEPTANCE_v0.2.2.md)） |
 | v0.3.0 | RTSP 输入、解码处理（滤镜/缩放/水印） | ⏳ 计划 |
 
 ### v0.2.0 验收摘要（实测，完整矩阵见验收报告）
@@ -20,7 +21,7 @@
 | 指标 | 实测 | 要求 |
 |---|---|---|
 | 输入 | MP4 / H264 裸流 / **MKV** / **TS**（含纯视频）→ 都能拉出合法 FLV；TS 的 ADTS **`ASC=12 08`** 且 raw AAC 已剥头 | FR-2.2 |
-| HLS | 2 s 切片（只切视频关键帧）/ 窗口 **6** / `MEDIA-SEQUENCE` 前进 / 老切片 404 / **`ffmpeg` 读 m3u8 零 error** / 切片 Range 206 | FR-3.2 / FR-4.2 |
+| HLS | 2 s 切片（只切视频关键帧）/ 窗口 **6** / `MEDIA-SEQUENCE` 前进 / 老切片 404 / **`ffmpeg` 读 m3u8 零 error** / 切片 Range 206 / **转码 + HLS**（切片 URI 自带规格，直通不受影响） | FR-3.2 / FR-4.1 / FR-4.2 |
 | **转码（NFR-5）** | 1080p→720p **3.03x**（媒体 4880 ms vs 墙钟 1688 ms，74 帧/s）；服务内 `/api/stats` 的 `speed` **3.26x**；HEVC→H264 实测可播 | **≥1.0x ✅ 首次达成** |
 | 并发/稳定性 | **10 路 × 1 小时**：每路完整可解、丢帧 0、fd 恒定、错误日志 0；ASAN 构建 10/10 | NFR-2/3/4 |
 | 质量（NFR-7） | `--clean-first` 重建 **0 warning**；**281 用例 / 24 分组**；ASAN 24/24；TSAN **370 用例 / 真问题 0** | 零警告 |
@@ -158,6 +159,8 @@ curl -N http://127.0.0.1:8080/live/sample.ts.flv  -o /tmp/t.flv && ffprobe /tmp/
 
 # 9) 【v0.2】HLS：ffplay / ffmpeg / 浏览器都能直接吃 m3u8
 ffplay http://127.0.0.1:8080/hls/sample.mp4.m3u8
+#    要转码的 HLS：同一个服务上还能同时提供直通（上面那条）与转码（这条）
+ffplay 'http://127.0.0.1:8080/hls/sample1080.mp4.m3u8?transcode=1&h=120'
 ffmpeg -v error -i http://127.0.0.1:8080/hls/sample.mp4.m3u8 -t 4 -f null -   # 零 error 即通过
 
 # 10) 【v0.2】转码：服务端要显式打开（默认关），URL 里再选
@@ -170,10 +173,10 @@ ffprobe -v error -show_entries stream=codec_name,width,height /tmp/tx.flv    # h
 ### 验证（每个脚本都会打印"通过 N 项 / 失败 N 项"）
 
 ```bash
-cd build && ctest                        # 24 个分组（286 个用例），**串行**跑（不要加 -j）
+cd build && ctest                        # 24 个分组（288 个用例），**串行**跑（不要加 -j）
 ./bin/mzmedia_unittest producer           # 只跑某组：分组名是**用例名的子串**
-../scripts/flv_http_test.sh               # 端到端：101 项（HTTP-FLV + MKV/TS + 播放页 + 循环 + 转码 + B 帧）
-../scripts/hls_test.sh                    # HLS：32 项（m3u8 / 切片 / Range / 窗口 / 租约 / 播放页）
+../scripts/flv_http_test.sh               # 端到端：104 项（HTTP-FLV + MKV/TS + 播放页 + 循环 + 转码 + B 帧）
+../scripts/hls_test.sh                    # HLS：40 项（m3u8 / 切片 / Range / 窗口 / 租约 / 播放页 / 转码+HLS）
 ../scripts/ts_mux_test.sh                 # TS 封装：29 项（ffprobe/ffmpeg 四层判据）
 ../scripts/transcode_test.sh              # 转码：12 项（1080p→720p + NFR-5 speed）
 ../scripts/flv_mux_test.sh                # FLV 封装：8 项（→ ffprobe）
@@ -199,7 +202,8 @@ cd build && ctest                        # 24 个分组（286 个用例），**�
 | [docs/SPEC.md](docs/SPEC.md) | **需求规格（唯一规格来源）**：能力矩阵、流水线、功能/非功能需求、成功标准 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构设计：分层、线程模型、一源多消费者、资源管理 |
 | [docs/CODEC_MATRIX.md](docs/CODEC_MATRIX.md) | 输入 × 输出的可行性判定（何时 remux、何时必须转码） |
-| [docs/ACCEPTANCE_v0.2.1.md](docs/ACCEPTANCE_v0.2.1.md) | **v0.2.1 补丁验收报告（当前版本）**：B 帧源时间戳三处缺陷的修前/修后实测 + 变异验证 |
+| [docs/ACCEPTANCE_v0.2.2.md](docs/ACCEPTANCE_v0.2.2.md) | **v0.2.2 验收报告（当前版本）**：转码 + HLS 补齐（v0.2 里程碑收尾） |
+| [docs/ACCEPTANCE_v0.2.1.md](docs/ACCEPTANCE_v0.2.1.md) | **v0.2.1 补丁验收报告**：B 帧源时间戳三处缺陷的修前/修后实测 + 变异验证 |
 | [docs/ACCEPTANCE_v0.2.0.md](docs/ACCEPTANCE_v0.2.0.md) | **v0.2.0 验收报告**：逐条 SC/NFR/FR → 状态 + 证据命令 + 实测数字 + 变异验证 + 未验证清单 |
 | [docs/ACCEPTANCE_v0.1.0.md](docs/ACCEPTANCE_v0.1.0.md) | **v0.1.0 验收报告**：逐条 SC/NFR/FR → 状态 + 证据命令 + 实测数字 + 复现步骤 + 未达成清单 |
 | [docs/ACCEPTANCE_v0.1.1.md](docs/ACCEPTANCE_v0.1.1.md) | **v0.1.1 补丁验收报告**：两个缺陷的修前/修后实测、变异验证、门禁数字、已知边界 |

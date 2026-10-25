@@ -38,10 +38,14 @@ public:
     using Ptr = std::shared_ptr<HlsService>;
 
     struct Config {
-        HlsWriter::Config writer;        ///< 切片参数（`name` 每次按请求覆盖）
+        HlsWriter::Config writer;        ///< 切片参数（`name`/`uri_query` 每次按请求覆盖）
         uint32_t lease_ms = 60000;       ///< 拉流请求的租约（FR-1.3 的 60s 同量级）
         uint32_t sweep_ms = 5000;        ///< 扫描间隔（0 = 非法：不能不扫，否则永不释放）
     };
+
+    /// 【M10-c】流的键：同一个名字 × 同一个转码规格 = 同一条 HLS 流（与 SourceManager 的源键同构）
+    /// `movie` + 不转码 → `movie`；`movie` + 缩到 120p → `movie|h=120`
+    static std::string streamKey(const std::string &name, const SourceManager::TranscodeSpec &spec);
 
     /// @param manager 用来按名字懒启动/复用源
     /// @param poller 订阅者的唤醒线程 + 租约定时器所在线程（通常是 app 的 poller）
@@ -59,14 +63,15 @@ public:
      * @param path 媒体文件路径（由调用方从名字解析出来；本层不认识 media_root）
      * @return false = 打不开/封不了（`error` 是人话，调用方据此回 4xx/5xx）
      */
-    bool playlist(const std::string &name, const std::string &path, std::string *out,
-                  std::string *error);
+    bool playlist(const std::string &name, const std::string &path,
+                  const SourceManager::TranscodeSpec &spec, std::string *out, std::string *error);
 
     /**
      * `GET /hls/<name>-<seq>.ts`
      * @return false = 没有这个流 / 该序号已滑出窗口（播放器拿旧 m3u8 请求老切片是**正常**的 404）
      */
-    bool slice(const std::string &name, uint64_t seq, std::string *out, std::string *error);
+    bool slice(const std::string &name, const SourceManager::TranscodeSpec &spec, uint64_t seq,
+               std::string *out, std::string *error);
 
     // 观测（接进 /api/stats）
     size_t streamCount() const;
@@ -79,17 +84,20 @@ private:
         MediaSource::Ptr source;    ///< 句柄：让源活着（否则空闲释放会把它停掉）
         Subscriber::Ptr subscriber; ///< 订阅者：释放它 = 退订（NFR-6）
         HlsWriter::Ptr writer;
+        std::string name;                    ///< 媒体名（不含规格后缀；stats 用）
+        SourceManager::TranscodeSpec spec;   ///< 这条流是不是转码出来的（stats 用）
         uint64_t last_access_ms = 0;
     };
 
     HlsService(const SourceManager::Ptr &manager, const EventPoller::Ptr &poller, const Config &config);
 
-    /// 拿到（必要时创建）某个名字的条目；失败返回 nullptr 且写 `error`
+    /// 拿到（必要时创建）某个（名字 × 规格）的条目；失败返回 nullptr 且写 `error`
     std::shared_ptr<Entry> acquireEntry(const std::string &name, const std::string &path,
+                                        const SourceManager::TranscodeSpec &spec,
                                         std::string *error);
     void touchLocked(Entry &entry);
-    /// 释放条目（**在锁外**调用；会 drop 订阅者/句柄）
-    void releaseEntry(const std::string &name, const char *why);
+    /// 释放条目（**在锁外**调用；会 drop 订阅者/句柄）；`key` = `streamKey(...)`
+    void releaseEntry(const std::string &key, const char *why);
     void scheduleSweep();
     /// 必须在 poller 线程
     void sweepInLoop();

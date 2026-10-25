@@ -44,6 +44,10 @@ public:
     struct Config {
         /// 播放列表里的 URI 前缀：切片地址 = `/hls/<name>-<seq>.ts`
         std::string name;
+        /// 【M10-c】切片 URI 的查询串后缀（形如 `?transcode=1&h=120`；空 = 不带）
+        /// @note 为什么要写在 URI 里：播放器只认播放列表里给出的地址，
+        ///       转码规格必须在**每个切片**的 URL 上重复一遍，否则切片请求会退化成直通
+        std::string uri_query;
         uint32_t target_duration_ms = 2000;   ///< 目标切片时长（FR-3.2 的 2s）
         size_t window = 6;                    ///< 滑动窗口片数（FR-3.2 的 6 片）
         /// 单片时长硬顶：GOP 比它长时**切不了**（切在非关键帧 = 坏片）→ 计数 + Warn，继续等关键帧

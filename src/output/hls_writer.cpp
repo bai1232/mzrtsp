@@ -247,7 +247,9 @@ std::string HlsWriter::playlist() const {
         m3u8 += "#EXTINF:";
         m3u8 += dur;
         m3u8 += ",\n";
-        m3u8 += "/hls/" + _config.name + "-" + std::to_string(slice.seq) + ".ts\n";
+        m3u8 += "/hls/" + _config.name + "-" + std::to_string(slice.seq) + ".ts";
+        m3u8 += _config.uri_query;   // 【M10-c】转码流的每个切片都带上同一份规格
+        m3u8 += "\n";
     }
     if (_finished) {
         m3u8 += "#EXT-X-ENDLIST\n";

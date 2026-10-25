@@ -60,7 +60,7 @@ FFmpeg 4.4.2 + libswscale 5.9.100 / Node 12.22.9 / Python 3.10.12）。本版**�
 | **FR-1.2** 直播式重放（可选循环、时间戳连续） | ✅ **修复** | 循环重开的趟偏移改成 `pass_end − pass_start`（首包 dts 为负的源不再倒退）；转码路径的接缝修正改成**增量**（`本趟真实长度 − 本趟转出媒体时长`）。证据：`producer_loop_with_negative_first_dts_does_not_regress` + `flv_http_test.sh` §12（循环 200 tag 严格递增）+ 原有的 `producer_loop_offsets_timestamps_monotonically` / `producer_transcode_loop_keeps_audio_and_video_aligned` 仍绿 |
 | **FR-2.4** 边界（VFR / 时长未知）不崩 | ⚠ 仍是"部分验证" | 本版让 **pts 乱序（B 帧的正常现象）** 与 **dts 回退（真异常）** 在统计上分开；VFR 仍然**没有专门样本**（沿用 v0.2.0 的"未验证"结论） |
 | **FR-6.1** `/api/stats` 可观测性 | ✅ 增强 | 每源新增 `producer.ts{pts_out_of_order,dts_clamped}`：`pts_out_of_order > 0` 才说明"B 帧信息没被搞丢"，`dts_clamped` 非 0 才是真异常。`flv_http_test.sh` §12 断言这两条 |
-| **NFR-7** 零警告 + 覆盖 | ✅ | `--clean-first` 重建 0 warning；用例 **281 → 286**（+5）；`flv_http_test.sh` **96 → 101 项** |
+| **NFR-7** 零警告 + 覆盖 | ✅ | `--clean-first` 重建 0 warning；用例 **281 → 286**（+5）；`flv_http_test.sh` **96 → 104 项** |
 | 其余 SC/NFR/FR | 不变 | 本版只碰"时间戳"这一条纵线（`ffmpeg/demuxer`、`output/mpegts_muxer`、`media/demuxer_producer` 的接缝计算），不涉及网络/HTTP/分发；回归面由全量 `ctest` + 6 个脚本覆盖 |
 
 ## 3. 变异验证（证明新断言真的会红）
@@ -82,7 +82,7 @@ FFmpeg 4.4.2 + libswscale 5.9.100 / Node 12.22.9 / Python 3.10.12）。本版**�
 | 单元（单进程全量，诊断） | `./build/bin/mzmedia_unittest` | **286/286 用例、63,265 条断言、0 失败** |
 | 单元（ASAN） | `cmake --build build-asan -j4 && cd build-asan && ctest` | **24/24 通过**（本轮无抖动） |
 | 并发（TSAN） | `./scripts/tsan.sh` | **375 用例 | 已知误报 0 | 真问题 0**。⚠ 见下方"一次时序抖动" |
-| 端到端（FLV / HLS / TS / 转码） | `scripts/{flv_http,hls,ts_mux,transcode}_test.sh` | **101/101**、**32/32**、**29/29**、**12/12** |
+| 端到端（FLV / HLS / TS / 转码） | `scripts/{flv_http,hls,ts_mux,transcode}_test.sh` | **104/104**、**32/32**、**29/29**、**12/12** |
 | 端到端（HTTP / FLV 封装） | `scripts/{http,flv_mux}_test.sh` | 全绿（8/8） |
 | **tag 独立构建** | `git clone --branch v0.2.1 … && ./scripts/make_samples.sh && cmake -B build && cmake --build build -j4 && (cd build && ctest)` | 见 §7.1 |
 

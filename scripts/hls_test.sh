@@ -16,11 +16,14 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SERVER="$ROOT/build/bin/mzmedia"
 SAMPLE="$ROOT/samples/sample.mp4"
+TX_SAMPLE="$ROOT/samples/sample1080.mp4"   # M10-c：转码 + HLS（1080p → 120p）
 PORT=$(( (RANDOM % 3000) + 24000 ))
 LEASE_PORT=$(( PORT + 1 ))
+TX_PORT=$(( PORT + 2 ))
 OUT="/tmp/mzmedia_hls"
 SRV_PID=""
 LEASE_PID=""
+TX_PID=""
 
 [ -x "$SERVER" ] || { echo "错误：找不到 $SERVER，先执行 cmake --build build" >&2; exit 1; }
 [ -f "$SAMPLE" ] || { echo "错误：找不到样本，先执行 ./scripts/make_samples.sh" >&2; exit 1; }
@@ -42,6 +45,7 @@ check_false() { printf '  ✘ %-44s %s\n' "$1" "$2"; fail=$((fail + 1)); }
 
 cleanup() {
     [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null || true
+    [ -n "$TX_PID" ] && kill "$TX_PID" 2>/dev/null || true
     [ -n "$LEASE_PID" ] && kill "$LEASE_PID" 2>/dev/null || true
     wait 2>/dev/null || true
 }
@@ -229,7 +233,76 @@ else
     check_false "lease_expired 计数 >= 1" "$expired"
 fi
 
+echo "== 10) 转码 + HLS（M10-c）：播放列表里的每个切片都要带上同一份规格 =="
+# 为什么必须验：播放器**只认播放列表里给出的 URI**。切片 URI 若没带 ?transcode=1&h=120，
+# 播放器会去请求直通切片 → 画面突然变回 1080p（甚至来回跳），而服务端不会报任何错。
+TXDIR="/tmp/mzmedia_hls_tx"
+rm -rf "$TXDIR"; mkdir -p "$TXDIR"
+cp "$TX_SAMPLE" "$TXDIR/tx.mp4"
+"$SERVER" --port "$TX_PORT" --media-root "$TXDIR" --loop --speed 2 --transcode \
+    --transcode-height 120 --log-file "$TXDIR/server.log" > /dev/null 2>&1 &
+TX_PID=$!
+sleep 1.2
+TBASE="http://127.0.0.1:$TX_PORT"
+# ① 没开转码的实例 → 501（不降级成直通）
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$BASE/hls/movie.mp4.m3u8?transcode=1")
+check "未开转码时 HLS + ?transcode=1 → 501" "$code" "501"
+# ② 开了转码：m3u8 里每个切片 URI 都必须带同一份查询串
+curl -s -o /dev/null --max-time 5 "$TBASE/hls/tx.mp4.m3u8?transcode=1&h=120"   # 先建流
+sleep 6                                                                         # 2 倍速 ≈ 12 秒媒体
+curl -s -o "$TXDIR/tx.m3u8" --max-time 5 "$TBASE/hls/tx.mp4.m3u8?transcode=1&h=120"
+slices=$(grep -c 'transcode=1&h=120' "$TXDIR/tx.m3u8" || true)
+if [ "${slices:-0}" -ge 1 ]; then
+    check_true "转码 m3u8 的切片 URI 带规格（$slices 处）"
+else
+    check_false "转码 m3u8 的切片 URI 带规格" "$(head -6 "$TXDIR/tx.m3u8" | tr '\n' '|')"
+fi
+# ③ 按播放列表里的 URI 取切片 → 必须是 120p（等比：1920x1080 → 212x120）
+txslice=$(grep -o '/hls/tx\.mp4-[0-9]*\.ts?transcode=1&h=120' "$TXDIR/tx.m3u8" | tail -1)
+code=$(curl -s -o "$TXDIR/slice.ts" -w '%{http_code}' --max-time 5 "$TBASE$txslice")
+check "转码切片 → 200" "$code" "200"
+check "转码切片的编码" \
+    "$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$TXDIR/slice.ts" | awk 'NF' | head -1)" "h264"
+check "转码切片的高度（--transcode-height 120）" \
+    "$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$TXDIR/slice.ts" | awk 'NF' | head -1)" "120"
+# ④ 直通 HLS 不受影响（同一个服务、不带查询串 → 仍是 1920x1080）
+curl -s -o /dev/null --max-time 5 "$TBASE/hls/tx.mp4.m3u8"
+sleep 6
+curl -s -o "$TXDIR/plain.m3u8" --max-time 5 "$TBASE/hls/tx.mp4.m3u8"
+pslice=$(grep -o '/hls/tx\.mp4-[0-9]*\.ts' "$TXDIR/plain.m3u8" | tail -1)
+curl -s -o "$TXDIR/plain.ts" --max-time 5 "$TBASE$pslice"
+check "直通切片的宽度（不受转码影响）" \
+    "$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$TXDIR/plain.ts" | awk 'NF' | head -1)" "1920"
+# ⑤ 独立裁判：ffmpeg 直接读**转码的** m3u8 并解码 4 秒
+tx_err="$(ffmpeg -v error -i "$TBASE/hls/tx.mp4.m3u8?transcode=1&h=120" -t 4 -f null - 2>&1 > /dev/null || true)"
+if [ -z "$tx_err" ]; then
+    check_true "ffmpeg 直接读转码 m3u8 解码 4 秒无 error"
+else
+    check_false "ffmpeg 直接读转码 m3u8 解码 4 秒无 error" "$(printf '%s' "$tx_err" | head -2)"
+fi
+# ⑥ stats：同名两条流（直通 + 转码），key 不同、transcode 标记正确
+curl -s --max-time 5 "$TBASE/api/stats" > "$TXDIR/stats.json"
+set +e
+tx_stats="$(python3 - "$TXDIR/stats.json" << 'PYTX'
+import json, sys
+d = json.load(open(sys.argv[1]))
+rows = [(p.get("name"), p.get("key"), p.get("transcode") or {}) for p in d.get("hls", {}).get("playlists", [])]
+tx = [r for r in rows if r[0] == "tx.mp4" and r[2].get("enabled")]
+plain = [r for r in rows if r[0] == "tx.mp4" and not r[2].get("enabled")]
+print("streams=%d tx=%d plain=%d tx_key=%s" % (len(rows), len(tx), len(plain), tx[0][1] if tx else "-"))
+sys.exit(0 if (len(tx) == 1 and len(plain) == 1) else 1)
+PYTX
+)"
+tx_rc=$?
+set -e
+if [ "$tx_rc" -eq 0 ]; then
+    printf '  ✔ %-44s %s\n' "stats：同名两条流（直通 + 转码）" "$tx_stats"
+    pass=$((pass + 1))
+else
+    check_false "stats：同名两条流（直通 + 转码）" "$tx_stats"
+fi
+
 echo
-echo "结果：通过 $pass 项 / 失败 $fail 项（产物：$OUT）"
+echo "结果：通过 $pass 项 / 失败 $fail 项（产物：$OUT / $TXDIR）"
 [ "$fail" -eq 0 ] || exit 1
-echo "结论：M9-b 通过（m3u8 结构/切片可独立解码/Range/窗口滚动/租约释放，ffmpeg 独立判定无 error）"
+echo "结论：M9-b + M10-c 通过（m3u8 结构/切片可独立解码/Range/窗口滚动/租约释放/转码+HLS，ffmpeg 独立判定无 error）"
