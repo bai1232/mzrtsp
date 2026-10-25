@@ -125,6 +125,10 @@ public:
     bool setReconnect(const Reconnect &reconnect);
 
     // ---- 【M11-a2】网络源观测（stats 用；本地文件恒 Idle/0）----
+    /// 【M11-a2b】接缝处因"新一段头几个包时间戳更早"而做过的整段后移次数（0 = 没发生）
+    uint64_t seamRepairs() const {
+        return _seam_repairs.load();
+    }
     NetState netState() const {
         return _net_state.load();
     }
@@ -247,6 +251,8 @@ private:
     std::atomic<uint64_t> _loops{0};
     std::atomic<uint64_t> _loop_failures{0};
     std::atomic<int64_t> _loop_offset_ms{0};
+    /// 【M11-a2b】接缝时间戳修复次数（源的头几个包时间戳乱序时整段后移）
+    std::atomic<uint64_t> _seam_repairs{0};
 
     /// 只有源线程碰：一趟的 dts 轨迹
     std::vector<PassTrack> _pass;

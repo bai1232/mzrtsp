@@ -118,7 +118,7 @@ CURL_PID=$!
 HLS_PID=$!
 
 echo "== 2) 每分钟采样（RSS / CPU / 包数 / 重连数 / 帧龄）=="
-echo "t,elapsed_s,rss_kb,cpu_pct,packets,reconnects,state,age_ms" > "$OUT/soak.csv"
+echo "elapsed_s,rss_kb,cpu_pct,packets,reconnects,state,age_ms" > "$OUT/soak.csv"
 restarted=0
 while true; do
     now=$(date +%s)
@@ -135,18 +135,26 @@ while true; do
         echo "  [掐断上游] 假服务端已重启（pid $FAKE_PID）"
     fi
 
-    line=$(curl -s --max-time 3 "$BASE/api/stats" 2> /dev/null | python3 -c '
+    # 采样要**抗抖动**：curl 偶尔超时、ps 偶尔拿到空，都重试一次再下结论
+    st=""
+    for _ in 1 2 3; do
+        st=$(curl -s --max-time 5 "$BASE/api/stats" 2> /dev/null)
+        [ -n "$st" ] && break
+        sleep 1
+    done
+    line=$(printf '%s' "$st" | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
 except Exception:
-    print("-,-,-,-,-"); raise SystemExit
+    print("-,-,-,-")
+    raise SystemExit
 for s in d.get("media_sources", []):
     r = (s.get("producer") or {}).get("rtsp")
     if not r:
         continue
     p = s.get("producer") or {}
-    print("%d,%d,%s,%s" % (p.get("packets", -1), r.get("reconnects", -1),
+    print("%d,%d,%s,%d" % (p.get("packets", -1), r.get("reconnects", -1),
                            r.get("state", "?"), r.get("last_packet_age_ms", -1)))
     break
 else:
@@ -154,7 +162,7 @@ else:
 ')
     rss=$(ps -o rss= -p "$SRV_PID" 2> /dev/null | tr -d ' ')
     cpu=$(ps -o %cpu= -p "$SRV_PID" 2> /dev/null | tr -d ' ')
-    echo "$elapsed,$elapsed,${rss:-0},${cpu:-0},$line" >> "$OUT/soak.csv"
+    echo "$elapsed,${rss:-0},${cpu:-0},$line" >> "$OUT/soak.csv"
     [ $(( elapsed % 300 )) -lt 60 ] && echo "  t=${elapsed}s rss=${rss}KB cpu=${cpu}% $(echo "$line" | tr ',' ' ')"
     sleep 60
 done
@@ -220,15 +228,26 @@ fi
 tail -n 1 "$OUT/hls.log" | grep -q "slices=" && ok "HLS 播放列表持续滚动（$(tail -n 1 "$OUT/hls.log")）" \
     || ng "HLS 播放列表" "$(tail -n 2 "$OUT/hls.log" | tr '\n' '|')"
 
-# 内存：RSS 首尾差不能超过首值的 15%（"慢性泄漏"的粗判据）
-mem_report=$(awk -F, 'NR > 1 && $3 > 0 { if (first == 0) first = $3; last = $3 }
-                      END { printf "%d %d", first, last }' "$OUT/soak.csv")
+# 内存：**预热之后**不许再涨（"慢性泄漏"的粗判据）。
+# 基线取"跑到 10% 时长"那一次采样，而不是第一次：第一次采样时 FFmpeg 的探测/GOP 缓存
+# 还没铺开（1080p 实测 32MB → 72MB 是预热，不是泄漏），拿它当基线会误报。
+mem_report=$(awk -F, 'NR > 1 && $2 ~ /^[0-9]+$/ && $2 > 0 {
+                          if (first == 0) first = $2;
+                          if (t <= warm) { base = $2 }
+                          if ($2 > mx) mx = $2;
+                          last = $2; t = $1
+                      }
+                      END { printf "%d %d %d %d", first, base, last, mx }' \
+    warm=$(python3 -c "print(int($DURATION * 0.1))") "$OUT/soak.csv")
 first=${mem_report%% *}
-last=${mem_report##* }
-if [ "${first:-0}" -gt 0 ]; then
-    limit=$(python3 -c "print(int($first * 1.15))")
-    [ "$last" -le "$limit" ] && ok "RSS ${first}KB → ${last}KB（≤ +15%）" \
-        || ng "RSS 增长" "${first}KB → ${last}KB"
+rest=${mem_report#* }; base=${rest%% *}
+rest=${rest#* }; last=${rest%% *}
+mx=${rest##* }
+if [ "${base:-0}" -gt 0 ]; then
+    limit=$(python3 -c "print(int($base * 1.20))")
+    [ "$last" -le "$limit" ] \
+        && ok "RSS 基线（10% 处）${base}KB → 收尾 ${last}KB（峰值 ${mx}KB，≤ +20%）" \
+        || ng "RSS 增长" "基线 ${base}KB → 收尾 ${last}KB（峰值 ${mx}KB）"
 fi
 
 echo

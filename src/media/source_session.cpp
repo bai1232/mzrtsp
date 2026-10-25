@@ -496,7 +496,23 @@ SourceSession::Result SourceSession::read(Packet *out, std::string *error) {
         out->raw_pts_ms = pts_ms;
         out->payload = std::move(payload);
 
-        const int64_t effective = dts_ms + _loop_offset_ms.load();
+        // 【M11-a2b】**接缝处必须严格单调**：接续偏移是按"新一段的第一个包"算的，但有些源
+        //   （实测：FFmpeg 的 RTP 解包在**没有 RTCP SR** 时）会给连接后的头几个包一个更高的
+        //   假时间戳（0.2s），于是第二个包的原始 dts 反而更小 → 加上偏移后**倒退**，
+        //   FLV 里就出现非单调 dts、解码器报 `co located POCs unavailable`。
+        //   处理：整段**统一下移/上移到上一包之后**（不是逐包修补，段内节奏不抖），并计数。
+        int64_t effective = dts_ms + _loop_offset_ms.load();
+        if (_has_effective_dts && effective <= _last_effective_dts) {
+            const int64_t bump = (_last_effective_dts + 1) - effective;
+            _loop_offset_ms.fetch_add(bump);
+            effective += bump;
+            ++_seam_repairs;
+            if (_seam_repairs == 1) {
+                WarnP("SourceSession: 接缝时间戳修复第 1 次 —— 新一段的原始 dts 比第一包更早，"
+                      "整段后移 %lld ms（后续同类按计数处理）",
+                      static_cast<long long>(bump));
+            }
+        }
         if (!_has_effective_dts || effective > _last_effective_dts) {
             _last_effective_dts = effective;
             _has_effective_dts = true;
