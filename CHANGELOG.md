@@ -5,7 +5,12 @@
 
 ## [Unreleased]
 
-（下一版内容；v0.2.0 计划见 [docs/ROADMAP.md](docs/ROADMAP.md)）
+（下一版内容：v0.3 计划见 [docs/ROADMAP.md](docs/ROADMAP.md)）
+
+## [0.2.0] - 2026-10-25
+
+> 发布证据见 **[docs/ACCEPTANCE_v0.2.0.md](docs/ACCEPTANCE_v0.2.0.md)**（逐条 SC/NFR/FR 的状态 + 证据命令 + 实测数字）。
+> 本版是**新增功能**版（`Y` 位递增）：MKV/TS 输入、HLS 输出（含 TS 封装与浏览器播放页）、转码。
 
 ### Added（**M10-b：转码接进服务**，闭环 NFR-5 / FR-1.3 / FR-7.1）
 - **转码源 = 独立源**（`SourceManager::sourceKey`）：同一个文件 × 同一个转码规格 = 一个源

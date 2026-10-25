@@ -33,8 +33,18 @@
 **App 层（v0.1 实际形态，M6-c）**：`src/main.cpp` = `bin/mzmedia`，只做**接线**：
 命令行 → `SourceManager::Config`、把 `/live/` 与 `/flv.min.js` 两条路由挂到 `HttpServer`、
 把 `FlvSender` 交给连接托管。它**不认识** FLV 字节、也不碰 `Demuxer`（只用 `SourceManager` 的两三个入口）。
-层内代码不允许反向依赖，检查方式：
-`grep -rn "network/\|http/" src/output/`（应为空）、`grep -rn "#include \"mzmedia.h\"" src/`（应为空）。
+层内代码不允许反向依赖，检查方式（**只查真正的 include，注释里的路径不算**）：
+
+```bash
+grep -rn '#include "http/'   src/output/ src/media/   # 应为空
+grep -rn '#include "mzmedia.h"' src/                  # 只允许 src/main.cpp
+```
+
+**一个受控例外（M9-b 引入，v0.2.0 记录在案）**：`src/output/hls_service.h` include 了
+`network/event_poller.h` —— HLS 的**租约计时器**要用 `EventPoller::doDelayTask`。
+它仍然是**向下**依赖（Output 在 Network 之上，见上图的依赖方向），不是反向依赖；
+而 `FlvSender`/`FlvMuxer`/`MpegTsMuxer`/`HlsWriter` 这些**纯输出层**类**一律不碰** network/http。
+把 poller 抽象成"定时器接口"再注入，对这个规模是净增复杂度，所以选择留这一处并在此写清。
 
 **`third_party/` 是分层之外的特例**：里面只有两个浏览器播放器 —— `flv.js`（HTTP-FLV，Apache-2.0）
 与 `hls.js`（HLS，Apache-2.0，M9-c 入库）。它们**不参与 C++ 构建**（被 `src/main.cpp` 当静态文件
