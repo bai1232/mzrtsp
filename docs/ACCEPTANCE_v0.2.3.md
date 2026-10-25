@@ -126,4 +126,22 @@ DemuxerProducer（编排：搭链 / 驱动 / 转发观测）
 
 ### 7.1 tag 独立构建与测试（`VERSIONING.md` §5）
 
-（tag 推送后的实跑记录填在这一节。）
+tag 推送后**从本地仓库重新 clone**（不依赖工作区任何未提交改动）：
+
+```bash
+git clone --branch v0.2.3 /home/bpy/MyZltoolkit /tmp/v023_verify && cd /tmp/v023_verify
+./scripts/make_samples.sh
+cmake -B build && cmake --build build -j4
+cd build && ctest --output-on-failure
+```
+
+| 步骤 | 实测 |
+|---|---|
+| clone | `clone=0`；`HEAD=c1247b5`；`git describe --tags` = **`v0.2.3`** |
+| `make_samples.sh` | `samples=0` |
+| 配置 + 构建 | `configure=0`、`build=0`，**`warnings=0`** |
+| `ctest` | **25/25 通过**（294 用例） |
+| 单进程全量 | **294/294、64,027 断言** |
+
+> 回滚性：`git checkout v0.2.2` 能独立构建（回到单类实现，行为相同 —— 正因为行为相同，可用
+> `scripts/refactor_equiv_check.sh` 交叉验证两个 tag 的产物字节是否一致）。
