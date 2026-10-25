@@ -134,4 +134,22 @@ ffmpeg -v error -i /tmp/bf.flv -f null -     # 应无输出
 
 ### 7.1 tag 独立构建与测试（`VERSIONING.md` §5）
 
-见下方实跑记录。
+tag 推送后**从本地仓库重新 clone**（不依赖工作区任何未提交改动），走 `VERSIONING.md` §5 的最后一问：
+
+```bash
+git clone --branch v0.2.1 /home/bpy/MyZltoolkit /tmp/v021_verify && cd /tmp/v021_verify
+./scripts/make_samples.sh          # 样本不入库：bf.mp4 正是本版的关键样本
+cmake -B build && cmake --build build -j4
+cd build && ctest --output-on-failure
+```
+
+| 步骤 | 实测 |
+|---|---|
+| clone | `clone=0`；`HEAD=4a70bcb`；`git describe --tags` = **`v0.2.1`** |
+| `make_samples.sh` | `samples=0`（含 `bf.mp4` / `sample_hevc.mp4` / `sample1080.mp4` 等） |
+| `cmake -B build` + `cmake --build build -j4` | `configure=0`、`build=0`，**`warnings=0`** |
+| `ctest` | **24/24 通过**（286 用例） |
+| 单进程全量 | **286/286、63,265 断言** |
+
+> 这一步同时验证"可回滚"：切到 `v0.2.1` 能独立构建并跑完门禁；回退到 `v0.2.0` 也能构建
+> （但会重新出现 B 帧源的顺序问题 —— 这正是本版要修的）。
