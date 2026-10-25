@@ -64,14 +64,17 @@ def split_annexb(data):
 
 
 class Rtp:
-    def __init__(self, mt=96):
+    def __init__(self, mt=96, max_payload=1400):
         self.seq = 0
         self.mt = mt
+        self.max_payload = max_payload
 
     def packet(self, nal, ts, marker):
         """把一个 NAL 打成 1..N 个 RTP 包（返回 bytes 列表）"""
         out = []
-        max_payload = 1400
+        # TCP 交错传输没有 MTU 限制：`--no-fu-a` 时整个 NAL 一个 RTP 包
+        # （便于排查"首帧时间戳异常是不是分片路径引起的"）
+        max_payload = self.max_payload
         if len(nal) <= max_payload:
             payload = nal
             out.append(self._mk(ts, marker, payload))
@@ -207,7 +210,7 @@ class Server:
                 threading.Thread(target=self.stream, args=(conn,), daemon=True).start()
 
     def stream(self, conn):
-        rtp = Rtp()
+        rtp = Rtp(96, self.args.max_payload)
         ts_step = 90000 // 25
         n = min(self.args.frames, len(self.frames))
         t0 = time.time()
@@ -262,6 +265,8 @@ def main():
     ap.add_argument("--after", choices=["close", "silent", "hold"], default="hold")
     ap.add_argument("--no-sprop", action="store_true", help="SDP 里**不带** sprop-parameter-sets")
     ap.add_argument("--tcp-only", action="store_true", help="只接受 TCP 交错传输（UDP SETUP → 461）")
+    ap.add_argument("--max-payload", type=int, default=1400,
+                    help="单个 RTP 包的负载上限（>= 帧大小即不分片；TCP 交错下可调大）")
     ap.add_argument("--loop", action="store_true",
                     help="发完一轮从头再来（时间戳继续；关键帧周期性出现，供 HLS 切片）")
     args = ap.parse_args()
