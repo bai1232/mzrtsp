@@ -325,6 +325,8 @@ class Server:
             for pkt in rtp.packet(nal, ts, True):
                 if not self.send_packet(conn, state, 0, pkt):
                     return
+            if getattr(self.args, "trace_ts", False) and sent % 500 == 0:
+                self.log(f"   视频已发 {sent} 帧（i={i} ts={ts}）")
             target = t0 + (i + 1) / self.fps
             time.sleep(max(0.0, target - time.time()))
             sent += 1

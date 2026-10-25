@@ -57,6 +57,20 @@ for tool in python3 curl ffprobe ffmpeg; do
     command -v "$tool" > /dev/null 2>&1 || { echo "错误：需要 $tool" >&2; exit 1; }
 done
 
+# 只允许一个实例：两轮同时写同一个 OUT，CSV 会互相覆盖（踩过：数字全乱、看起来像"吞吐衰减"）
+exec 9> /tmp/rtsp_soak.lock
+if ! flock -n 9; then
+    echo "错误：已经有一个 rtsp_soak.sh 在跑（拿不到 /tmp/rtsp_soak.lock）→ 先等它结束" >&2
+    exit 1
+fi
+
+for p in "$PORT" "$RTSP_PORT"; do
+    if ss -ltn "sport = :$p" 2> /dev/null | grep -q LISTEN; then
+        echo "错误：端口 $p 已被占用（上一次的残留进程？）→ 先清理再跑，否则数字不可信" >&2
+        exit 1
+    fi
+done
+
 rm -rf "$OUT"
 mkdir -p "$OUT"
 FAKE_PID=""
@@ -118,7 +132,7 @@ CURL_PID=$!
 HLS_PID=$!
 
 echo "== 2) 每分钟采样（RSS / CPU / 包数 / 重连数 / 帧龄）=="
-echo "elapsed_s,rss_kb,cpu_pct,packets,reconnects,state,age_ms" > "$OUT/soak.csv"
+echo "elapsed_s,rss_kb,cpu_pct,packets,reconnects,state,age_ms,pid" > "$OUT/soak.csv"
 restarted=0
 while true; do
     now=$(date +%s)
@@ -162,8 +176,10 @@ else:
 ')
     rss=$(ps -o rss= -p "$SRV_PID" 2> /dev/null | tr -d ' ')
     cpu=$(ps -o %cpu= -p "$SRV_PID" 2> /dev/null | tr -d ' ')
-    echo "$elapsed,${rss:-0},${cpu:-0},$line" >> "$OUT/soak.csv"
-    [ $(( elapsed % 300 )) -lt 60 ] && echo "  t=${elapsed}s rss=${rss}KB cpu=${cpu}% $(echo "$line" | tr ',' ' ')"
+    [ -z "${rss:-}" ] && echo "  [警告] 第 ${elapsed}s 采样时服务端进程（pid $SRV_PID）不在了" >&2
+    echo "$elapsed,${rss:-0},${cpu:-0},$line,$SRV_PID" >> "$OUT/soak.csv"
+    [ $(( elapsed % 600 )) -lt 60 ] && \
+        echo "  t=${elapsed}s rss=${rss}KB cpu=${cpu}% $(echo "$line" | awk -F, '{printf "packets=%s reconnects=%s state=%s age=%sms", $1, $2, $3, $4}')"
     sleep 60
 done
 
@@ -248,6 +264,25 @@ if [ "${base:-0}" -gt 0 ]; then
     [ "$last" -le "$limit" ] \
         && ok "RSS 基线（10% 处）${base}KB → 收尾 ${last}KB（峰值 ${mx}KB，≤ +20%）" \
         || ng "RSS 增长" "基线 ${base}KB → 收尾 ${last}KB（峰值 ${mx}KB）"
+fi
+
+# 持续吞吐：把采样按时间分成"前 10%"与"后 10%"，两段平均包速率比较（衰减会让后段明显掉）
+head_rate=$(awk -F, -v span="$DURATION" 'NR > 1 && $4 ~ /^[0-9]+$/ {
+        if (t0 == "") { t0 = $1; p0 = $4 }
+        if ($1 <= t0 + span * 0.1) { p1 = $4; t1 = $1 }
+    } END { if (t1 > t0) printf "%.2f", (p1 - p0) / (t1 - t0); else print "-1" }' "$OUT/soak.csv")
+tail_rate=$(awk -F, -v span="$DURATION" 'NR > 1 && $4 ~ /^[0-9]+$/ {
+        t = $1; p = $4;
+        if (t >= span * 0.9 && t_first90 == "") { t_first90 = t; p_first90 = p }
+        t_last = t; p_last = p
+    } END { if (t_last > t_first90 && t_first90 != "") printf "%.2f", (p_last - p_first90) / (t_last - t_first90); else print "-1" }' "$OUT/soak.csv")
+if [ "${head_rate:-0}" != "-1" ] && [ "${tail_rate:-0}" != "-1" ]; then
+    ok_rate=$(python3 -c "print(1 if float('$tail_rate') >= 0.8 * float('$head_rate') else 0)")
+    if [ "$ok_rate" = "1" ]; then
+        ok "持续吞吐：前 10% ${head_rate} 包/秒 → 后 10% ${tail_rate} 包/秒（≥80%，没有衰减）"
+    else
+        ng "持续吞吐衰减" "前 10% ${head_rate} 包/秒 → 后 10% ${tail_rate} 包/秒"
+    fi
 fi
 
 echo

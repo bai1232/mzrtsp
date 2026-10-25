@@ -256,6 +256,8 @@ private:
     /// 【M11-a2b】"刚接缝"的窗口（还剩几个包可以修时间戳）：接缝后 8 个包足够覆盖
     /// 源的乱序头（实测 1–3 个），又不会把正常文件的轻微乱序也一起"修"
     int _seam_window = 0;
+    /// 【M11-a2b】每条流"最后一次生效 dts"（按流判倒退；跨流比较是错的，见 read() 里的注释）
+    std::vector<int64_t> _last_effective_by_stream;
 
     /// 只有源线程碰：一趟的 dts 轨迹
     std::vector<PassTrack> _pass;

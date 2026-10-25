@@ -95,6 +95,7 @@ bool SourceSession::open(const std::string &path, const Demuxer::Options &option
     _opened_at_ms.store(static_cast<int64_t>(getCurrentMillisecond()));
     _loop_offset_ms.store(0);
     _pass.assign(_demux.streams().size(), PassTrack{});
+    _last_effective_by_stream.assign(_demux.streams().size(), -1);
     // 打开时记下**源**流参数快照（重开时校验用；不刷新 —— 输出层持有它的裸指针）
     if (const StreamInfo *video = _demux.firstVideo()) {
         _raw_video_info = *video;
@@ -510,16 +511,26 @@ SourceSession::Result SourceSession::read(Packet *out, std::string *error) {
         if (_seam_window > 0) {
             --_seam_window;
         }
-        if (in_seam_window && _has_effective_dts && effective <= _last_effective_dts) {
-            const int64_t bump = (_last_effective_dts + 1) - effective;
-            _loop_offset_ms.fetch_add(bump);
-            effective += bump;
-            ++_seam_repairs;
-            if (_seam_repairs == 1) {
-                WarnP("SourceSession: 接缝时间戳修复第 1 次 —— 新一段的原始 dts 比第一包更早，"
-                      "整段后移 %lld ms（后续同类按计数处理）",
-                      static_cast<long long>(bump));
+        // 【关键】**按流**判倒退，绝不能跨流比：音视频两条轴本来就是你追我赶（video 1040、
+        //   audio 1039 是**正常**的），跨流一比就每包都"该修"，偏移量越修越大 ——
+        //   实测 `loop_offset_ms` 半分钟涨到 28 s，节流按 dts 走 → 整条源被拖到 0.5 倍速。
+        const size_t sidx = static_cast<size_t>(stream_index);
+        if (sidx < _last_effective_by_stream.size()) {
+            const int64_t prev = _last_effective_by_stream[sidx];
+            // 网络源：同一条流里倒退就要修（实测会偶发 4 ms 抖动）；本地文件只在接缝窗口里修
+            const bool can_repair = _network || in_seam_window;
+            if (can_repair && prev > 0 && effective <= prev) {
+                const int64_t bump = (prev + 1) - effective;
+                _loop_offset_ms.fetch_add(bump);
+                effective += bump;
+                ++_seam_repairs;
+                if (_seam_repairs == 1) {
+                    WarnP("SourceSession: 时间轴修复第 1 次 —— 这一包在同一路流里会让 dts 倒退，"
+                          "整段后移 %lld ms（后续同类按计数处理）",
+                          static_cast<long long>(bump));
+                }
             }
+            _last_effective_by_stream[sidx] = effective;
         }
         if (!_has_effective_dts || effective > _last_effective_dts) {
             _last_effective_dts = effective;
