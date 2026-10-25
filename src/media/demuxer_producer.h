@@ -69,6 +69,12 @@ public:
         /// 传输方式：`auto`（FFmpeg 默认：UDP 优先、被拒自动回退 TCP）/ `tcp` / `udp`
         enum class Transport { Auto = 0, Tcp = 1, Udp = 2 };
         Transport transport = Transport::Auto;
+        /// 【M11-a2】断流重连（网络源）：退避 1→2→4→8→16→封顶 30s，读到第一个包才复位
+        bool reconnect_enabled = true;
+        int64_t backoff_initial_ms = 1000;
+        int64_t backoff_max_ms = 30000;
+        /// 0 = 不设上限（一直退避重试，但每次都有计数与日志）
+        int max_attempts = 0;
     };
 
     struct Config {

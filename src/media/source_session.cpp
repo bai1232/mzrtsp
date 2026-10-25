@@ -11,6 +11,8 @@
 #include "core/logger.h"
 #include "core/util.h"
 
+#include <chrono>
+#include <thread>
 #include <utility>
 
 namespace mzmedia {
@@ -81,6 +83,7 @@ bool SourceSession::open(const std::string &path, const Demuxer::Options &option
     }
     _path = path;
     _network = isNetworkMediaUrl(path);
+    _options = options;   // 重连要用**同一批**打开选项（transport/timeout/探测上限）
     _opened_at_ms.store(static_cast<int64_t>(getCurrentMillisecond()));
     _loop_offset_ms.store(0);
     _pass.assign(_demux.streams().size(), PassTrack{});
@@ -92,6 +95,10 @@ bool SourceSession::open(const std::string &path, const Demuxer::Options &option
     if (const StreamInfo *audio = _demux.firstAudio()) {
         _raw_audio_info = *audio;
         _has_audio_info = true;
+    }
+    if (_network) {
+        _net_state.store(NetState::Playing);
+        ++_connects;
     }
     return true;
 }
@@ -248,6 +255,142 @@ bool SourceSession::reopenForLoop() {
     return true;
 }
 
+const char *SourceSession::netStateName(NetState state) {
+    switch (state) {
+    case NetState::Idle: return "idle";
+    case NetState::Playing: return "playing";
+    case NetState::Reconnecting: return "reconnecting";
+    case NetState::Failed: return "failed";
+    }
+    return "unknown";
+}
+
+bool SourceSession::setReconnect(const Reconnect &reconnect) {
+    if (reconnect.enabled && !_policy.setConfig(reconnect.policy)) {
+        return false; // 退避参数非法：保持原值（不静默改成"看起来合理"的数）
+    }
+    _reconnect = reconnect;
+    return true;
+}
+
+int64_t SourceSession::lastPacketAgeMs() const {
+    const int64_t last = _last_packet_ms.load();
+    if (last <= 0) {
+        return 0;
+    }
+    const int64_t now = static_cast<int64_t>(getCurrentMillisecond());
+    return (now > last) ? (now - last) : 0;
+}
+
+std::string SourceSession::lastNetError() const {
+    std::lock_guard<std::mutex> lock(_net_mutex);
+    return _last_net_error;
+}
+
+bool SourceSession::sleepInterruptibleMs(int64_t delay_ms) {
+    // 小片睡眠：既尊重中止标志（stop() 不该等满 30s），也不忙等
+    constexpr int64_t kSliceMs = 50;
+    int64_t remaining = delay_ms;
+    while (remaining > 0) {
+        if (_abort != nullptr && _abort->load()) {
+            return false;
+        }
+        const int64_t slice = (remaining < kSliceMs) ? remaining : kSliceMs;
+        std::this_thread::sleep_for(std::chrono::milliseconds(slice));
+        remaining -= slice;
+    }
+    return !(_abort != nullptr && _abort->load());
+}
+
+void SourceSession::continueTimelineAt(int64_t raw_first_dts_ms) {
+    // 目标：新一段的**第一帧**落在"上一包生效 dts + 一帧间隔"之后。
+    // 无论对端是"接着发"（raw dts 已经是后续值）还是"从 0 重来"，这个公式都成立：
+    //   offset = 目标 − 新的原始 dts
+    int64_t gap = 0;
+    if (const StreamInfo *video = _demux.firstVideo()) {
+        gap = estimateFrameDurationMs(*video);
+    }
+    if (gap <= 0) {
+        gap = kLoopGapMs; // 拿不到帧率就至少前进 1ms（不原地打转）
+    }
+    _loop_offset_ms.store(
+        timelineOffsetForReconnect(_last_effective_dts, _has_effective_dts, raw_first_dts_ms, gap));
+    InfoP("SourceSession: 重连后接续时间轴 —— 上一包生效 dts=%lld，新一段原始 dts=%lld → 偏移 %lld ms",
+          static_cast<long long>(_last_effective_dts), static_cast<long long>(raw_first_dts_ms),
+          static_cast<long long>(_loop_offset_ms.load()));
+}
+
+bool SourceSession::reconnectNetwork(std::string *error) {
+    while (true) {
+        if (_abort != nullptr && _abort->load()) {
+            if (error != nullptr) {
+                *error = "重连被中止（源被停）";
+            }
+            _net_state.store(NetState::Failed);
+            return false;
+        }
+        const int64_t delay = _policy.nextDelayMs();
+        if (delay < 0) {
+            if (error != nullptr) {
+                *error = "重连次数达到上限（" +
+                         std::to_string(_reconnect.policy.max_attempts) +
+                         " 次）仍失败 → 放弃这一路（不伪装成「播完了」）";
+            }
+            _net_state.store(NetState::Failed);
+            ErrorL << "SourceSession: " << (error != nullptr ? *error : "重连放弃");
+            return false;
+        }
+        _net_state.store(NetState::Reconnecting);
+        WarnP("SourceSession[%s]: 断流 → %lld ms 后第 %llu 次重连",
+              redactMediaUrl(_path).c_str(), static_cast<long long>(delay),
+              static_cast<unsigned long long>(_policy.attempts()));
+        if (!sleepInterruptibleMs(delay)) {
+            if (error != nullptr) {
+                *error = "重连等待期间被中止（源被停）";
+            }
+            _net_state.store(NetState::Failed);
+            return false;
+        }
+
+        (void) _demux.close();
+        if (!_demux.open(_path, _options)) {
+            // 打不开 = 这一轮失败：**继续退避**（对端可能还没起来），并记下原因供排查
+            {
+                std::lock_guard<std::mutex> lock(_net_mutex);
+                _last_net_error = redactMediaUrl(_demux.lastError());
+            }
+            WarnP("SourceSession[%s]: 第 %llu 次重连打不开（%s）",
+                  redactMediaUrl(_path).c_str(),
+                  static_cast<unsigned long long>(_policy.attempts()),
+                  redactMediaUrl(_demux.lastError()).c_str());
+            continue;
+        }
+        // 参数没变才继续（与循环重开同一套校验：变了 = 换了源，明确失败）
+        const StreamInfo *video = _demux.firstVideo();
+        const StreamInfo *audio = _demux.firstAudio();
+        const bool video_ok = (_has_video_info == (video != nullptr)) &&
+                              (!_has_video_info || sameStreamParams(_raw_video_info, *video));
+        const bool audio_ok = (_has_audio_info == (audio != nullptr)) &&
+                              (!_has_audio_info || sameStreamParams(_raw_audio_info, *audio));
+        if (!video_ok || !audio_ok) {
+            _net_state.store(NetState::Failed);
+            if (error != nullptr) {
+                *error = "重连后流参数与断开前不一致（对端换了码流？）→ 放弃这一路";
+            }
+            ErrorL << "SourceSession: " << (error != nullptr ? *error : "参数不一致");
+            return false;
+        }
+        _pass.assign(_demux.streams().size(), PassTrack{}); // 新一段从零记
+        _reconnect_needs_timeline = true; // 读到新一段的第一个包时接续时间轴
+        ++_connects;
+        ++_reconnects;
+        _net_state.store(NetState::Playing);
+        InfoP("SourceSession[%s]: 重连成功（第 %llu 次尝试）", redactMediaUrl(_path).c_str(),
+              static_cast<unsigned long long>(_policy.attempts()));
+        return true;   // 退避复位在"读到第一个包"之后（read() 里调 onSuccess）
+    }
+}
+
 SourceSession::Result SourceSession::read(Packet *out, std::string *error) {
     if (out == nullptr || error == nullptr) {
         setError("read 的出参为空（调用方 bug）");
@@ -273,7 +416,23 @@ SourceSession::Result SourceSession::read(Packet *out, std::string *error) {
             continue; // 重开成功：接着读新一趟（时间戳已由偏移接上）
         }
         if (result == Demuxer::ReadResult::Error) {
-            setError(_demux.lastError()); // 如实转达（含超时/超限/损坏）
+            const std::string reason = _demux.lastError();
+            setError(reason); // 如实转达（含超时/超限/损坏）
+            // 【M11-a2】网络源：断流/超时 → **进入重连**，绝不把 Error 抛给 SourcePump
+            //   （SourcePump 见 Error 就 endOfStream()，观众会掉线 —— 见 DESIGN_M11 §3）
+            if (_network && _reconnect.enabled && !(_abort != nullptr && _abort->load())) {
+                {
+                    std::lock_guard<std::mutex> lock(_net_mutex);
+                    _last_net_error = redactMediaUrl(reason);
+                }
+                std::string reconnect_error;
+                if (!reconnectNetwork(&reconnect_error)) {
+                    setError(reconnect_error);
+                    *error = lastError();
+                    return Result::Error;
+                }
+                continue; // 重连成功：接着读（pending 为空，下一轮会读到新一段的包）
+            }
             *error = lastError();
             return Result::Error;
         }
@@ -311,12 +470,25 @@ SourceSession::Result SourceSession::read(Packet *out, std::string *error) {
         auto payload = std::make_shared<const std::vector<uint8_t>>(
             pkt->data, pkt->data + static_cast<size_t>(pkt->size));
 
+        // 【M11-a2】刚重连上：用这一包确定新一段的趟偏移（把时间轴接在上一包之后）
+        if (_network && _reconnect_needs_timeline) {
+            _reconnect_needs_timeline = false;
+            continueTimelineAt(dts_ms);
+        }
+
         out->kind = kind;
         out->stream_index = stream_index;
         out->key = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
         out->raw_dts_ms = dts_ms;
         out->raw_pts_ms = pts_ms;
         out->payload = std::move(payload);
+
+        const int64_t effective = dts_ms + _loop_offset_ms.load();
+        if (!_has_effective_dts || effective > _last_effective_dts) {
+            _last_effective_dts = effective;
+            _has_effective_dts = true;
+        }
+        _last_packet_ms.store(static_cast<int64_t>(getCurrentMillisecond()));
 
         ++_packets;
         _bytes += out->payload->size();

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# M11-a1 验收：RTSP 输入（能连上、能拉、缺参数集当场拒绝）
+# M11-a1 + a2 验收：RTSP 输入（能连上、能拉、缺参数集当场拒绝、断流自愈）
 #
 # 为什么能用脚本验：真摄像机不可控，所以用一个**零依赖的假 RTSP 服务端**
 # （`scripts/rtsp_fake_server.py`，纯 python3 标准库）把"协议行为"变成可注入的：
@@ -10,7 +10,7 @@
 #   · 带凭据的 URL → 日志与 /api/stats 必须脱敏
 #
 # **不能**证明（要真机，见 docs/DESIGN_M11.md §7）：真实摄像机的时间戳/乱序行为、
-# UDP 丢包、RTSP 鉴权（Basic/Digest）、断流重连（属 M11-a2）。
+# UDP 丢包、RTSP 鉴权（Basic/Digest）；断流自愈见 §8（注入故障，不是真网络抖动）。
 #
 # 用法：./scripts/rtsp_test.sh
 # 依赖：build/bin/mzmedia、samples/sample.h264、python3、curl、ffprobe、ffmpeg
@@ -25,6 +25,8 @@ PORT=$(( (RANDOM % 2000) + 26000 ))
 RTSP_OK=$(( PORT + 100 ))
 RTSP_NOSPROP=$(( PORT + 101 ))
 RTSP_TCPONLY=$(( PORT + 102 ))
+RTSP_CLOSE=$(( PORT + 103 ))   # M11-a2：发 N 帧后关连接（对端消失）
+RTSP_SILENT=$(( PORT + 104 ))  # M11-a2：发 N 帧后半开（只靠读超时能发现）
 OUT="/tmp/mzmedia_rtsp"
 SRV_PID=""
 FAKE_PIDS=""
@@ -66,18 +68,25 @@ start_fake() { # start_fake <port> <额外参数...>
 start_fake "$RTSP_OK" --frames 400 --loop --after hold
 start_fake "$RTSP_NOSPROP" --frames 100 --after hold --no-sprop
 start_fake "$RTSP_TCPONLY" --frames 400 --loop --after hold --tcp-only
+# 断流源：**第一条连接**只发 25 帧（1 秒）就断（close=关连接 / silent=半开），
+# 之后一直推流（--fault-close-first）—— 这样"重连成功"才会有后续数据可测
+start_fake "$RTSP_CLOSE" --frames 25 --after close --fault-close-first
+start_fake "$RTSP_SILENT" --frames 25 --after silent --fault-close-first
 sleep 1.5
 ok_sources=0
-for port in "$RTSP_OK" "$RTSP_NOSPROP" "$RTSP_TCPONLY"; do
+for port in "$RTSP_OK" "$RTSP_NOSPROP" "$RTSP_TCPONLY" "$RTSP_CLOSE" "$RTSP_SILENT"; do
     grep -q "监听 127.0.0.1:$port" "$OUT/fake_$port.log" && ok_sources=$((ok_sources + 1))
 done
-check "三个假 RTSP 源就绪" "$ok_sources" "3"
+check "五个假 RTSP 源就绪" "$ok_sources" "5"
 
 "$SERVER" --port "$PORT" --media-root "$ROOT/samples" --log-level info \
     --rtsp "rtsp://127.0.0.1:$RTSP_OK/live#cam1" \
     --rtsp "rtsp://127.0.0.1:$RTSP_NOSPROP/live#bad" \
     --rtsp "rtsp://127.0.0.1:$RTSP_TCPONLY/live#tcp" \
     --rtsp "rtsp://user:secret123@127.0.0.1:$RTSP_OK/live#auth" \
+    --rtsp "rtsp://127.0.0.1:$RTSP_CLOSE/live#brk" \
+    --rtsp "rtsp://127.0.0.1:$RTSP_SILENT/live#half" \
+    --rtsp-timeout-ms 3000 \
     > "$OUT/server.log" 2>&1 &
 SRV_PID=$!
 ready=no
@@ -198,7 +207,90 @@ else
     check_false "日志里能看到脱敏后的 URL" "没找到 ***"
 fi
 
+echo "== 8) 断流自愈（M11-a2）：对端消失 / 半开，都要自动重连且**不打断观众** =="
+# 判据四件事：
+#   ① 观众连接一直没被结束：curl 20 秒后退出码必须是 28（超时），而不是 0（对端正常关流 = 被 EOS 踢了）；
+#   ② 时间轴**不倒退**且持续前进：跨重连处 dts 不许变小，且总时长远超第一段（25 帧 ≈ 1 秒）；
+#   ③ 所有帧都能解出来（-count_frames），且没有"非单调 dts"以外的解码错误；
+#   ④ /api/stats 的 rtsp 段：reconnects ≥ 1 且 state 回到 playing。
+#
+# 注：这里**不断言**"dts 严格递增"。假源没发 RTCP SR，FFmpeg 给每个连接的第一个包
+# 一个乱序 pts（0.2s，第 5 帧的位置），我们的单调守卫把它后面 5 个包钳到同一 dts →
+# 每个连接开头（含重连处）会有 6 个重复 dts，这是**源/FFmpeg**的已知现象
+# （见 docs/DESIGN_M11.md §5.2 观测 3），不是重连逻辑的错；真机有 RTCP SR 不会这样。
+self_heal() { # self_heal <名字> <端口> <说明>
+    local name="$1" port="$2" label="$3"
+    local flv="$OUT/${name}.flv"
+    local rc=0
+    # 20 秒：足够覆盖"断开 → 退避 1s → 重连 → 继续推流"
+    curl -s -o "$flv" --max-time 20 "$BASE/live/${name}.flv" || rc=$?
+    local bytes
+    bytes=$(stat -c%s "$flv" 2> /dev/null || echo 0)
+    if [ "${bytes:-0}" -gt 10000 ]; then
+        printf '  ✔ %-44s %s 字节\n' "$label：20 秒内持续有数据" "$bytes"
+        pass=$((pass + 1))
+    else
+        check_false "$label：20 秒内持续有数据" "${bytes} 字节（重连后没有继续推流？）"
+    fi
+    # ① 观众没被踢：curl 仍在等数据（超时退出 28），不是收到 EOF 正常结束
+    check "$label：观众连接没被 EOS 结束（curl=28）" "$rc" "28"
+    # ② 时间轴不倒退 + 持续前进
+    if ffprobe -v error -select_streams v:0 -show_entries packet=dts_time -of csv=p=0 "$flv" \
+        | awk 'NF && $1 != "N/A" { v = $1 + 0; if (last != "" && v < last) back = 1; last = v; if (v > mx) mx = v; n++ }
+               END { exit (back || n < 60 || mx < 5.0) }'; then
+        check_true "$label：跨重连 dts 不倒退且持续前进"
+    else
+        check_false "$label：跨重连 dts 不倒退且持续前进" \
+            "$(ffprobe -v error -select_streams v:0 -show_entries packet=dts_time -of csv=p=0 "$flv" \
+               | awk 'NF && $1 != "N/A" { v = $1 + 0; if (last != "" && v < last) back++; last = v; if (v > mx) mx = v; n++ }
+                      END { printf "包=%d 倒退=%d 最远=%.2fs", n, back + 0, mx + 0 }')"
+    fi
+    # ③ 全部帧可解；错误只允许已知的"非单调 dts"（假源每个连接开头的重复 dts）
+    local frames errs
+    frames=$(ffprobe -v error -select_streams v:0 -count_frames \
+        -show_entries stream=nb_read_frames -of csv=p=0 "$flv" | awk 'NF' | head -1)
+    # 允许的只有已知的"重复 dts"一族（含 ffmpeg 的 "Last message repeated N times" 折叠行）
+    errs=$(ffmpeg -v error -i "$flv" -f null - 2>&1 > /dev/null \
+        | grep -vE "non monotonically increasing dts|Last message repeated [0-9]+ times" | head -2)
+    if [ "${frames:-0}" -ge 200 ] && [ -z "$errs" ]; then
+        check_true "$label：解出 $frames 帧、无其它解码错误"
+    else
+        check_false "$label：解出 $frames 帧、无其它解码错误" "${errs:-见日志}"
+    fi
+    # ④ stats：重连计数与状态
+    curl -s --max-time 5 "$BASE/api/stats" > "$OUT/stats_$name.json"
+    python3 - "$OUT/stats_$name.json" "$port" << 'PY' || return 0
+import json, sys
+path, port = sys.argv[1], sys.argv[2]
+d = json.load(open(path))
+# 多路 RTSP 源的 URL 可能同名不同端口（本用例就是这样），所以按端口定位，别按名字猜
+rtsp = None
+for s in d.get("media_sources", []):
+    r = (s.get("producer") or {}).get("rtsp")
+    if r and r.get("enabled") and (":%s/" % port) in (r.get("url") or ""):
+        rtsp = r
+if rtsp is None:
+    sys.exit("没有找到端口 %s 的 rtsp 段" % port)
+print("state=%s reconnects=%s attempts=%s" % (rtsp.get("state"), rtsp.get("reconnects"), rtsp.get("attempts")))
+sys.exit(0 if int(rtsp.get("reconnects", 0)) >= 1 else 1)
+PY
+    if [ $? -eq 0 ]; then
+        check_true "$label：stats 显示 reconnects ≥ 1"
+    else
+        check_false "$label：stats 显示 reconnects ≥ 1" "见 $OUT/stats_$name.json"
+    fi
+}
+self_heal "brk" "$RTSP_CLOSE" "对端消失（--after close）"
+self_heal "half" "$RTSP_SILENT" "半开静默（--after silent，3s 读超时）"
+# 重连日志必须能看（可观测性：不能只在 stats 里有个数字）
+reconn_logs=$(grep -c "断流 → " "$OUT/server.log" || true)
+if [ "${reconn_logs:-0}" -ge 2 ]; then
+    check_true "日志里能看到断流与退避（$reconn_logs 条）"
+else
+    check_false "日志里能看到断流与退避" "$reconn_logs 条"
+fi
+
 echo
 echo "结果：通过 $pass 项 / 失败 $fail 项（产物：$OUT）"
 [ "$fail" -eq 0 ] || { echo "结论：M11-a1 未通过"; exit 1; }
-echo "结论：M11-a1 通过（RTSP 能连、能拉 FLV 与 HLS、缺参数集当场拒绝、TCP 回退、凭据脱敏）"
+echo "结论：M11-a1 + a2 通过（RTSP 能连能拉、缺参数集当场拒绝、TCP 回退、凭据脱敏；断流自动重连且观众不掉线）"

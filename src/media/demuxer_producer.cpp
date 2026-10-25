@@ -28,6 +28,27 @@
 
 namespace mzmedia {
 
+namespace {
+
+/// JSON 字符串转义（`last_error` 里可能有引号/反斜杠/换行 —— 不能让 stats 变成非法 JSON）
+std::string jsonEscapeJsonString(const std::string &in) {
+    std::string out;
+    out.reserve(in.size() + 8);
+    for (const char c : in) {
+        switch (c) {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': break;
+        case '\t': out += "\\t"; break;
+        default: out += c; break;
+        }
+    }
+    return out;
+}
+
+} // namespace
+
 DemuxerProducer::DemuxerProducer(const Config &config)
     : _config(config)
     , _session(SourceSession::Config{config.demux, config.loop}) {}
@@ -144,15 +165,20 @@ std::string DemuxerProducer::rtspStatsJson() const {
     if (!_network) {
         return "null"; // 本地文件源：没有这个字段的内容（不制造假数据）
     }
-    const int64_t now = static_cast<int64_t>(getCurrentMillisecond());
-    const int64_t age = (_last_packet_ms > 0 && now > _last_packet_ms) ? (now - _last_packet_ms) : 0;
-    std::string out = "{\"enabled\":true,\"state\":\"playing\"";
-    out += ",\"url\":\"" + redactMediaUrl(_session.path()) + "\"";
-    out += ",\"connects\":1";      // a1：只有首次连接；a2 起由重连策略维护
-    out += ",\"reconnects\":0";
-    out += ",\"attempts\":0";
-    out += ",\"backoff_ms\":0";
+    // 【M11-a2】状态由 `SourceSession` 维护（idle/playing/reconnecting/failed + 计数）
+    const int64_t age = _session.lastPacketAgeMs();
+    std::string out = "{\"enabled\":true,\"state\":\"";
+    out += SourceSession::netStateName(_session.netState());
+    out += "\",\"url\":\"" + redactMediaUrl(_session.path()) + "\"";
+    out += ",\"connects\":" + std::to_string(_session.connects());
+    out += ",\"reconnects\":" + std::to_string(_session.reconnects());
+    out += ",\"attempts\":" + std::to_string(_session.reconnectAttempts());
+    out += ",\"backoff_ms\":" + std::to_string(_session.nextBackoffMs());
     out += ",\"last_packet_age_ms\":" + std::to_string(age);
+    const std::string net_error = _session.lastNetError();
+    if (!net_error.empty()) {
+        out += ",\"last_error\":\"" + jsonEscapeJsonString(net_error) + "\"";
+    }
     out += "}";
     return out;
 }
@@ -314,6 +340,20 @@ bool DemuxerProducer::open(const std::string &path) {
         options = Demuxer::Options{};
     }
 
+    // 【M11-a2】断流重连（只有网络源；本地文件由 `loop` 那一套负责）
+    if (_network) {
+        SourceSession::Reconnect reconnect;
+        reconnect.enabled = _config.rtsp.reconnect_enabled;
+        reconnect.policy.initial_ms = _config.rtsp.backoff_initial_ms;
+        reconnect.policy.max_ms = _config.rtsp.backoff_max_ms;
+        reconnect.policy.max_attempts = _config.rtsp.max_attempts;
+        if (!_session.setReconnect(reconnect)) {
+            setError("RTSP 重连参数非法（backoff_initial/backoff_max/max_attempts 超界）→ 明确拒绝");
+            ErrorL << "DemuxerProducer::open 失败：" << lastError();
+            _network = false;
+            return false;
+        }
+    }
     if (!_session.open(path, options)) {
         setError(_session.lastError()); // 不吞掉下层原因
         if (_network) {

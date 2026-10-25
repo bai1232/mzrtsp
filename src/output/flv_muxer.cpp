@@ -231,8 +231,21 @@ FlvMuxer::Result FlvMuxer::appendTag(uint8_t type, uint32_t timestamp_ms, const 
 }
 
 FlvMuxer::Result FlvMuxer::writeVideoTag(const MediaPacket &packet, std::string *out) {
-    const int64_t composition = packet.ptsMs() - packet.dtsMs();
-    if (composition < kInt24Min || composition > kInt24Max) {
+    int64_t composition = packet.ptsMs() - packet.dtsMs();
+    // 【M11-a2】**负 cts 兜底**：FLV 规范允许负值，但 FFmpeg 系播放器会当作非法时间戳**丢帧**
+    //   （实测 ffplay 打 `Negative cts` / `Invalid timestamps ... pts=-200, dts=0` 并丢包）。
+    //   所以这里钳到 0：画面顺序退化为解码顺序（就那几帧），但**不丢帧**，并且：
+    //   · 计数（`negativeCompositionCount()` 进 stats）+ **Warn 一次** —— 不静默。
+    if (composition < 0) {
+        ++_negative_composition;
+        if (_negative_composition == 1) {
+            WarnP("FlvMuxer: 源给出负 CompositionTime（pts-dts=%.3f ms）→ 钳到 0（不丢帧）；"
+                  "后续同类按计数处理，解码顺序即显示顺序",
+                  static_cast<double>(composition));
+        }
+        composition = 0;
+    }
+    if (composition > kInt24Max) {
         return fail(Result::InvalidPacket,
                     "CompositionTime 超出 24 位有符号范围（pts-dts=" + std::to_string(composition) + "ms）");
     }

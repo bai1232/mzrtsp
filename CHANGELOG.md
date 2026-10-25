@@ -5,8 +5,8 @@
 
 ## [Unreleased]
 
-（v0.3.0 进行中：**M11-a1 已完成**（RTSP 能连、能拉）；a2 断流重连 / a3 1 小时验收待做。
-设计见 [docs/DESIGN_M11.md](docs/DESIGN_M11.md)）
+（v0.3.0 进行中：**M11-a1 ✅**（RTSP 能连、能拉）、**a2 ✅**（断流自动重连、观众不掉线）；
+a3 1 小时长跑与验收文档待做。设计见 [docs/DESIGN_M11.md](docs/DESIGN_M11.md)）
 
 ### Added（**M11-a1：RTSP 输入**，v0.3-a 的第一批）
 - `--rtsp <url>[#name]`（可重复）：把 RTSP 源注册成 `/live/<name>.flv` 与 `/hls/<name>.m3u8`
@@ -37,9 +37,44 @@
   "密码里带 @"、"本地路径必须 no-op"）；**未开 `--rtsp` 时用不可达 URL 也不联网**、
   且错误信息里不含密码。
 
+### Added（**M11-a2：断流自愈**，v0.3-a 的第二批）
+- `media/reconnect_policy.{h,cpp}`（新，**纯逻辑、可单测**）：指数退避 `1→2→4→8→16→30 s` 封顶、
+  `--rtsp-backoff-initial-ms` / `--rtsp-backoff-max-ms` / `--rtsp-max-attempts`（0 = 不设上限，
+  但**不是**"无限快重试"—— 次数上限与退避是两件事）；`nextDelayMs()` 用尽返回 −1，
+  `onSuccess()` 才复位。参数越界一律**拒绝启动**（有界，0 ≠ 无限）。
+- `SourceSession` 接入重连：`NetState{Idle,Playing,Reconnecting,Failed}`、`connects/reconnects/
+  attempts/next_backoff_ms/last_packet_age_ms/last_net_error` 观测；`sleepInterruptibleMs()`
+  用 50 ms 切片等待，**源被停时能立刻退出**（不会让关停等满 30 s 退避）。
+- **时间戳接续** `continueTimelineAt()`：`偏移 = (上一包生效 dts + 一帧间隔) − 新一段原始 dts`，
+  对"对端接着发"和"对端从 0 重来"两种情况都成立；复用循环重开的同一条趟偏移通道。
+- **观众语义**：重连期间 `read()` **绝不返回 `Error`**（否则 `SourcePump` 会 `endOfStream()`，
+  观众被踢下线）；只有"参数变了 / 次数用尽 / 被中止"三种情况才明确失败。
+- `/api/stats` 的 `rtsp` 段补齐 `state/reconnects/attempts/backoff_ms/last_error`（URL 脱敏）。
+- `scripts/rtsp_fake_server.py` 新增 `--fault-close-first`：故障只发生在**第一条**连接、之后一直推流
+  —— 否则"每轮 25 帧就断"只能证明"反复断"，证明不了"自愈"。
+- `scripts/rtsp_test.sh` §8（**新增 10 项**，总计 **33 项**）：`--after close` 与 `--after silent`
+  两个注入场景 × {20 s 内持续有数据、`curl=28`（观众没被 EOS 结束）、跨重连 dts 不倒退且持续前进、
+  全部帧可解且无其它解码错误、stats `reconnects ≥ 1`}。
+
+### Fixed（**M11-a2**，都是实测撞出来的）
+- **FLV 负 CompositionTime**：源给出 `pts < dts`（假 RTSP 源首个包的乱序 pts 就会）时，
+  原来按补码写进 24 位字段 → ffplay/ffmpeg 打 `Negative cts` / `Invalid timestamps` 并丢帧。
+  现在**钳到 0 并计数**（`negativeComposition()`，Warn 只打一次）+ stats 暴露，不丢帧、不静默。
+- 假服务端"每轮都断"导致自愈用例永远测不出**重连之后**的行为（见上 `--fault-close-first`）。
+
+### Removed（**M11-a2**）
+- `SourceSession::_pending`（设计里"重连成功时先存第一个包、由 `read()` 补交"的预留队列）：
+  实现时发现没必要 —— `read()` 读到新一段第一个包时就地算偏移、就地返回，少一个队列、
+  少一处状态不一致的可能。死代码不留。
+
+
 ### Tests / 门禁
-- **297 用例 / 26 分组**（原 294 / 25，新增 `rtsp` 组 3 例）；ASAN **26/26**；
-  TSAN **391 用例真问题 0**；脚本全绿（含新增的 `rtsp` 22 项与等价性 11 项）。
+- **303 用例 / 26 分组**（a2 新增 `pipeline` 组 4 例：接续公式 3 例 + 状态名 1 例；
+  断言 **64,098** 条）；ASAN **26/26**；TSAN **397 用例真问题 0**；
+  脚本全绿：`rtsp` **33 项**（a1 22 + a2 11）、`flv_http` 104、`hls` 40、`ts_mux` 29、
+  `transcode` 12、`flv_mux` 8、`http`、等价性 11。
+- **变异验证**（新增用例不是"写出来就绿"）：把 `timelineOffsetForReconnect` 的
+  `+ frame_gap_ms` 删掉 → 3 例红；把 `has_last` 分支写成恒取 `raw_first` → 2 例红；恢复后 12/12 绿。
 - `transcode_test.sh` 的 NFR-5 速度改为"第一次 <1.0x 就复测一次、取较好值并打印两次数字"
   （那一轮门禁机器被抢，实测过一次 0.46x；空闲复测 3.95x —— 真回归两次都会低）。
 

@@ -90,6 +90,10 @@ public:
     Result writePacket(const MediaPacket &packet, std::string *out);
 
     // 观测
+    /// 【M11-a2】负 CompositionTime 被钳到 0 的次数（>0 说明源的显示顺序信息不完整）
+    uint64_t negativeCompositionCount() const {
+        return _negative_composition;
+    }
     uint64_t tagCount() const {
         return _tag_count;
     }
@@ -120,6 +124,7 @@ private:
     bool _base_fixed = false;
 
     uint64_t _tag_count = 0;
+    uint64_t _negative_composition = 0; ///< cts<0 被钳 0 的次数（一次 Warn）
     uint64_t _bytes_written = 0;
     uint32_t _last_timestamp = 0;
     uint64_t _clamped_before_base = 0;

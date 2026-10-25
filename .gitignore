@@ -41,3 +41,6 @@ Thumbs.db
 
 # M4 的测试样本由 scripts/make_samples.sh 现场生成，不入库
 /samples/
+
+# python 验收工具的字节码（`python3 -m py_compile` 会产生）
+__pycache__/

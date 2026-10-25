@@ -15,7 +15,7 @@
 | **v0.2.1** | 补丁：**B 帧源**的时间戳（pts 不再被钳 → 显示顺序正确；TS 负时间戳整体平移；循环接缝不倒退） | ✅ **已发布**（tag `v0.2.1`；证据见 [docs/ACCEPTANCE_v0.2.1.md](docs/ACCEPTANCE_v0.2.1.md)） |
 | **v0.2.2** | v0.2 收尾：**转码 + HLS**（`/hls/x.m3u8?transcode=1&h=720`） | ✅ **已发布**（tag `v0.2.2`；证据见 [docs/ACCEPTANCE_v0.2.2.md](docs/ACCEPTANCE_v0.2.2.md)） |
 | **v0.2.3** | 重构：`DemuxerProducer` 拆成「读（`SourceSession`）/ 形状（`PacketStage`）/ 编排」 | ✅ **已发布**（tag `v0.2.3`；行为不变的证据见 [docs/ACCEPTANCE_v0.2.3.md](docs/ACCEPTANCE_v0.2.3.md)） |
-| **v0.3.0** | RTSP 输入、解码处理（滤镜/缩放/水印） | 🚧 **进行中**：**a1 RTSP 输入 ✅**（能连、能拉 FLV/HLS、缺参数集当场拒绝、凭据脱敏）；a2 断流重连 / a3 1 小时验收待做。设计见 [docs/DESIGN_M11.md](docs/DESIGN_M11.md) |
+| **v0.3.0** | RTSP 输入、解码处理（滤镜/缩放/水印） | 🚧 **进行中**：**a1 RTSP 输入 ✅**（能连、能拉 FLV/HLS、缺参数集当场拒绝、凭据脱敏）、**a2 断流自愈 ✅**（读超时判据、指数退避 1→30 s、重连不踢观众、时间戳接续）；a3 1 小时长跑待做。设计见 [docs/DESIGN_M11.md](docs/DESIGN_M11.md) |
 
 ### v0.2.0 验收摘要（实测，完整矩阵见验收报告）
 
@@ -52,7 +52,7 @@
 |---|---|---|---|
 | 输入 MP4 / H264 裸流 | ✅ | | |
 | 输入 MKV / TS | | ✅ | |
-| 输入 RTSP | | | ✅ |
+| 输入 RTSP（含断流自动重连） | | | ✅ |
 | 视频 H264 / 音频 AAC | ✅ | | |
 | 输出 HTTP-FLV | ✅ | | |
 | 输出 HLS | | ✅ | |
@@ -193,7 +193,7 @@ cd build && ctest                        # 26 个分组（297 个用例），**�
 ../scripts/concurrent_test.sh             # 长跑：10 路 × 5 分钟（NFR-2/3/4/6 + 性能基线）
 ../scripts/tsan.sh                        # TSAN：严格组 0 报告
 ../scripts/refactor_equiv_check.sh        # 重构等价性：同一输入 → 同一输出**字节**
-../scripts/rtsp_test.sh                   # RTSP 输入 22 项（假 RTSP 服务端注入 4 类场景，零新依赖）
+../scripts/rtsp_test.sh                   # RTSP 输入 + 断流自愈 33 项（假 RTSP 服务端注入 6 类场景，零新依赖）
 ```
 
 ## 部署提示（v0.1.0）
@@ -226,7 +226,7 @@ cd build && ctest                        # 26 个分组（297 个用例），**�
 | [docs/DESIGN_M4.md](docs/DESIGN_M4.md) | **FFmpeg 封装设计（M4）**：AvPtr RAII、时间基换算与单调守卫、Demuxer 上限与观测、决策记录 |
 | [docs/DESIGN_M5.md](docs/DESIGN_M5.md) | **媒体分发设计（M5）**：MediaPacket 零拷贝、FrameQueue 上限与丢帧策略、GopCache 接入保证、MediaSource 订阅者生命周期 |
 | [docs/DESIGN_M6.md](docs/DESIGN_M6.md) | **输出层设计（M6）**：FLV 字节布局逐字段、per-client 时间戳基准、sequence header 重发纪律、ffprobe 验收 |
-| [docs/DESIGN_M11.md](docs/DESIGN_M11.md) | **RTSP 输入设计（v0.3-a，待做）**：实测事实（读超时=断流检测、缺 SPS/PPS 必须拒绝）、重连策略、两轴落点、批次与测试计划、9 条待拍板 |
+| [docs/DESIGN_M11.md](docs/DESIGN_M11.md) | **RTSP 输入 + 断流重连设计（v0.3-a，a1/a2 已落地）**：实测事实（读超时=断流检测、缺 SPS/PPS 必须拒绝）、重连策略、两轴落点、批次与测试计划、9 条待拍板 |
 | [docs/DESIGN_M9.md](docs/DESIGN_M9.md) | **HLS 设计（M9）**：TS 封装（PAT/PMT/PCR/90kHz）、切片只认视频关键帧、窗口与租约、决策与风险 |
 | [docs/DESIGN_M10.md](docs/DESIGN_M10.md) | **转码设计（M10）**：解码→sws→x264、自己生成 CFR 时间轴（为什么不能用源 pts）、服务接线与并发上限、`speed` 口径 |
 | [docs/AV_BASICS.md](docs/AV_BASICS.md) | **音视频基础（本项目需要的 20%）**：容器/编码、I-P-B、pts/dts、time_base、SPS/PPS；每条概念配可自己跑的命令 |

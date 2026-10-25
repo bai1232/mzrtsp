@@ -158,7 +158,7 @@ public:
 | 批次 | 内容 | 验收 |
 |---|---|---|
 | **M11-a1 ✅ 已完成**：能连上、能拉 | `Demuxer::open(path, options)` 重载 + 网络流 Limits 档 + §4.2 选项 + §4.8 前置校验 + `--rtsp` 入口 + `rtsp` 观测字段（状态恒 `playing`） | 假服务端 4 场景（UDP / TCP-only / 无 SPS-PPS / 关连接）；`ffprobe`/`ffmpeg` 从 `/live/<name>.flv` 拉到合法 FLV；`hls` 也能切 |
-| **M11-a2**：断流能自愈 | `ReconnectPolicy`（新文件）+ `SourceSession` 接入 + 时间戳接续 + 状态机 + 退避日志 | 假服务端：`--after close` / `--after silent` → 自动重连、观众不掉线、重连后 dts 严格递增；退避序列可断言（日志或 stats） |
+| **M11-a2 ✅ 已完成**：断流能自愈 | `ReconnectPolicy`（新文件）+ `SourceSession` 接入 + 时间戳接续 + 状态机 + 退避日志 | 假服务端：`--after close` / `--after silent` → 自动重连、观众不掉线、跨重连 dts 不倒退（实测见 §5.2）；退避序列可断言（日志或 stats） |
 | **M11-a3**：验收与收尾 | `scripts/rtsp_test.sh`（假服务端驱动，含"半开"场景）+ 入库假服务端 + 文档（TESTING/ROADMAP/ACCEPTANCE）+ 全量门禁 | 脚本全绿；`refactor_equiv_check.sh` 11/11（证明本地文件路径零影响）；1 小时长跑（RTSP 源） |
 
 ## 5.1 M11-a1 实测记录（2026-10-25）
@@ -183,14 +183,40 @@ public:
    / `SourceManager` 的日志与 stats / `HlsService` 的日志 —— 因为 HTTP 响应会把
    `lastError()` 原样带给客户端。
 
+## 5.2 M11-a2 实测记录（2026-10-25）
+
+| 项 | 结果 |
+|---|---|
+| **对端消失**（`--after close`） | 断流到重连成功 **2.35 s**（退避 1 s + `avformat_open_input` ≈ 1.35 s）；`reconnects=1`、`state` 回到 `playing` |
+| **半开静默**（`--after silent`） | 靠 3 s 读超时发现，重连成功 ≈ 3.5 s；观众侧 `curl` 20 s 后仍是**超时退出**（28），没收到 EOS |
+| 退避序列（实测日志） | `1000 → 2000 → 4000 ms`（假源每次只给 25 帧就又断，所以连续断 3 次），与 `ReconnectPolicy` 一致 |
+| **时间戳接续** | 日志：`上一包生效 dts=15920，新一段原始 dts=200 → 偏移 15760 ms`；抓到的 FLV **0 次倒退**，`max dts=10.28 s`（第一段只有 1 s，证明时间轴确实往前接了） |
+| 解码 | `-count_frames` 解出 **274 / 271** 帧，除下述已知重复 dts 外无其它 error |
+| stats | `state=playing`、`connects=1`、`reconnects`、`attempts`、`backoff_ms`、`last_packet_age_ms`、`last_error`（脱敏）齐全 |
+| 脚本 | `scripts/rtsp_test.sh` **33/33**（含 §8 两个注入场景 ×5 项） |
+
+**观测 3（已知现象，不是本批 bug）**：假源不发 RTCP SR，FFmpeg 会给**每个连接的第一个包**
+一个乱序 pts（实测 0.2 s，落在第 5 帧位置；`ffprobe` 直连该源同样复现，与我们的代码无关）。
+我们的单调守卫（`MonotonicGuard`）把它后面 5 个包钳到同一 dts 并计数，于是**每个连接开头**
+（含重连处）会出现 6 个重复 dts。后果：`ffmpeg -f null -` 打
+`non monotonically increasing dts` 警告（帧照解，`-count_frames` 数量对得上）。
+真机发 RTCP SR 时不该出现；本条已写进 `TESTING.md` §8.6 与本文件 §7 风险 1。
+**没有**为了让测试好看去改守卫逻辑（钳制是"如实上报 + 计数"，不是"静默修复"）。
+
+实现要点（一条与设计的偏差）：
+- 设计里设想"重连成功时先把这个包存进 `_pending`，由 `read()` 补交"。实现时发现没必要：
+  `read()` 读到新一段第一个包时，就地算偏移、就地返回（`_reconnect_needs_timeline`），
+  少一个队列、少一次状态不一致的机会 —— `_pending` 已删除。
+
 ## 6. 测试计划
 
 | 层级 | 用例 | 证明什么 / 什么会让它红 |
 |---|---|---|
 | 单测 `rtsp`（新组） | `rtsp_reconnect_policy_backoff_sequence` | 退避 1,2,4,8,16,30,30…；成功后复位。红 = 序列错或没封顶 |
 | 单测 | `rtsp_open_rejects_missing_sprop` | 缺 SPS/PPS → 明确失败且**不**白等满超时（用假服务端 `--no-sprop`） |
-| 单测 `pipeline` | `pipeline_source_session_reconnects_after_silence` | 半开→重连→继续读；红 = read 返回 Error（观众会掉线） |
-| 单测 | `pipeline_source_session_reconnect_keeps_timestamps_monotonic` | 重连后 dts 接续；红 = 倒退 |
+| 单测 `pipeline` | `pipeline_timeline_offset_restarts_from_zero` / `..._continues_after_outage` / `..._without_previous_packet` | 接续公式（`timelineOffsetForReconnect`，抽成**纯函数**）；红 = 新一段与上一包同 dts、或把"对端接着发"拉错 |
+| 单测 `pipeline` | `pipeline_net_state_names_are_stable` | stats 对外契约 `idle/playing/reconnecting/failed` 四个名字稳定且互异；红 = 改名/撞名 |
+| 说明 | 原计划的 `pipeline_source_session_reconnects_after_silence` **没有按原样实现** | 造"半开"要么起进程内 RTSP 服务端、要么 sleep 到读超时（单测里既引入网络又慢）。改为：①接续公式单测（错的就是它）；②`rtsp_test.sh` §8 端到端真重连（必红条件：观众掉线/时间戳倒退）。**不假装覆盖** |
 | 脚本 `rtsp_test.sh` | ① 正常拉流（`ffprobe` 认 h264/分辨率）② **TCP-only**（461 回退）③ 无 SPS-PPS → 415 ④ `--after close` → 自动恢复 ⑤ `--after silent` → 自动恢复 ⑥ `/api/stats` 的 `rtsp` 段 ⑦ 退避序列出现在日志 ⑧ 凭据脱敏（日志/统计里无密码明文） | 真源不可控 → 用假服务端把"断流"变成**可注入**；红 = 重连没发生/观众掉线/时间戳倒退 |
 | 回归 | `flv_http` 104 项、`hls` 40 项、`ts_mux`、`transcode`、`refactor_equiv_check` 11 条 | 本地文件路径**零影响** |
 

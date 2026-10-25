@@ -331,6 +331,53 @@ MZ_TEST(pipeline_source_session_loop_offsets_negative_start) {
 // TranscodeStage：拥有时间轴（生产者据此**不加**趟偏移）+ flush 幂等
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 【M11-a2】重连的时间轴接续公式（纯函数）：重连处最容易"悄悄错"的地方
+//
+// 什么让它们红：
+//   · 公式漏掉 `frame_gap` → 新一段第一个包与上一包**同一个 dts**（第二个断言）；
+//   · 公式把"对端接着发"当异常 → 时间轴被拉到未来，播放器等一大截（第三个断言）；
+//   · `has_last == false` 时误用 0 当基准 → 偏移算成 −raw_first（第四个断言）。
+// ---------------------------------------------------------------------------
+
+MZ_TEST(pipeline_timeline_offset_restarts_from_zero) {
+    // 实测场景：上一包生效 dts=15920，对端重连后从 200ms 重新开始 → 偏移 15760
+    const int64_t offset = mzmedia::timelineOffsetForReconnect(15920, true, 200, 40);
+    MZ_ASSERT_EQ(offset, 15760);
+    MZ_ASSERT_EQ(200 + offset, 15960); // = 上一包 + 一帧，**不是**重复的 15920
+}
+
+MZ_TEST(pipeline_timeline_offset_continues_after_outage) {
+    // 对端自己接着走钟（断流 460 ms）：公式把它**拉回来**接到上一包之后（不保留空档）
+    // 实测场景：上一包 15920，新一段原始 dts=16380，一帧 40 → 偏移 −420
+    const int64_t offset = mzmedia::timelineOffsetForReconnect(15920, true, 16380, 40);
+    MZ_ASSERT_EQ(offset, -420);
+    MZ_ASSERT_EQ(16380 + offset, 15960);
+}
+
+MZ_TEST(pipeline_timeline_offset_without_previous_packet) {
+    // 没有上一包时基准取"新一段自己的首个 dts"，于是只前进一帧（因此这个函数**只能**用在接续处）
+    MZ_ASSERT_EQ(mzmedia::timelineOffsetForReconnect(0, false, 200, 40), 40);
+    MZ_ASSERT_EQ(mzmedia::timelineOffsetForReconnect(0, false, 0, 1), 1);
+}
+
+MZ_TEST(pipeline_net_state_names_are_stable) {
+    // stats 里这几个字符串是**对外契约**（脚本/看板按它判断），改名要当成破坏性变更
+    MZ_ASSERT_TRUE(std::string(mzmedia::SourceSession::netStateName(
+                       mzmedia::SourceSession::NetState::Idle)) == "idle");
+    MZ_ASSERT_TRUE(std::string(mzmedia::SourceSession::netStateName(
+                       mzmedia::SourceSession::NetState::Playing)) == "playing");
+    MZ_ASSERT_TRUE(std::string(mzmedia::SourceSession::netStateName(
+                       mzmedia::SourceSession::NetState::Reconnecting)) == "reconnecting");
+    MZ_ASSERT_TRUE(std::string(mzmedia::SourceSession::netStateName(
+                       mzmedia::SourceSession::NetState::Failed)) == "failed");
+    // 四个状态**互不相同**（否则观测出"两种状态同一个名字"）
+    MZ_ASSERT_TRUE(std::string(mzmedia::SourceSession::netStateName(
+                       mzmedia::SourceSession::NetState::Failed)) !=
+                   std::string(mzmedia::SourceSession::netStateName(
+                       mzmedia::SourceSession::NetState::Reconnecting)));
+}
+
 MZ_TEST(pipeline_transcode_stage_owns_timeline_and_flushes) {
     const std::string path = samplePath("sample.mp4");
     MZ_ASSERT_FALSE(path.empty());

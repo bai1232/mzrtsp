@@ -118,6 +118,7 @@ set(MZMEDIA_SOURCES
         # M5-c 真接 Demuxer + 源管理（懒启动 / 空闲释放）
         src/media/demuxer_producer.cpp
         src/media/source_session.cpp
+        src/media/reconnect_policy.cpp
         src/media/stage_passthrough.cpp
         src/media/stage_transcode.cpp
         src/media/source_manager.cpp

@@ -14,6 +14,7 @@
 
 #include "core/util.h"
 #include "media/demuxer_producer.h"
+#include "media/reconnect_policy.h"
 
 #include <string>
 
@@ -81,4 +82,64 @@ MZ_TEST(rtsp_source_rejected_when_disabled) {
     MZ_ASSERT_TRUE(err.find("***") != std::string::npos);
     MZ_ASSERT_FALSE(producer.opened());
     MZ_ASSERT_FALSE(producer.networkSource()); // 拒绝之后不留"这是网络源"的半状态
+}
+
+// ---------------------------------------------------------------------------
+// ④ 【M11-a2】重连退避曲线（纯逻辑）
+// ---------------------------------------------------------------------------
+
+MZ_TEST(rtsp_reconnect_policy_backoff_sequence) {
+    // 契约：1s → 2s → 4s → 8s → 16s → 封顶 30s（之后一直 30s），读到包才复位。
+    // 什么会让它红：曲线写错（比如线性、或没封顶）、复位没做、上限判定错。
+    ReconnectPolicy::Config config;
+    config.initial_ms = 1000;
+    config.max_ms = 30000;
+    config.max_attempts = 0; // 不设上限
+    ReconnectPolicy policy;
+    MZ_ASSERT_TRUE(policy.setConfig(config));
+
+    const int64_t expect[] = {1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000};
+    for (int i = 0; i < 8; ++i) {
+        MZ_ASSERT_EQ(policy.nextDelayMs(), expect[i]);
+        MZ_ASSERT_EQ(policy.attempts(), static_cast<uint64_t>(i + 1));
+    }
+    // 成功一次 → 退避复位（下一次又从 initial 开始）
+    policy.onSuccess();
+    MZ_ASSERT_EQ(policy.attempts(), 0u);
+    MZ_ASSERT_EQ(policy.nextDelayMs(), 1000);
+    // nextDelayIfFailedMs 与实际下一次一致（stats 展示用，不能与实际行为不符）
+    const int64_t peek = policy.nextDelayIfFailedMs();
+    MZ_ASSERT_EQ(peek, 2000);
+    MZ_ASSERT_EQ(policy.nextDelayMs(), peek);
+}
+
+MZ_TEST(rtsp_reconnect_policy_attempt_cap_and_bad_config) {
+    ReconnectPolicy::Config config;
+    config.initial_ms = 500;
+    config.max_ms = 2000;
+    config.max_attempts = 3;
+    ReconnectPolicy policy;
+    MZ_ASSERT_TRUE(policy.setConfig(config));
+    MZ_ASSERT_EQ(policy.nextDelayMs(), 500);   // 第 1 次
+    MZ_ASSERT_EQ(policy.nextDelayMs(), 1000);  // 第 2 次
+    MZ_ASSERT_EQ(policy.nextDelayMs(), 2000);  // 第 3 次（封顶）
+    MZ_ASSERT_EQ(policy.nextDelayMs(), -1);    // 次数用完 → 调用方必须放弃
+    MZ_ASSERT_EQ(policy.nextDelayIfFailedMs(), -1);
+
+    // 非法配置一律**拒绝并保持原值**（0 不是"立即"）
+    const ReconnectPolicy::Config good = config;
+    ReconnectPolicy::Config bad = good;
+    bad.initial_ms = 0;
+    MZ_ASSERT_FALSE(policy.setConfig(bad));
+    MZ_ASSERT_EQ(policy.config().initial_ms, good.initial_ms);
+    bad = good;
+    bad.max_ms = 100; // < initial_ms
+    MZ_ASSERT_FALSE(policy.setConfig(bad));
+    bad = good;
+    bad.max_attempts = -1;
+    MZ_ASSERT_FALSE(policy.setConfig(bad));
+    bad = good;
+    bad.max_ms = 400000; // 超硬上限 300000
+    MZ_ASSERT_FALSE(policy.setConfig(bad));
+    MZ_ASSERT_TRUE(policy.setConfig(good)); // 合法值仍可设
 }

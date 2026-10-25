@@ -18,9 +18,13 @@
       close  = 直接关连接（对端收到 RST / EOF）
       silent = **保持连接但不发数据**（模拟"半开"：只靠读超时才能发现）
       hold   = 继续空转（保持连接，不发也不关）
+  · `--fault-close-first`：故障只发生在**第一条**连接，之后一直推流（模拟相机重启后恢复）——
+    没有它，"每轮 25 帧就断"永远测不出自愈，只能测出"反复断"
 
 用法：
   python3 rtsp_fake_server.py --port 8554 --file samples/sample.h264 --frames 100 --after silent
+  # 自愈用例（M11-a2）：第一条连接 25 帧后断，之后一直推流
+  python3 rtsp_fake_server.py --port 8554 --file samples/sample.h264 --frames 25 --after close --fault-close-first
 """
 import argparse
 import base64
@@ -115,6 +119,7 @@ class Server:
         self.transport = "tcp"
         self.peer = None
         self.udp = None
+        self.conn_seq = 0  # 第几条连接（1 起）：`--fault-close-first` 靠它只坑第一条
         self.log(f"就绪：SPS {len(sps)}B / PPS {len(pps)}B，可发 {len(self.frames)} 帧")
 
     def log(self, msg):
@@ -211,8 +216,18 @@ class Server:
 
     def stream(self, conn):
         rtp = Rtp(96, self.args.max_payload)
+        if getattr(self.args, "delay_ms", 0):
+            time.sleep(self.args.delay_ms / 1000.0)
         ts_step = 90000 // 25
-        n = min(self.args.frames, len(self.frames))
+        self.conn_seq += 1
+        first = self.conn_seq == 1
+        # `--fault-close-first`：只让**第一条**连接出故障（模拟相机重启/网络抖动），
+        # 后续连接一直推流。否则每轮 25 帧就被断掉 —— 那样任何客户端都不可能持续出数据，
+        # 测的就不是"自愈"，而是"反复断"。
+        fault = self.args.after if (first or not self.args.fault_close_first) else "hold"
+        loop = self.args.loop or not first
+        limit = self.args.frames if first else 0  # 0 = 不限轮数，一直发
+        n = min(self.args.frames, len(self.frames)) if first else len(self.frames)
         t0 = time.time()
         sent = 0
         round_index = 0
@@ -220,7 +235,7 @@ class Server:
         # --loop：一轮发完从头再来（时间戳继续走；首个 NAL 是 IDR → 周期性关键帧）
         while True:
             if frame_index >= n:
-                if not self.args.loop:
+                if not loop:
                     break
                 frame_index = 0
                 round_index += 1
@@ -228,6 +243,8 @@ class Server:
             i = round_index * n + frame_index
             frame_index += 1
             ts = (i * ts_step) & 0xFFFFFFFF
+            if getattr(self.args, "trace_ts", False) and sent < 8:
+                self.log(f"   发#{sent} i={i} ts={ts} bytes={len(nal)}")
             is_last = True  # 一个 NAL 视为一帧（样本是 x264 逐帧单 slice）
             try:
                 for pkt in rtp.packet(nal, ts, is_last):
@@ -242,15 +259,15 @@ class Server:
             target = t0 + (i + 1) / 25.0
             time.sleep(max(0.0, target - time.time()))
             sent += 1
-            if self.args.loop and sent >= self.args.frames:
+            if loop and limit and sent >= limit:
                 break
-        self.log(f"已发 {sent} 帧（{round_index + 1} 轮）；after={self.args.after}")
-        if self.args.after == "close":
+        self.log(f"已发 {sent} 帧（{round_index + 1} 轮）；after={fault}")
+        if fault == "close":
             try:
                 conn.close()
             except OSError:
                 pass
-        elif self.args.after == "silent":
+        elif fault == "silent":
             # 半开：连接还在，但一个字节都不再发（只有读超时/保活能发现）
             time.sleep(600)
         else:
@@ -269,6 +286,10 @@ def main():
                     help="单个 RTP 包的负载上限（>= 帧大小即不分片；TCP 交错下可调大）")
     ap.add_argument("--loop", action="store_true",
                     help="发完一轮从头再来（时间戳继续；关键帧周期性出现，供 HLS 切片）")
+    ap.add_argument("--delay-ms", type=int, default=0, help="PLAY 后延迟多少毫秒才开始发帧（排查用）")
+    ap.add_argument("--trace-ts", action="store_true", help="打印前 8 帧的 RTP 时间戳（排查用）")
+    ap.add_argument("--fault-close-first", action="store_true",
+                    help="故障只发生在第一条连接，之后一直推流（测自愈需要它）")
     args = ap.parse_args()
 
     srv = Server(args)

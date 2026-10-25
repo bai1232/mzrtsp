@@ -270,13 +270,24 @@ MZ_TEST(flv_video_tag_layout_and_composition_time) {
     MZ_ASSERT_EQ(readU32(out, data0 + size0), 11u + size0);
     MZ_ASSERT_EQ(muxer.lastTimestampMs(), 40u);
 
-    // 非关键帧 + B 帧语义（pts < dts，CompositionTime 为负）：24 位补码
+    // 非关键帧 + **负 cts**（pts < dts）：v0.2.1 起先照原值写（24 位补码），
+    // 但 M11-a2 实测发现 FFmpeg 系播放器会把它当非法时间戳**丢帧**
+    // （ffplay：`Negative cts` / `Invalid timestamps ... pts=-200, dts=0`），
+    // 所以改成**钳到 0 + 计数 + Warn 一次**（不丢帧，且不静默）：
+    //   期望：CompositionTime 写 0、计数器 +1、tag 时间戳仍是 dts 相对基准的 80。
     std::string out2;
     MZ_ASSERT_EQ(muxer.writePacket(*videoPacket(0, false, 8, 1080, 1040), &out2),
                  FlvMuxer::Result::Ok);
-    MZ_ASSERT_EQ(static_cast<int>(out2[11]), 0x27);               // 非关键帧 + AVC
-    MZ_ASSERT_EQ(readU24(out2, 13), 0xFFFFD8u);                   // -40 的 24 位补码
+    MZ_ASSERT_EQ(static_cast<int>(out2[11]), 0x27); // 非关键帧 + AVC
+    MZ_ASSERT_EQ(readU24(out2, 13), 0u);            // 负 cts 被钳 0（不再写补码）
     MZ_ASSERT_EQ(readTimestamp(out2, 0), 80u);
+    MZ_ASSERT_EQ(muxer.negativeCompositionCount(), 1u); // ★ 计数（能被 /api/stats 看见）
+    // 再来一个负 cts：行为一致、计数累加（Warn 只在第一次）
+    std::string out3;
+    MZ_ASSERT_EQ(muxer.writePacket(*videoPacket(0, false, 8, 1120, 1080), &out3),
+                 FlvMuxer::Result::Ok);
+    MZ_ASSERT_EQ(readU24(out3, 13), 0u);
+    MZ_ASSERT_EQ(muxer.negativeCompositionCount(), 2u);
 }
 
 MZ_TEST(flv_audio_tag_layout) {
