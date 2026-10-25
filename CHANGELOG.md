@@ -7,6 +7,48 @@
 
 （下一版内容：v0.3 计划见 [docs/ROADMAP.md](docs/ROADMAP.md)）
 
+## [0.2.3] - 2026-10-25
+
+> 发布证据见 **[docs/ACCEPTANCE_v0.2.3.md](docs/ACCEPTANCE_v0.2.3.md)**；设计见
+> **[docs/DESIGN_REFACTOR_PIPELINE.md](docs/DESIGN_REFACTOR_PIPELINE.md)**。
+> **行为不变的重构**（不走 `Y` 位：没有新增能力、没有改变任何输出字节）。
+
+### Changed（`DemuxerProducer` 拆成「读 / 形状 / 编排」三条可独立测的东西）
+- 为什么：它长成了 789 行 / 22 个成员函数的合并体（读包 + 跳过非音视频 + 循环重开与趟偏移 +
+  Annex-B→AVCC + ADTS→ASC + 转码编排）。后果是**每加一件输入侧的事都要改它**：
+  M8 **+125**、M10-b **+260**、v0.2.1 **+38** —— 违反开闭原则。
+- `media/source_session.{h,cpp}`（新）：**读**——打开、读包、跳过非音视频（计数）、时间戳、
+  EOF、**循环重开 + 趟偏移（`pass_end − pass_start`）**、读侧观测。
+- `media/packet_stage.h`（新）：**阶段接口**——`prepare/process/flush/onSeam/ownsTimeline/
+  convertedPackets/statsJson`。一条链从"源形状"加工到"输出形状"。
+- `media/stage_passthrough.{h,cpp}`（新）：`RawStage`（透传，零拷贝）/ `AnnexBStage`（→AVCC +
+  现场造 avcC）/ `AdtsStage`（→raw AAC + 一次性探针造 ASC）。
+- `media/stage_transcode.{h,cpp}`（新）：`TranscodeStage`——转码 + **自造时间轴** + 接缝修正 +
+  `speed` 观测；`ownsTimeline() == true`。
+- `media/demuxer_producer.{h,cpp}`：**只剩编排**（搭链 / 驱动 / 转发观测），对外接口**一个没变**
+  （`SourceManager`/examples/测试都不用改）。
+- 两条显式契约（有专门用例断言）：① 阶段只处理**原始**时间戳，趟偏移由编排者在**链尾**统一加，
+  除非链里有 `ownsTimeline()` 的阶段（转码，加了就双计）；② 循环接缝用**回调**
+  （`SourceSession::setSeamCallback`）通知，而不是让"读"认识"形状"。
+
+### Added（等价性验收工具）
+- `scripts/refactor_equiv_check.sh`（**新**）：跑五个 demo 覆盖 remux / Annex-B / ADTS /
+  B 帧源 / 转码（缩放与只重编码）/ TS 封装（含负首 dts 平移）共 **11 条产物**，逐条比 md5；
+  基线 `scripts/refactor_baseline.txt` 在**重构前**生成。重构后 **11/11 一致**。
+  今后任何"声称只是重构"的改动都要过它；**有意改变行为**时 `--save` 重生成并在本文件写明原因。
+- 新测试分组 `pipeline`（`tests/test_pipeline_stages.cpp`，**6 例**）：Raw/AnnexB/Adts 阶段、
+  `SourceSession` 的读到 EOF 与循环偏移、`TranscodeStage` 的"拥有时间轴 + flush 幂等 + 一帧不少"。
+
+### Fixed
+- `examples/flv_mux_demo` 用**源**流信息建 `FlvMuxer`（应使用 producer 的**输出**快照），
+  导致 `.h264` / TS 输入被误拒（`AnnexBNotSupported`）——与它自己注释矛盾；改后这两种输入也能用 demo 验。
+
+### Tests / 门禁
+- **294 用例 / 25 分组**（原 288 / 24，新增 `pipeline` 组 6 例）；断言 **64,027**。
+- ASAN **25/25**、TSAN **388 用例真问题 0**；脚本 `hls` 40/40、`flv_http` 104/104、`ts_mux` 29/29、
+  `transcode` 12/12、`flv_mux` 8/8、`http` 全绿；`--clean-first` 重建 **0 warning**。
+- 单进程全量耗时 14.8s → **15.0s**（+1.3%，多一层调用的代价，在噪声量级内）。
+
 ## [0.2.2] - 2026-10-25
 
 > 发布证据见 **[docs/ACCEPTANCE_v0.2.2.md](docs/ACCEPTANCE_v0.2.2.md)**。

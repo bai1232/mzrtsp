@@ -1,0 +1,13 @@
+# 重构等价性基线（scripts/refactor_equiv_check.sh --save 生成）
+# 每行：<用例名> <产物 md5>。**有意改变行为**时才重新生成，并在 CHANGELOG 里写明。
+flv_mp4 ed0b755ff37980f367fec715dc4d3859
+flv_mkv ec651959488b88a0ee0a933a461cbabc
+flv_ts dc5d14254d3d2dde6baf8856b798aabe
+flv_vonly_ts 8b2bcbd49c22d8ae09c6c57161461e53
+flv_h264_raw d95a2d583d32a53498b076f365f89222
+flv_bframes 31b64163db9912d1c6d9f209964a56d6
+tx_sample_120p c58e5329f16f5a86627bb2fb5ebd3422
+tx_sample_src 2808a0e149cce231495b45dbb9425600
+tx_1080_to_720p 47b5a0addca523cd81c48f9108d073f7
+ts_mp4 a5c801c396454092253230444e94283c
+ts_bframes c341f5caa04fd77603d502ba7ec95a0b

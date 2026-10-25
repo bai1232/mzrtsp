@@ -14,6 +14,7 @@
 | **v0.2.0** | MKV / TS 输入、**HLS** 输出、**转码**（含 HEVC → H264） | ✅ **已发布**（tag `v0.2.0`；验收证据见 [docs/ACCEPTANCE_v0.2.0.md](docs/ACCEPTANCE_v0.2.0.md)） |
 | **v0.2.1** | 补丁：**B 帧源**的时间戳（pts 不再被钳 → 显示顺序正确；TS 负时间戳整体平移；循环接缝不倒退） | ✅ **已发布**（tag `v0.2.1`；证据见 [docs/ACCEPTANCE_v0.2.1.md](docs/ACCEPTANCE_v0.2.1.md)） |
 | **v0.2.2** | v0.2 收尾：**转码 + HLS**（`/hls/x.m3u8?transcode=1&h=720`） | ✅ **已发布**（tag `v0.2.2`；证据见 [docs/ACCEPTANCE_v0.2.2.md](docs/ACCEPTANCE_v0.2.2.md)） |
+| **v0.2.3** | 重构：`DemuxerProducer` 拆成「读（`SourceSession`）/ 形状（`PacketStage`）/ 编排」 | ✅ **已发布**（tag `v0.2.3`；行为不变的证据见 [docs/ACCEPTANCE_v0.2.3.md](docs/ACCEPTANCE_v0.2.3.md)） |
 | v0.3.0 | RTSP 输入、解码处理（滤镜/缩放/水印） | ⏳ 计划 |
 
 ### v0.2.0 验收摘要（实测，完整矩阵见验收报告）
@@ -173,7 +174,7 @@ ffprobe -v error -show_entries stream=codec_name,width,height /tmp/tx.flv    # h
 ### 验证（每个脚本都会打印"通过 N 项 / 失败 N 项"）
 
 ```bash
-cd build && ctest                        # 24 个分组（288 个用例），**串行**跑（不要加 -j）
+cd build && ctest                        # 25 个分组（294 个用例），**串行**跑（不要加 -j）
 ./bin/mzmedia_unittest producer           # 只跑某组：分组名是**用例名的子串**
 ../scripts/flv_http_test.sh               # 端到端：104 项（HTTP-FLV + MKV/TS + 播放页 + 循环 + 转码 + B 帧）
 ../scripts/hls_test.sh                    # HLS：40 项（m3u8 / 切片 / Range / 窗口 / 租约 / 播放页 / 转码+HLS）
@@ -184,6 +185,7 @@ cd build && ctest                        # 24 个分组（288 个用例），**�
 ../scripts/concurrent_test.sh --quick     # 并发/回收：10 路 × 20s（硬门禁）
 ../scripts/concurrent_test.sh             # 长跑：10 路 × 5 分钟（NFR-2/3/4/6 + 性能基线）
 ../scripts/tsan.sh                        # TSAN：严格组 0 报告
+../scripts/refactor_equiv_check.sh        # 重构等价性：同一输入 → 同一输出**字节**
 ```
 
 ## 部署提示（v0.1.0）
@@ -202,7 +204,9 @@ cd build && ctest                        # 24 个分组（288 个用例），**�
 | [docs/SPEC.md](docs/SPEC.md) | **需求规格（唯一规格来源）**：能力矩阵、流水线、功能/非功能需求、成功标准 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构设计：分层、线程模型、一源多消费者、资源管理 |
 | [docs/CODEC_MATRIX.md](docs/CODEC_MATRIX.md) | 输入 × 输出的可行性判定（何时 remux、何时必须转码） |
-| [docs/ACCEPTANCE_v0.2.2.md](docs/ACCEPTANCE_v0.2.2.md) | **v0.2.2 验收报告（当前版本）**：转码 + HLS 补齐（v0.2 里程碑收尾） |
+| [docs/ACCEPTANCE_v0.2.3.md](docs/ACCEPTANCE_v0.2.3.md) | **v0.2.3 验收报告（当前版本）**：重构等价性（字节级）+ 门禁 + 风险 |
+| [docs/DESIGN_REFACTOR_PIPELINE.md](docs/DESIGN_REFACTOR_PIPELINE.md) | **流水线重构设计（v0.2.3）**：为什么拆、拆成什么、两条契约、扩展方式、等价性证据、机检口径 |
+| [docs/ACCEPTANCE_v0.2.2.md](docs/ACCEPTANCE_v0.2.2.md) | **v0.2.2 验收报告**：转码 + HLS 补齐（v0.2 里程碑收尾） |
 | [docs/ACCEPTANCE_v0.2.1.md](docs/ACCEPTANCE_v0.2.1.md) | **v0.2.1 补丁验收报告**：B 帧源时间戳三处缺陷的修前/修后实测 + 变异验证 |
 | [docs/ACCEPTANCE_v0.2.0.md](docs/ACCEPTANCE_v0.2.0.md) | **v0.2.0 验收报告**：逐条 SC/NFR/FR → 状态 + 证据命令 + 实测数字 + 变异验证 + 未验证清单 |
 | [docs/ACCEPTANCE_v0.1.0.md](docs/ACCEPTANCE_v0.1.0.md) | **v0.1.0 验收报告**：逐条 SC/NFR/FR → 状态 + 证据命令 + 实测数字 + 复现步骤 + 未达成清单 |

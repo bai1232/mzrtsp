@@ -51,6 +51,17 @@
 |---|---|
 | **M10-c ✅ 转码 + HLS** | `/hls/<name>.m3u8?transcode=1[&h=720]`；切片 URI 带同一份规格（`HlsWriter::Config::uri_query`）；流键 `HlsService::streamKey(name, spec)` 与 `SourceManager::sourceKey` 同构 → 同名可同时有直通与转码两路；`/api/stats` 的 `hls.playlists[]` 增 `key`/`transcode`。验收 `hls_test.sh` **40/40** + `hls` 组 2 例 |
 
+## v0.2.3 —— 流水线重构（✅ **已发布 2026-10-25**，tag `v0.2.3`）
+
+> 行为不变的重构，证据见 **[docs/ACCEPTANCE_v0.2.3.md](ACCEPTANCE_v0.2.3.md)**，
+> 设计见 **[docs/DESIGN_REFACTOR_PIPELINE.md](DESIGN_REFACTOR_PIPELINE.md)**。
+
+| 任务 | 说明 |
+|---|---|
+| **拆分 `DemuxerProducer`** | 789 行 / 22 函数 → 「`SourceSession`（读）+ `PacketStage` 链（形状）+ `DemuxerProducer`（编排）」。动因是数据：M8 **+125**、M10-b **+260**、v0.2.1 **+38** 行都在改同一个类 |
+| **等价性工具** | `scripts/refactor_equiv_check.sh`（11 条产物逐条比 md5，基线在重构前生成）+ `pipeline` 组 6 例 |
+| **为 v0.3 铺路** | RTSP 重连只需动 `SourceSession`（读轴）；滤镜/水印只需新写一个 `PacketStage`（形状轴） |
+
 ## v0.3.0 —— RTSP 输入 + 解码处理
 
 | 任务 | 说明 |

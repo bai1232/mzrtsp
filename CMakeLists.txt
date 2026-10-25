@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.15)
 
 project(mzmedia
-        VERSION 0.2.2
+        VERSION 0.2.3
         DESCRIPTION "多格式流媒体文件服务器：输入多种媒体文件，输出多种流媒体格式，按需转封装或转码"
         LANGUAGES CXX)
 
@@ -117,6 +117,9 @@ set(MZMEDIA_SOURCES
         src/media/source_pump.cpp
         # M5-c 真接 Demuxer + 源管理（懒启动 / 空闲释放）
         src/media/demuxer_producer.cpp
+        src/media/source_session.cpp
+        src/media/stage_passthrough.cpp
+        src/media/stage_transcode.cpp
         src/media/source_manager.cpp
         # M5-d 节流（FR-3.5）
         src/media/throttle.cpp

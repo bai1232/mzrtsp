@@ -236,6 +236,7 @@ MZMEDIA_SERVER=./build-asan/bin/mzmedia ./scripts/concurrent_test.sh --quick   #
 | **FR-4.1** HLS 的**转码流**（`?transcode=1&h=`，✅ **M10-c**） | `hls_test.sh` §10（8 项）：未开 `--transcode` → **501**（不降级）；转码 m3u8 的**每条切片 URI** 都带同一份规格（`?transcode=1&h=120`）；按列表里的 URI 取切片 → **h264 / 高 120**（1080p→212x120）；**同一服务上直通 HLS 仍是 1920x1080**（不受影响）；`ffmpeg` 直接读转码 m3u8 解码 4 秒**零 error**；`/api/stats` 里同名两条流（`key` 不同、`transcode` 标记正确）。单测 `hls_slice_uri_carries_transcode_query`（每条 URI 都要带 + 不带时的反向对照）、`hls_service_stream_key_distinguishes_transcode`（流键与 `SourceManager::sourceKey` 同构）。**变异**：把 `uri_query` 从切片 URI 去掉 → 用例立红 |
 | **FR-4.1** `/hls/<name>.m3u8` 与 `/hls/<name>-<seq>.ts` 路由（**M9-b ✅**） | `scripts/hls_test.sh`：m3u8 = 200 + `application/vnd.apple.mpegurl`；切片 = 200 + `video/mp2t`；名字规则与 `/live/` 同一套（`mediaNameToPath` 白名单）；非法路径 404。原计划： 计划：新增 `scripts/hls_test.sh` —— m3u8 返回 200 + `Content-Type: application/vnd.apple.mpegurl`；切片 200 + `video/mp2t`；不存在 / 目录穿越 / 非法名 / 非白名单扩展名 → 404（与 `/live/` 同一套名字映射） |
 | **FR-4.2** Range（**HLS 切片**，**M9-b ✅**） | `scripts/hls_test.sh` 对切片发 `Range: bytes=0-187` → **206** + `Content-Range: bytes 0-187/<total>` + `Accept-Ranges: bytes` + 响应体 **188 字节**。实现复用 `HttpServer` 的 `serveMemoryAsStatic()`（与静态文件同一套 Range 语义）。原计划： 计划：对 `-<seq>.ts` 发 `Range: bytes=a-b` → 206 + `Content-Range`；越界 → 416；响应带 `Accept-Ranges: bytes`。现有 `http_test.sh` 已覆盖通用 Range，但**必须对切片再验一次**（切片来自内存/磁盘的实现不同） |
+| **重构等价性**（v0.2.3：读/形状/编排拆分） | `scripts/refactor_equiv_check.sh` **11 条**产物逐条比 md5（remux / Annex-B / ADTS / B 帧 / 转码缩放 / 只重编码 / TS 封装含负首 dts）；基线在**重构前**生成，重构后 11/11 一致。单测新增 `pipeline` 组 6 例（Raw/AnnexB/Adts 阶段、`SourceSession` EOF 与循环偏移、`TranscodeStage` 的 `ownsTimeline` + flush 幂等 + 一帧不少） |
 | **FR-3.4** B 帧源的显示顺序（✅ **v0.2.1**） | 单测 3 例（分层锁）：`ffmpeg_bframes_pts_are_preserved_and_dts_stays_monotonic`（`Demuxer`：pts 回退被计数、dts 单调、pts 集合仍是 40ms 栅格）、`flv_bframes_composition_time_comes_from_source`（`FlvMuxer`：逐 tag 的 cts == 源 pts−dts，且**不全是 0**）、`mpegts_negative_first_dts_is_shifted_not_clamped`（`MpegTsMuxer`：整体平移、差值不变）；`producer` 组 2 例（pts 透传 + **循环接缝不倒退**）；端到端 `flv_http_test.sh` §12（25 个视频 tag 的 cts ∈ {40,80,160}、`ffmpeg -f null -` 零输出、`/api/stats` 的 `pts_out_of_order>0 且 dts_clamped=0`、循环 200 tag 严格递增）。**变异**：把 pts 钳回去 / 趟偏移退回旧公式 / TS 退回逐包钳 0 → 对应用例全部变红 |
 | **FR-3.4** 时间戳基准（**TS → 90kHz**，✅ **M9-a**） | 单测 `mpegts` 组 5 例：PES 里写的是 **90 kHz**（`ms → 90kHz` 用整数有理换算）、33 位回绕、**+90000 起始偏移**（首包 pts=0 不会被误判成回绕）；集成 `ts_mux_test.sh` **29 项**：`ffprobe` 读出首包 `pts=90000`、**视频包 dts 单调不减**、188 字节对齐 + 同步字全对、含 PAT+PMT、`ffmpeg` 完整解码零 error；`hls_test.sh` §3/§5：切片首个视频包是**关键帧**、切片结构（188 对齐 / PID）可判 |
 | **FR-6.1** 实时倍数 / **NFR-5** 转码 ≥1.0x（**M10-a ✅ 组件级 / M10-b ✅ 服务内**） | 两层判定：①**组件自证**（`transcode` 组 3 例，`tests/test_transcoder.cpp`）——拒绝路径 5 类（不认识的编码 VP9 / HEVC 缺初始化数据 / 缺 avcC / 只给宽或高 / `max_out_packets=0`、`gop_frames=0`）、真样本 320x240→160x120 全量转码（输出是合法 AVCC、avcC 现场构造、**解码 25 帧 → 编码 25 包**、dts 严格单调、`scaling()` 懒创建、`flush()` 幂等、空包拒绝）；②**外部裁判**（`scripts/transcode_test.sh` **12 项**）——`ffprobe` 认 1280x720 / h264 / 25 fps / ≈5 s、`ffmpeg -f null -` 零 error、**逐包 dts 单调**、"不缩放"路径保持源分辨率、**NFR-5 speed ≥ 1.0x（实测 2.61x / 2.89x）**。✅ **M10-b 已补服务内实测**：`/api/stats` 的 `producer.transcode.speed`（`speed = 已输出媒体时长 / 转码耗时`；`elapsed` 含节流等待，**不能**当分母 —— 那样永远是 ≈1.0）。实测 1080p→720p **3.26x**（媒体 5000 ms / 转码耗时 1533 ms）、320x240→160x120 **26–31x**；`flv_http_test.sh` §11.5 断言 `speed ≥ 1.0` |
@@ -257,6 +258,7 @@ MZMEDIA_SERVER=./build-asan/bin/mzmedia ./scripts/concurrent_test.sh --quick   #
 ThreadSanitizer —— 数据竞争不会在单线程测试里暴露，只会以"偶发崩溃"的形式出现在生产环境。
 
 ```bash
+./scripts/refactor_equiv_check.sh   # 重构等价性：同一输入 → 同一输出**字节**（基线在 scripts/refactor_baseline.txt）
 ./scripts/tsan.sh              # 配置 + 编译 + 检查
 ./scripts/tsan.sh --no-build   # 复用已有 build-tsan
 ```
@@ -361,15 +363,15 @@ cmake -B build-tsan -DMZMEDIA_ENABLE_TSAN=ON -DCMAKE_CXX_COMPILER=g++-12
 > 分组按**用例名子串**匹配，因此个别用例会同时属于两个组
 > （如 `logger_queue_overflow_drop` 同时属于 `logger` 与 `queue`）。上表为去重后的数字。
 
-**v0.2 当前基线（v0.2.2 完成时全门禁重跑，2026-10-25；每批交付都刷新这张表）**：
+**v0.2 当前基线（v0.2.3 完成时全门禁重跑，2026-10-25；每批交付都刷新这张表）**：
 
 | 门禁 | 实测 |
 |---|---|
 | 编译（`-Wall -Wextra`，无 `-Wno-`） | **0 warning / 0 error**（`--clean-first` 重建；Debug、ASAN、TSAN 三个构建都是 0） |
-| 单元（串行 `ctest`，**不加 `-j`**） | **24/24 分组**（**288 用例**；`ffmpeg` 37 / `srcmgr` 15 / `producer` 17 / `hls` 8 / `transcode` **13**） |
-| 单元（单进程全量，诊断用） | **288/288 用例、63,275 条断言**（本轮 `timer_precision` 也没抖） |
-| ASAN | **24/24** |
-| TSAN | **379 用例 | 已知误报 0 | 真问题 0**（严格组 21 组 + `qtimed`/`ptimed`/`ntimed`） |
+| 单元（串行 `ctest`，**不加 `-j`**） | **25/25 分组**（**294 用例**；新增 `pipeline` 组 6 例） |
+| 单元（单进程全量，诊断用） | **294/294 用例、64,027 条断言**（本轮 `timer_precision` 也没抖） |
+| ASAN | **25/25** |
+| TSAN | **388 用例 | 已知误报 0 | 真问题 0**（严格组 22 组 + `qtimed`/`ptimed`/`ntimed`；新增 `pipeline`） |
 | 脚本 | `http` / `flv_mux` **8** / `ts_mux` **29** / **`hls` 40** / **`flv_http` 104** / `transcode` **12** —— 全绿 |
 
 > **已知偶发（诚实记录，v0.2.0 那轮）**：`ntimed_session_shutdown_after_flush`（计时敏感组，已被排除在 TSAN 严格组外）

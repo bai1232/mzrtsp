@@ -33,9 +33,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    const Demuxer &demuxer = producer.demuxer();
-    const StreamInfo *video = demuxer.firstVideo();
-    const StreamInfo *audio = demuxer.firstAudio();
+    // ★ 要用 producer 的**输出快照**（muxerVideo/muxerAudio），不是 demuxer 的原始流信息：
+    //   原始流信息里 Annex-B 输入（.h264 / TS）带的还是 Annex-B 的 SPS/PPS，FlvMuxer 会拒绝；
+    //   producer 已经在 open() 里把形状转成"avcC + AVCC"了（M8 之后 TS 也走这条路）。
+    const StreamInfo *video = producer.muxerVideo();
+    const StreamInfo *audio = producer.muxerAudio();
     std::printf("输入：%s\n", input.c_str());
     std::printf("  视频：%s %dx%d%s\n", video != nullptr ? video->codec_name.c_str() : "(无)",
                 video != nullptr ? video->width : 0, video != nullptr ? video->height : 0,

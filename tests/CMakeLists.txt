@@ -53,6 +53,8 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_hls_writer.cpp
         # ---- M10-a 转码（用例名 transcode_*）----
         ${CMAKE_CURRENT_SOURCE_DIR}/test_transcoder.cpp
+        # ---- v0.2.3 流水线分段（用例名 pipeline_*）----
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_pipeline_stages.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS
@@ -115,6 +117,9 @@ set(MZMEDIA_TEST_GROUPS
         # ---- M10-a 转码（解码→缩放→编码，同步调用）----
         # 不用线程/等待；只读真样本 → 严格组。
         transcode
+        # ---- v0.2.3 流水线分段（SourceSession / PacketStage）----
+        # 同步调用、只用真样本（sample.mp4 / sample.ts / bf.mp4）→ 严格组。
+        pipeline
         )
 
 add_executable(mzmedia_unittest ${MZMEDIA_TEST_SOURCES})

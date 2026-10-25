@@ -1,40 +1,39 @@
 /*
- * DemuxerProducer 实现（M5-c；M6-c 加循环重开 + Annex-B → AVCC）
+ * DemuxerProducer 实现（v0.2.3 重构后只做编排）
  * ============================================================================
- * `read()` 的循环只在两个地方兜圈：**跳过非音视频流**、**循环重开**。
- * 其余情况一律"一步给出结论"（有包 / 读完 / 出错），因为 `SourcePump`
- * 的退出语义依赖这些结局被如实转达 —— 把"跳过"伪装成"读完"会让源提前结束，
- * 把"重开失败"伪装成"读完"会让观众以为片子播完了（其实是文件读不下去了）。
+ * `read()` 的形状（唯一的循环）：
  *
- * 线程说明：`read()` 由源线程调用；计数是 atomic、`lastError()` 走锁、
- * 流快照（`_video_info` 等）在 `open()` 里写完后**只读**，因此观测方读它们都安全。
+ *   while (true) {
+ *       session.read(&raw)                       // 读 + 跳过非音视频 + EOF/循环重开
+ *       if (Eof) → 非循环：让视频链 flush（转码残余），再 EndOfStream
+ *       current[0] = raw（原始时间戳）
+ *       for (stage : chain) runStage(stage, &current)   // 0..N 逐级加工
+ *       if (!chainOwnsTimeline) 给每个产物加趟偏移       // 转换类的时间轴接续
+ *       _pending += current
+ *       if (_pending 为空) continue                // 解码器攒帧：正常，继续读
+ *       return servePending()                      // 一次只交一个包
+ *   }
  * ============================================================================
  */
 
 #include "media/demuxer_producer.h"
 
 #include "core/logger.h"
-#include "ffmpeg/aac_util.h"
-#include "ffmpeg/codec_matrix.h"
-#include "ffmpeg/h264_util.h"
+#include "core/util.h"
+#include "ffmpeg/h264_util.h"   // looksLikeAnnexB（选阶段时判"输入是不是 Annex-B"）
+#include "media/stage_passthrough.h"
+#include "media/stage_transcode.h"
 
-#include <cmath>
 #include <utility>
-#include <vector>
 
 namespace mzmedia {
 
-/// 循环重开时给时间轴留的间隙（毫秒）：保证第二趟的首包**严格**排在第一趟末包之后
-/// （时间戳是整数毫秒，而真实帧长可能是小数；见 passEndMs() 的说明）
-constexpr int64_t kLoopGapMs = 1;
-
 DemuxerProducer::DemuxerProducer(const Config &config)
     : _config(config)
-    , _demux(config.demux) {}
+    , _session(SourceSession::Config{config.demux, config.loop}) {}
 
 // 无参构造与"带 Config"分开写：`Config` 自带默认成员初始值，
 // 在类内把它当默认实参用会触发 [class.mem] 的"必须在类完成前初始化"限制（GCC 直接报错）。
-// MediaSource 也是同样的写法。
 DemuxerProducer::DemuxerProducer() : DemuxerProducer(Config{}) {}
 
 void DemuxerProducer::setError(const std::string &message) {
@@ -47,709 +46,245 @@ std::string DemuxerProducer::lastError() const {
     return _last_error;
 }
 
+bool DemuxerProducer::opened() const {
+    return _session.opened();
+}
+
+const std::string &DemuxerProducer::path() const {
+    return _session.path();
+}
+
+const Demuxer &DemuxerProducer::demuxer() const {
+    return _session.demuxer();
+}
+
+const std::atomic<bool> *DemuxerProducer::setAbortFlag(const std::atomic<bool> *flag) {
+    return _session.setAbortFlag(flag);
+}
+
 uint64_t DemuxerProducer::bitrateBps() const {
-    const int64_t opened = _opened_at_ms.load();
-    if (opened <= 0) {
+    const uint64_t opened = _session.openedAtMs();
+    if (opened == 0) {
         return 0; // 还没打开：没有"码率"可言（不猜）
     }
-    const int64_t elapsed_ms = static_cast<int64_t>(getCurrentMillisecond()) - opened;
+    const int64_t elapsed_ms =
+        static_cast<int64_t>(getCurrentMillisecond()) - static_cast<int64_t>(opened);
     if (elapsed_ms <= 0) {
         return 0; // 不足 1ms：返回 0，避免除零造出天文数字
     }
-    return static_cast<uint64_t>(_bytes.load()) * 8u * 1000u /
-           static_cast<uint64_t>(elapsed_ms);
+    return _bytes.load() * 8u * 1000u / static_cast<uint64_t>(elapsed_ms);
 }
 
-bool DemuxerProducer::open(const std::string &path) {
-    if (path.empty()) {
-        setError("path 为空");
-        ErrorL << "DemuxerProducer::open 失败：" << lastError();
-        return false;
-    }
-    if (_demux.opened()) {
-        setError("已经打开过（需要换文件请新建 producer）");
-        ErrorL << "DemuxerProducer::open 失败：" << lastError();
-        return false;
-    }
-    if (!_demux.open(path)) {
-        setError(_demux.lastError()); // 不吞掉下层原因
-        return false;
-    }
-    // 【M8】_path 必须在 prepareStreams() **之前**记下：ADTS 探针要用它重新打开同一个文件
-    // （裸流/MP4 用不到，但把赋值提前没有副作用 —— 失败路径会把 _path 清掉，不留半状态）。
-    _path = path;
-    if (!prepareStreams()) {
-        _demux.close(); // 初始化数据不可用：不留一个半开的对象
-        _path.clear();
-        ErrorL << "DemuxerProducer::open 失败：" << lastError();
-        return false;
-    }
-    // 【M10-b】转码器必须在 `open()` 之内建好：`_video_info` 要立刻换成**输出**形状
-    // （分辨率/avcC 都变了），否则连接拿着源的分辨率写 FLV 元数据就是错的。
-    if (!openTranscoder()) {
-        _demux.close();
-        _path.clear();
-        _transcoder.reset();
-        _tx_enabled.store(false);
-        ErrorL << "DemuxerProducer::open 失败：" << lastError();
-        return false;
-    }
-    _opened_at_ms.store(static_cast<int64_t>(getCurrentMillisecond()));
-    _loop_offset_ms.store(0);
-    _pass.assign(_demux.streams().size(), PassTrack{});
-    return true;
+uint64_t DemuxerProducer::openedAtMs() const {
+    return _session.openedAtMs();
+}
+uint64_t DemuxerProducer::skippedUnknownStreams() const {
+    return _session.skippedUnknownStreams();
+}
+uint64_t DemuxerProducer::timestampFailures() const {
+    return _session.timestampFailures();
+}
+uint64_t DemuxerProducer::annexBPackets() const {
+    return _annexb_video && !_video_chain.empty() ? _video_chain.front()->convertedPackets() : 0;
+}
+uint64_t DemuxerProducer::adtsPackets() const {
+    return _adts_audio && !_audio_chain.empty() ? _audio_chain.front()->convertedPackets() : 0;
+}
+uint64_t DemuxerProducer::ptsOutOfOrder() const {
+    return _session.ptsOutOfOrder();
+}
+uint64_t DemuxerProducer::dtsClamped() const {
+    return _session.dtsClamped();
+}
+uint64_t DemuxerProducer::loopCount() const {
+    return _session.loopCount();
+}
+uint64_t DemuxerProducer::loopFailures() const {
+    return _session.loopFailures();
+}
+int64_t DemuxerProducer::loopOffsetMs() const {
+    return _session.loopOffsetMs();
 }
 
-const StreamInfo *DemuxerProducer::findStream(int index) const {
-    for (const auto &info : _demux.streams()) {
-        if (info.index == index) {
-            return &info;
-        }
+// ---- 转码观测：转码阶段可能不存在 ----
+bool DemuxerProducer::transcodeInputHevc() const {
+    return _transcode != nullptr && _transcode->inputHevc();
+}
+int DemuxerProducer::transcodeOutWidth() const {
+    return _transcode != nullptr ? _transcode->outWidth() : 0;
+}
+int DemuxerProducer::transcodeOutHeight() const {
+    return _transcode != nullptr ? _transcode->outHeight() : 0;
+}
+uint64_t DemuxerProducer::transcodeInputs() const {
+    return _transcode != nullptr ? _transcode->inputs() : 0;
+}
+uint64_t DemuxerProducer::transcodeOutputs() const {
+    return _transcode != nullptr ? _transcode->outputs() : 0;
+}
+uint64_t DemuxerProducer::transcodeOutMediaMs() const {
+    return _transcode != nullptr ? _transcode->outMediaMs() : 0;
+}
+int64_t DemuxerProducer::transcodeCostMs() const {
+    return _transcode != nullptr ? _transcode->costMs() : 0;
+}
+int64_t DemuxerProducer::transcodeElapsedMs() const {
+    return _transcode != nullptr ? _transcode->elapsedMs() : 0;
+}
+double DemuxerProducer::transcodeSpeed() const {
+    return _transcode != nullptr ? _transcode->speed() : 0.0;
+}
+bool DemuxerProducer::transcodeVfr() const {
+    return _transcode != nullptr && _transcode->vfr();
+}
+bool DemuxerProducer::transcodeScaling() const {
+    return _transcode != nullptr && _transcode->scaling();
+}
+std::string DemuxerProducer::transcodeStatsJson() const {
+    if (_transcode == nullptr) {
+        return "\"enabled\":false,\"in_hevc\":false,\"out_width\":0,\"out_height\":0,"
+               "\"scaling\":false,\"vfr\":false,\"inputs\":0,\"outputs\":0,"
+               "\"out_media_ms\":0,\"cost_ms\":0,\"elapsed_ms\":0,\"speed\":0.00";
     }
-    return nullptr;
+    return _transcode->statsJson();
 }
 
-int64_t DemuxerProducer::estimateFrameDurationMs(const StreamInfo &info) {
-    // **向上取整**：时间戳只以整数毫秒表示，向下取整会让"这一趟的结束时刻"偏小
-    // （AAC 一帧真实是 23.22ms → 23ms），于是第二趟的首包可能和第一趟的末包撞在同一毫秒上
-    // （实测：ffmpeg 的 null muxer 会报 "non monotonically increasing dts"）。
-    // 宁可多算不到 1ms（时间轴多一点点间隙，听不出来），也不要让时间轴倒回去。
-    if (info.is_video && info.frame_rate.num > 0 && info.frame_rate.den > 0) {
-        const int64_t num = info.frame_rate.num;
-        const int64_t den = info.frame_rate.den;
-        return (1000LL * den + num - 1) / num; // ceil(1000 * den / num)
+bool DemuxerProducer::chainOwnsTimeline(bool video) const {
+    const std::vector<PacketStage::Ptr> &chain = video ? _video_chain : _audio_chain;
+    for (const auto &stage : chain) {
+        if (stage->ownsTimeline()) {
+            return true;
+        }
     }
-    if (info.is_audio && info.sample_rate > 0) {
-        // v0.1 只认 AAC：一帧固定 1024 个样本。只用于"重开偏移"的估算，不参与时间戳换算
-        const int64_t rate = info.sample_rate;
-        return (1024LL * 1000 + rate - 1) / rate;
-    }
-    return 0; // 拿不到就返回 0（不猜）
+    return false;
 }
 
-bool DemuxerProducer::prepareStreams() {
-    // 只在这里写一次快照（见头文件的说明）
-    _has_video_info = false;
-    _has_audio_info = false;
-    _annexb_video = false;
-    _adts_audio = false;
-    _video_info = StreamInfo{};
-    _audio_info = StreamInfo{};
-    _raw_video_info = StreamInfo{};
-    _raw_audio_info = StreamInfo{};
-
-    if (const StreamInfo *video = _demux.firstVideo()) {
-        _raw_video_info = *video;
-        _video_info = *video;
-        _has_video_info = true;
-
-        const bool has_extra = video->extradata && !video->extradata->empty();
-        if (video->codec_id == AV_CODEC_ID_H264 && has_extra &&
-            looksLikeAnnexB(video->extradata->data(), video->extradata->size())) {
-            // H264 裸流（.h264 / TS）：初始化数据是 Annex-B 的 SPS/PPS → 现场构造 avcC
-            std::vector<uint8_t> sps;
-            std::vector<uint8_t> pps;
-            if (!extractSpsPps(video->extradata->data(), video->extradata->size(), &sps, &pps)) {
-                setError("H264 输入是 Annex-B，但初始化数据里没有同时出现 SPS 与 PPS → "
-                         "构造不出 avcC（明确失败，不用裸 SPS/PPS 冒充初始化头）");
-                return false;
-            }
-            std::vector<uint8_t> avcc;
-            if (!buildAvcC(sps.data(), sps.size(), pps.data(), pps.size(), &avcc)) {
-                setError("SPS(" + std::to_string(sps.size()) + "B)/PPS(" + std::to_string(pps.size()) +
-                         "B) 构造 avcC 失败（参数非法或超长）");
-                return false;
-            }
-            _video_info.extradata = std::make_shared<const std::vector<uint8_t>>(std::move(avcc));
-            _annexb_video = true;
-            InfoP("DemuxerProducer: 输入是 H264 裸流（Annex-B）→ 构造 avcC %zu 字节，发包时转 AVCC",
-                  _video_info.extradata->size());
-        }
-    }
-
-    if (const StreamInfo *audio = _demux.firstAudio()) {
-        _raw_audio_info = *audio;
-        _audio_info = *audio;
-        _has_audio_info = true;
-
-        // 【M8 / FR-2.2】TS 的 AAC 是 ADTS：没有 extradata，必须**现场造 ASC**。
-        // 为什么必须在 open() 之内做完：连接拿的是流快照的裸指针，AAC sequence header
-        // 在建连那一刻就要发（FR-3.1 的"立即"），等第一个包到了再造就来不及了。
-        const bool has_extra = audio->extradata && !audio->extradata->empty();
-        if (audio->codec_id == AV_CODEC_ID_AAC && !has_extra) {
-            if (!probeAdtsAudioConfig()) {
-                return false;   // 原因已由 probeAdtsAudioConfig 写进 lastError（明确失败，不猜）
-            }
-        }
-    }
-
-    _pass.assign(_demux.streams().size(), PassTrack{});
-    return true;
-}
-
-bool DemuxerProducer::probeAdtsAudioConfig() {
-    // 为什么要**另开一个** Demuxer 探针，而不是用主解封装读一帧：
-    //   主 Demuxer 的读游标一旦前进，读到的那些包就必须原样留到 read() 里再交付
-    //   （否则首帧/首包丢失 → 播放端从半途开始）。要实现这个就得引入"重放队列"，
-    //   而 ASC 又必须在 open() 之内就绪（见 prepareStreams 里的注释）。一次性探针
-    //   把这两个约束都绕开了：它只读前 N 个包、读完就关，主游标一个字节都没动。
-    // 代价：打开同一个文件两次（本地文件是一次 open + 读几个包，毫秒级）。
-    Demuxer probe(_config.demux);
-    if (!probe.open(_path)) {
-        setError("探测 ADTS 头失败：无法用探针打开 " + _path + "（" + probe.lastError() + "）");
-        ErrorL << "DemuxerProducer: " << lastError();
-        return false;
-    }
-    const StreamInfo *probe_audio = probe.firstAudio();
-    if (probe_audio == nullptr) {
-        (void) probe.close();
-        setError("探测 ADTS 头失败：探针没有看到音频流（与主解封装不一致）");
-        ErrorL << "DemuxerProducer: " << lastError();
-        return false;
-    }
-    const int want_index = probe_audio->index;
-
-    // 有界：最多看这么多包（正常 TS 里音频包间隔只有几个包；找不到就是文件本身异常）
-    constexpr int kMaxProbePackets = 512;
-    AdtsHeader header;
-    bool found = false;
-    for (int i = 0; i < kMaxProbePackets; ++i) {
-        const Demuxer::ReadResult result = probe.readPacket();
-        if (result == Demuxer::ReadResult::Eof) {
-            break;
-        }
-        if (result == Demuxer::ReadResult::Error) {
-            setError("探测 ADTS 头失败：探针读包出错（" + probe.lastError() + "）");
-            (void) probe.close();
-            ErrorL << "DemuxerProducer: " << lastError();
-            return false;
-        }
-        if (probe.packetStreamIndex() != want_index) {
-            continue;
-        }
-        const AVPacket *pkt = probe.packet();
-        if (pkt == nullptr || pkt->data == nullptr || pkt->size <= 0) {
-            continue;
-        }
-        if (!parseAdtsHeader(pkt->data, static_cast<size_t>(pkt->size), &header)) {
-            setError("探测 ADTS 头失败：TS 的 AAC 包不是合法 ADTS 帧（同步字 / 表外采样率 / 帧长非法）"
-                     " → 造不出 AudioSpecificConfig（明确拒绝，不猜）");
-            (void) probe.close();
-            ErrorL << "DemuxerProducer: " << lastError();
-            return false;
-        }
-        found = true;
-        break;
-    }
-    (void) probe.close();
-    if (!found) {
-        setError("探测 ADTS 头失败：前 " + std::to_string(kMaxProbePackets) +
-                 " 个包里没有 AAC 音频帧 → 造不出 AudioSpecificConfig（明确拒绝，不猜）");
-        ErrorL << "DemuxerProducer: " << lastError();
-        return false;
-    }
-
-    uint8_t asc[2] = {0, 0};
-    if (!buildAudioSpecificConfig(header, asc)) {
-        setError("由 ADTS 头构造 AudioSpecificConfig 失败（字段超出位宽）");
-        ErrorL << "DemuxerProducer: " << lastError();
-        return false;
-    }
-    // 交叉校验（两套独立路径互相印证，与 M4-b 的 SPS 交叉校验同一思路）：
-    //   · 采样率**必须**一致 —— 不一致说明两套读法有一边错了，继续下去会产出音调不对的流；
-    //   · 声道数只 Warn（ASC 用 ADTS 的 channel_configuration 才是权威；StreamInfo 是从 ADTS 推的，
-    //     而 7.1 的 channel_configuration=7 与"8 声道"不是同一个数值）。
-    const uint32_t adts_rate = aacSampleRateFromIndex(header.sampling_frequency_index);
-    if (_audio_info.sample_rate > 0 && adts_rate != static_cast<uint32_t>(_audio_info.sample_rate)) {
-        setError("ADTS 头声明的采样率 " + std::to_string(adts_rate) + " Hz 与解封装报的 " +
-                 std::to_string(_audio_info.sample_rate) + " Hz 不一致 → 明确拒绝（不猜用哪个）");
-        ErrorL << "DemuxerProducer: " << lastError();
-        return false;
-    }
-    if (_audio_info.channels > 0 &&
-        static_cast<int>(header.channel_configuration) != _audio_info.channels) {
-        WarnP("DemuxerProducer: ADTS 的 channel_configuration=%u 与解封装报的 channels=%d 不同"
-              "（7.1 的 channel_configuration=7 对应 8 声道，属于正常差异）→ 以 ADTS 为准",
-              static_cast<unsigned>(header.channel_configuration), _audio_info.channels);
-    }
-
-    _audio_info.extradata = std::make_shared<const std::vector<uint8_t>>(
-        std::vector<uint8_t>{asc[0], asc[1]});
-    _adts_audio = true;
-    InfoP("DemuxerProducer: 音频是 ADTS（TS）→ 现场构造 AudioSpecificConfig %02X %02X"
-          "（profile=%u 采样率索引=%u 声道配置=%u，头 %u 字节）→ 发包时逐包剥 ADTS 头",
-          static_cast<unsigned>(asc[0]), static_cast<unsigned>(asc[1]),
-          static_cast<unsigned>(header.profile),
-          static_cast<unsigned>(header.sampling_frequency_index),
-          static_cast<unsigned>(header.channel_configuration),
-          static_cast<unsigned>(header.header_bytes));
-    return true;
-}
-
-bool DemuxerProducer::sameStreamParams(const StreamInfo &a, const StreamInfo &b) {
-    if (a.index != b.index || a.codec_id != b.codec_id || a.is_video != b.is_video ||
-        a.is_audio != b.is_audio || a.width != b.width || a.height != b.height ||
-        a.sample_rate != b.sample_rate || a.channels != b.channels) {
-        return false;
-    }
-    const bool a_has = a.extradata && !a.extradata->empty();
-    const bool b_has = b.extradata && !b.extradata->empty();
-    if (a_has != b_has) {
-        return false;
-    }
-    if (!a_has) {
-        return true;
-    }
-    return *a.extradata == *b.extradata; // 初始化数据变了 = 编码参数变了
-}
-
-void DemuxerProducer::trackPass(int index, int64_t raw_dts_ms) {
-    if (index < 0 || static_cast<size_t>(index) >= _pass.size()) {
-        return; // 不在快照里（理论上不该发生；宁可少记一笔也不要越界写）
-    }
-    PassTrack &track = _pass[static_cast<size_t>(index)];
-    if (!track.has_first) {
-        track.first_dts = raw_dts_ms;   // 【v0.2.1】记下这一趟该流的起点（可能是负数）
-        track.has_first = true;
-    }
-    if (!track.has_last) {
-        track.last_dts = raw_dts_ms;
-        track.has_last = true;
-        return;
-    }
-    track.prev_dts = track.last_dts;
-    track.has_prev = true;
-    if (raw_dts_ms > track.last_dts) {
-        track.last_dts = raw_dts_ms;
-    }
-}
-
-int64_t DemuxerProducer::passEndMs() {
-    int64_t end = 0;
-    bool any = false;
-    for (size_t i = 0; i < _pass.size(); ++i) {
-        const PassTrack &track = _pass[i];
-        if (!track.has_last) {
-            continue;
-        }
-        any = true;
-        int64_t duration = 0;
-        if (track.has_prev && track.last_dts > track.prev_dts) {
-            duration = track.last_dts - track.prev_dts; // 观测到的帧间隔：比任何估算都可靠
-        }
-        if (duration <= 0) {
-            const StreamInfo *info = findStream(static_cast<int>(i));
-            if (info != nullptr) {
-                duration = estimateFrameDurationMs(*info);
-            }
-        }
-        // `+ kLoopGapMs`：整数毫秒下的"严格递增"间隙。真实帧长可能是小数（AAC 23.22ms），
-        // 不留间隙的话第二趟的首包会与第一趟的末包落在同一毫秒上 —— 播放端未必报错，
-        // 但严格的时间戳检查器会（ffmpeg 的 null muxer 就会报 non monotonically increasing dts，
-        // 这是 scripts/flv_http_test.sh §9 抓到的第二个问题）。
-        const int64_t stream_end = track.last_dts + duration + kLoopGapMs;
-        if (stream_end > end) {
-            end = stream_end;
-        }
-    }
-    if (!any) {
-        return 0; // 这一趟一个包都没有
-    }
-    // 保证每趟至少前进 1ms：否则"全是 0 时间戳"的文件会让循环在同一时刻原地打转
-    return end > 0 ? end : 1;
-}
-
-int64_t DemuxerProducer::passStartMs() {
-    int64_t start = 0;
-    bool any = false;
-    for (const auto &track : _pass) {
-        if (!track.has_first) {
-            continue;
-        }
-        // 取**最小**的首包 dts：偏移要让"最早开始的那条流"接得上，其余流自然更晚（不会倒退）
-        if (!any || track.first_dts < start) {
-            start = track.first_dts;
-            any = true;
-        }
-    }
-    return any ? start : 0;
-}
-
-bool DemuxerProducer::reopenForLoop() {
-    // 偏移必须在关文件**之前**算（要用当前这趟的流信息与 dts 轨迹）
-    const int64_t pass_end = passEndMs();
-    if (pass_end <= 0) {
-        // 空趟：重开还会立刻 EOF → 那就是死循环 + 100% CPU。明确停下来
-        ++_loop_failures;
-        setError("循环重开：这一趟没有读到任何包（空文件/截断）→ 停止循环");
-        ErrorL << "DemuxerProducer: " << lastError();
-        return false;
-    }
-
-    if (!_demux.close()) {
-        ++_loop_failures;
-        setError("循环重开：关闭上一次的上下文失败（本来没打开）");
-        return false;
-    }
-    if (!_demux.open(_path)) {
-        ++_loop_failures;
-        setError("循环重开失败：" + _demux.lastError());
-        ErrorL << "DemuxerProducer: " << lastError();
-        return false;
-    }
-
-    // 参数校验：同一路径重开，流参数必须一模一样。
-    // 变了说明文件在运行期被换掉了 —— 此时继续用**旧快照**（连接可能正拿着它的指针写 FLV）
-    // 就会把新文件的字节按旧参数封装，静默出一路坏流；所以这里明确失败。
-    const StreamInfo *video = _demux.firstVideo();
-    const StreamInfo *audio = _demux.firstAudio();
-    const bool video_ok = (_has_video_info == (video != nullptr)) &&
-                          (!_has_video_info || sameStreamParams(_raw_video_info, *video));
-    const bool audio_ok = (_has_audio_info == (audio != nullptr)) &&
-                          (!_has_audio_info || sameStreamParams(_raw_audio_info, *audio));
-    if (!video_ok || !audio_ok) {
-        ++_loop_failures;
-        setError("循环重开：文件 " + _path + " 的流参数与上一趟不一致（文件被换掉了？）→ 停止");
-        ErrorL << "DemuxerProducer: " << lastError();
-        return false;
-    }
-
-    // 【M10-b】转码时视频时间轴也要"跳过这一趟的剩余部分"：
-    //   转码器给的是"帧序号 × 步长"，而这一趟的真实媒体时长是 pass_end（两者可能差几十毫秒：
-    //   音频 1024 样本/帧 ≈ 23.22ms 这类小数帧长会累积）。在接缝处补齐差额，
-    //   视频与透传音频才会一直在同一条时间轴上（否则每趟漂一点，长跑就音画不同步）。
-    // 【v0.2.1】偏移 = 这一趟的**真实长度**（`pass_end - pass_start`）。
-    // 少了 `pass_start` 这一项时，首包 dts 为负的源（B 帧 / MP4 编辑列表）会在接缝处**倒退**：
-    // 实测 `bf.mp4` 的首包 dts = -80ms、末包 960ms，按旧公式下一趟从 921ms 开始（倒退 39ms），
-    // 循环播放每个接缝都抖一下 —— FLV 与 TS 两条路径都受影响。
-    const int64_t pass_start = passStartMs();
-    const int64_t pass_length = pass_end - pass_start;
-
-    // 转码路径的接缝修正：它自己生成时间轴（"锚点 + 帧序号 × 步长"，跨趟**连续**），
-    // 与透传音频的间距来自"本趟实际转出多少毫秒"与"这一趟真实多长"之间的差额：
-    //   shift += 本趟真实长度 − 本趟转出的媒体时长
-    // （用**增量**而不是"绝对位置"：帧序号是全局连续的，按绝对位置算会把前几趟的偏移重复扣掉）
-    if (_transcoder) {
-        const int64_t frames_this_pass =
-            static_cast<int64_t>(_tx_frames_out - _tx_frames_at_pass_start);
-        const int64_t video_pass_ms = static_cast<int64_t>(
-            std::llround(static_cast<double>(frames_this_pass) * _tx_frame_step_ms));
-        _tx_ts_shift += pass_length - video_pass_ms;
-        _tx_frames_at_pass_start = _tx_frames_out;
-        InfoP("DemuxerProducer: 转码接缝对齐 —— 本趟 %lld 帧（%lld ms）vs 真实 %lld ms，"
-              "修正后累计 %+lld ms",
-              static_cast<long long>(frames_this_pass), static_cast<long long>(video_pass_ms),
-              static_cast<long long>(pass_length), static_cast<long long>(_tx_ts_shift));
-    }
-    _loop_offset_ms.fetch_add(pass_length);
-    _pass.assign(_demux.streams().size(), PassTrack{}); // 新一趟从零开始记
-    ++_loops;
-    InfoP("DemuxerProducer: 循环重开第 %llu 次：本趟 [%lld, %lld] ms → 偏移 +%lld ms",
-          static_cast<unsigned long long>(_loops.load()), static_cast<long long>(pass_start),
-          static_cast<long long>(pass_end), static_cast<long long>(pass_length));
-    return true;
-}
-
-SourcePump::ReadResult DemuxerProducer::read(MediaPacket::Ptr *packet, std::string *error) {
-    if (packet == nullptr || error == nullptr) {
-        setError("read 的出参为空（调用方 bug）");
-        ErrorL << "DemuxerProducer::read 失败：" << lastError();
-        return SourcePump::ReadResult::Error;
-    }
-    if (!_demux.opened()) {
-        setError("尚未 open 就读包");
-        ErrorL << "DemuxerProducer::read 失败：" << lastError();
-        return SourcePump::ReadResult::Error;
-    }
-
-    // 【M10-b】上一次输入吐出的包还没交完：先交（`SourcePump` 的契约是"一次一个包"）
-    if (!_pending.empty()) {
-        return servePending(packet);
-    }
-
-    while (true) {
-        const Demuxer::ReadResult result = _demux.readPacket();
-        if (result == Demuxer::ReadResult::Eof) {
-            // 【M10-b】EOF 必须把编解码器里攒的帧冲出来（**漏了就是少最后几帧且不报错**）。
-            // 循环模式下**不** flush：那只是"这一趟结束"，解码器还要接着解下一趟。
-            if (_transcoder && !_tx_flushed && !_config.loop) {
-                if (!flushTranscoder()) {
-                    return SourcePump::ReadResult::Error;
-                }
-                _tx_flushed = true;
-                if (!_pending.empty()) {
-                    return servePending(packet);
-                }
-            }
-            if (!_config.loop) {
-                // 【M10-b】转码到这里就结束了：冻结墙钟（否则源播完后 speed 会一路衰减成假数字）
-                if (_transcoder && _tx_end_ms.load() == 0) {
-                    _tx_end_ms.store(static_cast<int64_t>(getCurrentMillisecond()));
-                }
-                return SourcePump::ReadResult::EndOfStream;
-            }
-            if (!reopenForLoop()) {
-                return SourcePump::ReadResult::Error; // 重开失败 = 明确失败，不伪装成"读完"
-            }
-            continue; // 重开成功：接着读新一趟（时间戳已由偏移接上）
-        }
-        if (result == Demuxer::ReadResult::Error) {
-            setError(_demux.lastError()); // 如实转达（含超时/超限/损坏）
-            return SourcePump::ReadResult::Error;
-        }
-
-        const AVPacket *pkt = _demux.packet();
-        if (pkt == nullptr || pkt->data == nullptr || pkt->size <= 0) {
-            setError("读到空包（data 为空或 size <= 0）");
-            ErrorL << "DemuxerProducer::read 失败：" << lastError();
-            return SourcePump::ReadResult::Error;
-        }
-
-        const int stream_index = _demux.packetStreamIndex();
-        const StreamInfo *info = findStream(stream_index);
-        MediaKind kind = MediaKind::Video;
-        if (info != nullptr && info->is_video) {
-            kind = MediaKind::Video;
-        } else if (info != nullptr && info->is_audio) {
-            kind = MediaKind::Audio;
-        } else {
-            // 字幕/数据流：媒体层不认，跳过但**计数**（静默跳过 = 悄悄丢数据）
-            ++_skipped_unknown;
-            continue;
-        }
-
-        int64_t pts_ms = 0;
-        int64_t dts_ms = 0;
-        if (!_demux.packetTimestampsMs(&pts_ms, &dts_ms)) {
-            // 换算失败仍然发（Demuxer 保持上一次的值并做了单调钳制）；丢包比时间戳不精确更糟
-            ++_ts_failures;
-        }
-        trackPass(stream_index, dts_ms); // 记本趟的**原始** dts（重开偏移要基于它算）
-
-        // 全链路**唯一**一次拷贝：Demuxer 的 AVPacket 下一帧就被复用
-        std::shared_ptr<std::vector<uint8_t>> payload;
-        if (kind == MediaKind::Video && _annexb_video) {
-            // Annex-B → AVCC：转完与 MP4 输入同形，输出层因此完全不用知道输入是什么
-            auto avcc = std::make_shared<std::vector<uint8_t>>();
-            if (!annexBToAvcc(pkt->data, static_cast<size_t>(pkt->size), avcc.get())) {
-                setError("Annex-B → AVCC 转换失败（包内没有合法起始码 / NAL 超长）");
-                ErrorL << "DemuxerProducer::read 失败：" << lastError();
-                return SourcePump::ReadResult::Error;
-            }
-            payload = std::move(avcc);
-            ++_annexb_packets;
-        } else if (kind == MediaKind::Audio && _adts_audio) {
-            // 【M8】ADTS → raw AAC：FLV 的 AudioTag 里**不能**带 ADTS 头（那样播放端会当噪声）
-            auto raw = std::make_shared<std::vector<uint8_t>>();
-            if (!adtsToRawAac(pkt->data, static_cast<size_t>(pkt->size), raw.get())) {
-                setError("ADTS → raw AAC 转换失败（帧不完整 / 一帧多块 / 同步字丢失）");
-                ErrorL << "DemuxerProducer::read 失败：" << lastError();
-                return SourcePump::ReadResult::Error;
-            }
-            payload = std::move(raw);
-            ++_adts_packets;
-        } else {
-            payload = std::make_shared<std::vector<uint8_t>>(
-                pkt->data, pkt->data + static_cast<size_t>(pkt->size));
-        }
-
-        // 【M10-b】转码：视频包过一道解码/缩放/编码，音频**原样透传**（SPEC §9 不做音频转码）。
-        // 一次输入可能吐出 0..N 个包：0 个就继续读下一个输入，>1 个先排队再一个一个交。
-        if (_transcoder && kind == MediaKind::Video) {
-            if (!transcodeVideo(*payload, dts_ms, pts_ms)) {
-                return SourcePump::ReadResult::Error;
-            }
-            if (_pending.empty()) {
-                continue; // 编解码器还在攒帧（正常现象，不是错误）
-            }
-            return servePending(packet);
-        }
-
-        // 循环重开：把这一趟的时间戳整体挪到上一趟之后（FLV 时间戳必须递增）
-        const int64_t offset = _loop_offset_ms.load();
-        const int64_t out_dts = dts_ms + offset;
-        const int64_t out_pts = pts_ms + offset;
-
-        const bool key_frame = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
-        MediaPacket::Ptr media_packet =
-            MediaPacket::create(kind, stream_index, std::move(payload), key_frame, out_dts, out_pts);
-        if (!media_packet) {
-            setError("MediaPacket::create 失败（参数非法）");
-            ErrorL << "DemuxerProducer::read 失败：" << lastError();
-            return SourcePump::ReadResult::Error;
-        }
-
-        ++_packets;
-        _bytes += media_packet->size();
-        *packet = std::move(media_packet);
-        return SourcePump::ReadResult::Packet;
-    }
-}
-
-// ===========================================================================
-// 【M10-b】转码
-// ===========================================================================
-
-bool DemuxerProducer::openTranscoder() {
-    if (!_config.transcode.enabled) {
-        return true; // 不转码：与 v0.1 完全一致
-    }
+bool DemuxerProducer::appendTranscodeStage() {
     if (!_has_video_info) {
         setError("转码需要视频流，但这个源只有音频（v0.2 不做音频转码）→ 明确拒绝");
         return false;
     }
-    // 音频必须是 AAC：FLV 只能装 AAC，而 SPEC §9 明确"不做音频转码"。
+    // 音频必须是 AAC：FLV/TS 只能装 AAC，而 SPEC §9 明确"不做音频转码"。
     // 这一条**先判**：否则会白建一次编解码器、白转几帧才发现音频没法处理。
     if (_has_audio_info && _audio_info.codec_id != AV_CODEC_ID_AAC) {
         setError("音频编码是「" + _audio_info.codec_name +
                  "」，FLV 只认 AAC，而 v0.2 明确不做音频转码 → 明确拒绝（不静默丢音轨）");
         return false;
     }
-
-    // 判定交给 CodecMatrix（单一口径）：**能力感知**的版本 —— HEVC 在有解码器+编码器时可转
-    const TranscodeCaps caps = detectTranscodeCaps();
-    const AVCodecID audio_codec = _has_audio_info ? _audio_info.codec_id : AV_CODEC_ID_NONE;
-    const CopyOrTranscode verdict = decideOutput(_video_info.codec_id, audio_codec, "flv", caps);
-    if (verdict == CopyOrTranscode::Unsupported) {
-        setError("转码被拒：CodecMatrix 判定「" + _video_info.codec_name +
-                 "」→ FLV 不可行（原因见日志：缺解码器/编码器）");
-        return false;
-    }
-
-    Transcoder::Config tc;
+    TranscodeStage::Config tc;
+    tc.out_height = _config.transcode.out_height;
+    tc.max_height = _config.transcode.max_height;
     tc.out_bitrate_kbps = _config.transcode.out_bitrate_kbps;
     tc.gop_frames = _config.transcode.gop_frames;
     tc.max_out_packets = _config.transcode.max_out_packets;
 
-    // 目标高度有三种来源，优先级从高到低：
-    //   1) `out_height`（URL 的 `h=`）：用户明确要的高度 —— 与源一样 = 不缩放，比源高 = 拒绝；
-    //   2) `max_height`（`--transcode-height`）：只当**上限**用 —— 源高于它才缩；
-    //   3) 都没有：不缩放（只重编码）。
-    int want_height = _config.transcode.out_height;
-    const bool explicit_height = want_height > 0;
-    if (!explicit_height && _config.transcode.max_height > 0 && _video_info.height > 0 &&
-        _config.transcode.max_height < _video_info.height) {
-        want_height = _config.transcode.max_height;
-    }
-    if (want_height < 0 || (want_height > 0 && (want_height & 1) != 0)) {
-        setError("目标高度非法：" + std::to_string(want_height) +
-                 "（0 = 不缩放；否则必须是**偶数**正数 —— yuv420p 要求）");
+    auto stage = std::make_unique<TranscodeStage>(tc);
+    StageContext ctx{_session.path(), _config.demux};
+    StreamInfo out_info;
+    // 用**当前视频链的输出形状**建转码器（Annex-B 已被上一步转成 AVCC）
+    std::string error;
+    if (!stage->prepare(_video_info, ctx, &out_info, &error)) {
+        setError(error);
         return false;
     }
-    if (want_height > 0) {
-        if (_video_info.width <= 0 || _video_info.height <= 0) {
-            setError("拿不到源分辨率（" + std::to_string(_video_info.width) + "x" +
-                     std::to_string(_video_info.height) + "）→ 无法等比缩放，明确拒绝");
-            return false;
-        }
-        if (want_height > _video_info.height && explicit_height) {
-            // 放大既浪费 CPU 又不会更清楚：这类"参数写错了"要当场拒，不能默默照做
-            setError("目标高度 " + std::to_string(want_height) + " 大于源高度 " +
-                     std::to_string(_video_info.height) + " → 明确拒绝（本服务不放大）");
-            return false;
-        }
-        if (want_height != _video_info.height) {
-            tc.out_height = want_height;
-            // 等比算宽（奇数宽由 Transcoder 取偶并 Warn）—— 用 llround 避免截断成 0
-            tc.out_width = static_cast<int>(std::llround(
-                static_cast<double>(_video_info.width) * static_cast<double>(want_height) /
-                static_cast<double>(_video_info.height)));
-        }
-        // want_height == 源高：out_width/out_height 保持 0 = 不缩放（只重编码）
-    }
-
-    Transcoder::Ptr built = Transcoder::create(_video_info, tc);
-    if (!built) {
-        setError("转码器建不起来（输入「" + _video_info.codec_name + "」 " +
-                 std::to_string(_video_info.width) + "x" + std::to_string(_video_info.height) +
-                 "；原因见日志：缺编解码器 / 初始化数据不可用 / 参数非法）");
-        return false;
-    }
-    _transcoder = built;
-    _tx_in_hevc.store(_video_info.codec_id == AV_CODEC_ID_HEVC);
-    // 输出按 CFR 生成（Transcoder 的时间轴 = 锚点 + 帧序号 × 步长），步长取自输出帧率
-    const TimeBase out_fps = built->videoInfo().frame_rate;
-    if (out_fps.num > 0 && out_fps.den > 0) {
-        _tx_frame_step_ms = 1000.0 * static_cast<double>(out_fps.den) /
-                            static_cast<double>(out_fps.num);
-    }
-    _tx_out_width.store(built->videoInfo().width);
-    _tx_out_height.store(built->videoInfo().height);
-    // ★ 关键：把快照换成**输出**形状（宽高 + 现场构造的 avcC）。
-    //   输出层从此看到的就是"一路 H264"，完全不知道它原来是 HEVC 或原来是 1080p。
-    _video_info = built->videoInfo();
-    _tx_enabled.store(true);
-    InfoP("DemuxerProducer: 转码已启用 —— %s %dx%d → h264 %dx%d（out_height=%d）",
-          _tx_in_hevc.load() ? "hevc" : "h264", _raw_video_info.width, _raw_video_info.height,
-          _tx_out_width.load(), _tx_out_height.load(), want_height);
+    _video_info = out_info; // 输出层从此看到转码后的宽高与 avcC
+    _transcode = stage.get();
+    _video_chain.push_back(std::move(stage));
     return true;
 }
 
-bool DemuxerProducer::enqueueTranscoded(std::vector<Transcoder::OutPacket> *outs) {
-    // ★ 转码走 **`_tx_ts_shift`**，不是 `_loop_offset_ms`：转码器自己生成的时间轴是
-    //   "锚点 + 帧序号 × 步长"，跨趟**自动连续**；再叠一次趟偏移就会双计
-    //   （实测：`--loop` 下视频跑到 14.0s 而音频才 8.1s → 音画彻底错位）。
-    //   `_tx_ts_shift` 只在接缝处补"这一趟真实时长 − 这趟转出的媒体时长"的差额（见 reopenForLoop）。
-    const int64_t offset = _tx_ts_shift;
-    for (auto &item : *outs) {
-        const int64_t out_dts = item.dts_ms + offset;
-        const int64_t out_pts = item.pts_ms + offset;
-        MediaPacket::Ptr built = MediaPacket::create(MediaKind::Video, _video_info.index,
-                                                     std::move(item.data), item.key, out_dts, out_pts);
-        if (!built) {
-            setError("转码产物构造 MediaPacket 失败（时间戳/载荷非法）");
-            ErrorL << "DemuxerProducer: " << lastError();
+bool DemuxerProducer::buildChains() {
+    _has_video_info = false;
+    _has_audio_info = false;
+    _annexb_video = false;
+    _adts_audio = false;
+    _video_info = StreamInfo{};
+    _audio_info = StreamInfo{};
+    _video_chain.clear();
+    _audio_chain.clear();
+    _transcode = nullptr;
+
+    StageContext ctx{_session.path(), _config.demux};
+    std::string error;
+
+    // ---- 视频链：输入形状 → （可选）转码 ----
+    if (const StreamInfo *src_video = _session.firstVideo()) {
+        const bool need_annexb = src_video->codec_id == AV_CODEC_ID_H264 &&
+                                 src_video->extradata && !src_video->extradata->empty() &&
+                                 looksLikeAnnexB(src_video->extradata->data(),
+                                                 src_video->extradata->size());
+        PacketStage::Ptr stage = need_annexb ? PacketStage::Ptr(new AnnexBStage())
+                                             : PacketStage::Ptr(new RawStage());
+        StreamInfo out_info;
+        if (!stage->prepare(*src_video, ctx, &out_info, &error)) {
+            setError(error);
+            ErrorL << "DemuxerProducer::open 失败：" << lastError();
             return false;
         }
-        ++_tx_frames_out;
-        // 媒体时长 = 帧数 × 标称帧步长（CFR 输出；用 dts 跨度会被循环偏移造出的假间隙虚高）
-        _tx_out_media_ms.store(static_cast<uint64_t>(
-            std::llround(static_cast<double>(_tx_frames_out) * _tx_frame_step_ms)));
-        ++_tx_outputs;
-        _pending.push_back(std::move(built));
+        _video_info = out_info;
+        _has_video_info = true;
+        _annexb_video = need_annexb;
+        _video_chain.push_back(std::move(stage));
+    }
+
+    // ---- 音频链：输入形状（ADTS）----
+    if (const StreamInfo *src_audio = _session.firstAudio()) {
+        const bool need_adts = src_audio->codec_id == AV_CODEC_ID_AAC &&
+                               (!src_audio->extradata || src_audio->extradata->empty());
+        PacketStage::Ptr stage =
+            need_adts ? PacketStage::Ptr(new AdtsStage()) : PacketStage::Ptr(new RawStage());
+        StreamInfo out_info;
+        if (!stage->prepare(*src_audio, ctx, &out_info, &error)) {
+            setError(error);
+            ErrorL << "DemuxerProducer::open 失败：" << lastError();
+            return false;
+        }
+        _audio_info = out_info;
+        _has_audio_info = true;
+        _adts_audio = need_adts;
+        _audio_chain.push_back(std::move(stage));
+    }
+
+    // ---- 转码：追加到视频链尾（音频在这里已经就绪，才能做"音频必须是 AAC"的校验）----
+    if (_config.transcode.enabled && !appendTranscodeStage()) {
+        ErrorL << "DemuxerProducer::open 失败：" << lastError();
+        return false;
     }
     return true;
 }
 
-bool DemuxerProducer::transcodeVideo(const std::vector<uint8_t> &avcc, int64_t dts_ms,
-                                     int64_t pts_ms) {
-    std::vector<Transcoder::OutPacket> outs;
-    // 只把**转码本身**的耗时计入 cost（不含解封装/节流/网络）：NFR-5 的 speed 分母
-    const uint64_t cost_begin_us = getCurrentMicrosecond();
-    const Transcoder::Result result =
-        _transcoder->transcode(avcc.data(), avcc.size(), dts_ms, pts_ms, &outs);
-    _tx_cost_us.fetch_add(static_cast<int64_t>(getCurrentMicrosecond() - cost_begin_us));
-    ++_tx_inputs;
-    if (_tx_first_ms.load() == 0) {
-        _tx_first_ms.store(static_cast<int64_t>(getCurrentMillisecond())); // speed 的墙钟基准
-    }
-    if (result != Transcoder::Result::Ok) {
-        setError(std::string("转码失败（") + Transcoder::resultName(result) + "）：" +
-                 _transcoder->lastError());
-        ErrorL << "DemuxerProducer: " << lastError();
+bool DemuxerProducer::open(const std::string &path) {
+    if (!_session.open(path)) {
+        setError(_session.lastError()); // 不吞掉下层原因
         return false;
     }
-    // 观测：VFR 与"是否建了缩放器"由转码器决定，这里跨线程可见化（各一次 store 很便宜）
-    _tx_vfr.store(_transcoder->vfrDetected());
-    _tx_scaling.store(_transcoder->scaling());
-    return enqueueTranscoded(&outs);
+    if (!buildChains()) {
+        (void) _session.close(); // 不留半开的对象
+        ErrorL << "DemuxerProducer::open 失败：" << lastError();
+        return false;
+    }
+    // 循环接缝 → 转码阶段对齐时间轴（用回调：**读**不该认识**形状**）
+    _session.setSeamCallback([this](int64_t pass_length_ms) {
+        for (auto &stage : _video_chain) {
+            stage->onSeam(pass_length_ms);
+        }
+    });
+    return true;
 }
 
-bool DemuxerProducer::flushTranscoder() {
-    if (!_transcoder) {
-        return true;
+bool DemuxerProducer::runStage(PacketStage &stage, std::vector<MediaPacket::Ptr> *current,
+                               std::string *error) {
+    std::vector<MediaPacket::Ptr> next;
+    for (const auto &in : *current) {
+        if (!in) {
+            continue;
+        }
+        if (!stage.process(*in, &next, error)) {
+            return false;
+        }
     }
-    std::vector<Transcoder::OutPacket> outs;
-    const uint64_t cost_begin_us = getCurrentMicrosecond();
-    const Transcoder::Result result = _transcoder->flush(&outs);
-    _tx_cost_us.fetch_add(static_cast<int64_t>(getCurrentMicrosecond() - cost_begin_us));
-    if (result != Transcoder::Result::Ok) {
-        setError(std::string("转码收尾失败（") + Transcoder::resultName(result) + "）：" +
-                 _transcoder->lastError());
-        ErrorL << "DemuxerProducer: " << lastError();
-        return false;
-    }
-    return enqueueTranscoded(&outs);
+    *current = std::move(next);
+    return true;
 }
 
 SourcePump::ReadResult DemuxerProducer::servePending(MediaPacket::Ptr *packet) {
@@ -761,29 +296,117 @@ SourcePump::ReadResult DemuxerProducer::servePending(MediaPacket::Ptr *packet) {
     return SourcePump::ReadResult::Packet;
 }
 
-int64_t DemuxerProducer::transcodeElapsedMs() const {
-    const int64_t first = _tx_first_ms.load();
-    if (first <= 0) {
-        return 0; // 还没开始转：没有"经过"可算（不制造 0 除）
+SourcePump::ReadResult DemuxerProducer::read(MediaPacket::Ptr *packet, std::string *error) {
+    if (packet == nullptr || error == nullptr) {
+        setError("read 的出参为空（调用方 bug）");
+        ErrorL << "DemuxerProducer::read 失败：" << lastError();
+        return SourcePump::ReadResult::Error;
     }
-    // 已经转完就用冻结的时刻（否则源播完后它会一直涨，看起来像"越转越慢"）
-    const int64_t end = _tx_end_ms.load();
-    const int64_t now = (end > 0) ? end : static_cast<int64_t>(getCurrentMillisecond());
-    const int64_t elapsed = now - first;
-    return elapsed > 0 ? elapsed : 0;
-}
-
-int64_t DemuxerProducer::transcodeCostMs() const {
-    const int64_t cost_us = _tx_cost_us.load();
-    return cost_us > 0 ? cost_us / 1000 : 0;
-}
-
-double DemuxerProducer::transcodeSpeed() const {
-    const int64_t cost_ms = transcodeCostMs();
-    if (cost_ms <= 0) {
-        return 0.0; // 还不足 1ms：不编数字（"亚毫秒转完"没法给出有意义的倍数）
+    if (!_session.opened()) {
+        setError("尚未 open 就读包");
+        ErrorL << "DemuxerProducer::read 失败：" << lastError();
+        return SourcePump::ReadResult::Error;
     }
-    return static_cast<double>(_tx_out_media_ms.load()) / static_cast<double>(cost_ms);
+
+    // 上一次加工吐出的包还没交完：先交（`SourcePump` 的契约是"一次一个包"）
+    if (!_pending.empty()) {
+        return servePending(packet);
+    }
+
+    while (true) {
+        SourceSession::Packet raw;
+        std::string read_error;
+        const SourceSession::Result result = _session.read(&raw, &read_error);
+        if (result == SourceSession::Result::Error) {
+            setError(read_error); // 如实转达（含超时/超限/损坏/重开失败）
+            return SourcePump::ReadResult::Error;
+        }
+        if (result == SourceSession::Result::EndOfStream) {
+            // 非循环 EOF：让视频链把残余冲出来（**漏了就是少最后几帧且不报错**）。
+            // 循环模式下不会走到这里（session 内部已经重开）。
+            if (!_flushed) {
+                _flushed = true;
+                std::string flush_error;
+                std::vector<MediaPacket::Ptr> flushed;
+                for (auto &stage : _video_chain) {
+                    std::vector<MediaPacket::Ptr> stage_out;
+                    if (!stage->flush(&stage_out, &flush_error)) {
+                        setError(flush_error);
+                        return SourcePump::ReadResult::Error;
+                    }
+                    for (auto &pkt : stage_out) {
+                        flushed.push_back(std::move(pkt));
+                    }
+                }
+                for (auto &pkt : flushed) {
+                    _pending.push_back(std::move(pkt));
+                }
+                if (!_pending.empty()) {
+                    return servePending(packet);
+                }
+            }
+            return SourcePump::ReadResult::EndOfStream;
+        }
+
+        const bool is_video = (raw.kind == MediaKind::Video);
+        std::vector<PacketStage::Ptr> &chain = is_video ? _video_chain : _audio_chain;
+        if (chain.empty()) {
+            setError("这条流没有对应的加工阶段（调用方 bug / 流快照不一致）");
+            ErrorL << "DemuxerProducer::read 失败：" << lastError();
+            return SourcePump::ReadResult::Error;
+        }
+
+        // 原始包（**零拷贝**：session 已把字节拷进共享缓冲区，这里只是包一层）
+        MediaPacket::Ptr in = MediaPacket::create(raw.kind, raw.stream_index, raw.payload, raw.key,
+                                                  raw.raw_dts_ms, raw.raw_pts_ms);
+        if (!in) {
+            setError("MediaPacket::create 失败（参数非法）");
+            ErrorL << "DemuxerProducer::read 失败：" << lastError();
+            return SourcePump::ReadResult::Error;
+        }
+        std::vector<MediaPacket::Ptr> current;
+        current.push_back(std::move(in));
+        std::string stage_error;
+        for (const auto &stage : chain) {
+            if (!runStage(*stage, &current, &stage_error)) {
+                setError(stage_error);
+                ErrorL << "DemuxerProducer::read 失败：" << lastError();
+                return SourcePump::ReadResult::Error;
+            }
+            if (current.empty()) {
+                break; // 该阶段暂时没有产物（转码攒帧）：不必再往下走
+            }
+        }
+
+        // 链尾统一加趟偏移 —— **除非**链里有阶段自己拥有时间轴（转码）
+        if (!current.empty() && !chainOwnsTimeline(is_video)) {
+            const int64_t offset = _session.loopOffsetMs();
+            if (offset != 0) {
+                std::vector<MediaPacket::Ptr> shifted;
+                shifted.reserve(current.size());
+                for (const auto &pkt : current) {
+                    auto moved = MediaPacket::create(pkt->kind(), pkt->streamIndex(), pkt->payload(),
+                                                     pkt->isKeyFrame(), pkt->dtsMs() + offset,
+                                                     pkt->ptsMs() + offset);
+                    if (!moved) {
+                        setError("加趟偏移后构造 MediaPacket 失败（参数非法）");
+                        ErrorL << "DemuxerProducer::read 失败：" << lastError();
+                        return SourcePump::ReadResult::Error;
+                    }
+                    shifted.push_back(std::move(moved));
+                }
+                current = std::move(shifted);
+            }
+        }
+
+        for (auto &pkt : current) {
+            _pending.push_back(std::move(pkt));
+        }
+        if (_pending.empty()) {
+            continue; // 编解码器还在攒帧（正常现象，不是错误）
+        }
+        return servePending(packet);
+    }
 }
 
 } // namespace mzmedia

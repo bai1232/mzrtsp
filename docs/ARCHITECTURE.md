@@ -16,6 +16,7 @@
 ├──────────────────────────────────────────────────────────────────┤
 │ Media 层      MediaSource（一源一份输出 + 多订阅者）              │
 │              SourceManager · Subscriber · FrameQueue · GopCache   │
+│              SourceSession（读）· PacketStage（形状）· DemuxerProducer（编排）│
 ├──────────────────────────────────────────────────────────────────┤
 │ FFmpeg 封装层 Demuxer · Remuxer · Transcoder（v0.2）· Filter（v0.3）│
 │              AvPtr<T>（RAII 智能指针）· CodecMatrix（可行性判定）  │
@@ -45,6 +46,29 @@ grep -rn '#include "mzmedia.h"' src/                  # 只允许 src/main.cpp
 它仍然是**向下**依赖（Output 在 Network 之上，见上图的依赖方向），不是反向依赖；
 而 `FlvSender`/`FlvMuxer`/`MpegTsMuxer`/`HlsWriter` 这些**纯输出层**类**一律不碰** network/http。
 把 poller 抽象成"定时器接口"再注入，对这个规模是净增复杂度，所以选择留这一处并在此写清。
+
+### 1.1 输入侧的两条轴（v0.2.3 重构后）
+
+`DemuxerProducer` 曾经把"读"与"输入形状"塞在一个类里（789 行），于是每加一种输入形状或能力
+都要改它。现在拆成两条**互不认识**的轴（详见 `DESIGN_REFACTOR_PIPELINE.md`）：
+
+| 轴 | 谁负责 | 变化频率 | 加东西时改哪 |
+|---|---|---|---|
+| **读**（打开/读包/EOF/循环/**重连**） | `SourceSession` | 换协议才动（v0.3 的 RTSP） | 只动它 |
+| **形状**（Annex-B→AVCC、ADTS→AAC、转码、将来的滤镜） | `PacketStage` 实现 + 一条链 | 每加一种加工就加一个 | 新文件 + `buildChains()` 一支 |
+
+两条轴的唯一耦合是**循环接缝回调**（`setSeamCallback`）与**链尾统一加趟偏移**
+（除非链里有阶段 `ownsTimeline()`）—— 都是显式契约，有专门用例断言。
+
+**开闭原则的机检口径**（每次交付后统计）：
+
+```bash
+git diff --stat <上一个 tag>..HEAD -- src/media/media_source.* src/media/subscriber.* \
+    src/media/frame_queue.* src/network/ src/http/
+```
+
+新增函数/只读接口 ≤ 20 行属"接线"（正常）；**改既有逻辑 > 30 行**必须在验收文档里写清
+"为什么非改不可、替代方案为何更差"。这条规则让"加功能改了多少老代码"每次发版都被看见。
 
 **`third_party/` 是分层之外的特例**：里面只有两个浏览器播放器 —— `flv.js`（HTTP-FLV，Apache-2.0）
 与 `hls.js`（HLS，Apache-2.0，M9-c 入库）。它们**不参与 C++ 构建**（被 `src/main.cpp` 当静态文件
