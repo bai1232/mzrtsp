@@ -253,6 +253,9 @@ private:
     std::atomic<int64_t> _loop_offset_ms{0};
     /// 【M11-a2b】接缝时间戳修复次数（源的头几个包时间戳乱序时整段后移）
     std::atomic<uint64_t> _seam_repairs{0};
+    /// 【M11-a2b】"刚接缝"的窗口（还剩几个包可以修时间戳）：接缝后 8 个包足够覆盖
+    /// 源的乱序头（实测 1–3 个），又不会把正常文件的轻微乱序也一起"修"
+    int _seam_window = 0;
 
     /// 只有源线程碰：一趟的 dts 轨迹
     std::vector<PassTrack> _pass;

@@ -425,6 +425,7 @@ SourceSession::Result SourceSession::read(Packet *out, std::string *error) {
             if (!reopenForLoop()) {
                 return Result::Error; // 重开失败 = 明确失败，不伪装成"读完"
             }
+            _seam_window = 8; // 循环接缝同样允许修时间戳（新一趟的开头）
             continue; // 重开成功：接着读新一趟（时间戳已由偏移接上）
         }
         if (result == Demuxer::ReadResult::Error || peer_gone) {
@@ -487,6 +488,7 @@ SourceSession::Result SourceSession::read(Packet *out, std::string *error) {
         if (_network && _reconnect_needs_timeline) {
             _reconnect_needs_timeline = false;
             continueTimelineAt(dts_ms);
+            _seam_window = 8; // 新连接开头的包允许"修时间戳"（见上面的 in_seam_window）
         }
 
         out->kind = kind;
@@ -502,7 +504,13 @@ SourceSession::Result SourceSession::read(Packet *out, std::string *error) {
         //   FLV 里就出现非单调 dts、解码器报 `co located POCs unavailable`。
         //   处理：整段**统一下移/上移到上一包之后**（不是逐包修补，段内节奏不抖），并计数。
         int64_t effective = dts_ms + _loop_offset_ms.load();
-        if (_has_effective_dts && effective <= _last_effective_dts) {
+        // 只在"刚接缝"的窗口里修：新一段开头的几个包（源没 RTCP SR 时时间戳会乱），
+        // 否则**正常的本地文件**（首包 dts 略有乱序）也会被"修"，把 loopOffset 弄成非 0。
+        const bool in_seam_window = _seam_window > 0;
+        if (_seam_window > 0) {
+            --_seam_window;
+        }
+        if (in_seam_window && _has_effective_dts && effective <= _last_effective_dts) {
             const int64_t bump = (_last_effective_dts + 1) - effective;
             _loop_offset_ms.fetch_add(bump);
             effective += bump;
