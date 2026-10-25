@@ -256,9 +256,29 @@ curl -s http://127.0.0.1:8080/api/stats | python3 -m json.tool | grep -A14 '"tra
 
 | 验证项 | 结果 |
 |---|---|
-| tag 独立构建 | 见 §8.1 |
-| tag 上的 ctest | 见 §8.1 |
+| tag 独立构建 | ✅ **0 warning / 0 error** |
+| tag 上的 ctest | ✅ **24/24**（281 用例） |
+| tag 上的单进程全量 | ✅ **281/281 用例、62,841 断言** |
 
 ### 8.1 tag 独立构建与测试（`VERSIONING.md` §5）
 
-（本节由 tag 推送后的复现填入。）
+tag 推送后**从本地仓库重新 clone**（不依赖工作区里的任何未提交改动），完整走一遍
+`VERSIONING.md` §5 的最后一问：
+
+```bash
+git clone --branch v0.2.0 /home/bpy/MyZltoolkit /tmp/v020_verify && cd /tmp/v020_verify
+./scripts/make_samples.sh          # 样本不入库，必须先造
+cmake -B build && cmake --build build -j4
+cd build && ctest --output-on-failure
+```
+
+| 步骤 | 实测 |
+|---|---|
+| clone | `clone=0`；`HEAD=44ae44d`；`git describe --tags` = **`v0.2.0`**（tag 与提��对得上） |
+| `make_samples.sh` | `samples=0`（含 `sample.mkv` / `sample.ts` / `vonly.ts` / `sample1080.mp4` / `sample_hevc.mp4` / `sample_audio.aac`） |
+| `cmake -B build` | `configure=0` |
+| `cmake --build build -j4` | `build=0`，**`warnings=0`** |
+| `ctest` | **24/24 通过**（`ctest=0`），耗时 18 s |
+| 单进程全量 | **281/281、62,841 断言**（`single=0`） |
+
+> 这一步同时验证了"可回滚"：把仓库切到 `v0.2.0`（或回退到 `v0.1.1`）都能独立构建并跑完整门禁。
