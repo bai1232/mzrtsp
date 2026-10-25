@@ -167,6 +167,15 @@ public:
     uint64_t timestampFailures() const {
         return _ts_failures.load();
     }
+    /// 【v0.2.1】**pts 回退（乱序）**的包数 —— B 帧源的**正常现象**（源线程写，观测方可能跨线程读）
+    /// @note 它是"这条链路有没有把 B 帧的显示顺序搞坏"的最直观指标：>0 才说明 pts 是原样的
+    uint64_t ptsOutOfOrder() const {
+        return _demux.ptsOutOfOrder();
+    }
+    /// **dts** 回退被钳制的次数（正常应恒为 0；非 0 说明源的解码序都不单调了）
+    uint64_t dtsClamped() const {
+        return _demux.dtsClamped();
+    }
     /// Annex-B → AVCC 转换过的视频包数（Annex-B 输入 ≈ 视频包总数）
     uint64_t annexBPackets() const {
         return _annexb_packets.load();
@@ -243,12 +252,17 @@ public:
     std::string lastError() const;
 
 private:
-    /// 一趟的 dts 轨迹（算"这一趟到哪儿结束"用；只有源线程碰它）
+    /// 一趟的 dts 轨迹（算"这一趟从哪儿开始 / 到哪儿结束"用；只有源线程碰它）
     struct PassTrack {
         int64_t last_dts = 0;
         int64_t prev_dts = 0;
+        /// 【v0.2.1】这一趟该流的**首个** dts。为什么需要它：MP4 的编辑列表/B 帧源首包
+        /// dts 可能是负的（实测 `bf.mp4` = **-80ms**），只按"末包 + 帧长"算趟偏移会让
+        /// 下一趟的首包**倒退**（960 → 921），循环播放时每个接缝都抖一下
+        int64_t first_dts = 0;
         bool has_last = false;
         bool has_prev = false;
+        bool has_first = false;
     };
 
     const StreamInfo *findStream(int index) const;
@@ -268,6 +282,9 @@ private:
     bool reopenForLoop();
     /// 本趟结束时刻（毫秒）：各流"最后 dts + 一帧时长"的最大值；没有任何包 = 0
     int64_t passEndMs();
+    /// 本趟起点（毫秒）：各流**首个 dts** 的最小值；没有任何包 = 0
+    /// @note 循环偏移要用 `pass_end - pass_start`，否则首包 dts 为负的源会在接缝处倒退
+    int64_t passStartMs();
     /// 用帧率/采样率估一帧时长（拿不到就返回 0，**不猜**）
     static int64_t estimateFrameDurationMs(const StreamInfo &info);
     /// 流参数是否一致（重开时校验；不一致说明文件被换了）

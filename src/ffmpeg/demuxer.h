@@ -85,8 +85,8 @@ public:
      * @note 刻意**保留**两样东西：
      *       · 计数器（`totalPackets` 等）——它们是"这个对象一辈子干了什么"，不属于某一次打开；
      *       · `setAbortFlag` 绑定的外部标志——它是外部生命周期，与文件无关。
-     *       流的单调时间戳守卫（`_pts_guard`/`_dts_guard`）**必须**清掉：新一次打开的时间轴
-     *       从零开始，留着旧守卫会把新时间戳全判成"回退"而钳住。
+     *       流的单调守卫（`_dts_guard`）与 pts 的回退观测（`_last_pts`）**必须**清掉：
+     *       新一次打开的时间轴从零开始，留着旧守卫会把新时间戳全判成"回退"而钳住。
      */
     bool close();
 
@@ -107,8 +107,17 @@ public:
     ReadResult readPacket();
     const AVPacket *packet() const;
     int packetStreamIndex() const;
-    /// 当前包的时间戳（毫秒，已做换算 + 单调钳制）
-    /// @return false = 换算出错（已计数；输出保持上一次的值）
+    /**
+     * 当前包的时间戳（毫秒，已做换算）
+     * @param pts_ms 出参：**源的真实 pts**（B 帧源的 pts 本来就是乱序的，这里**不钳**）
+     * @param dts_ms 出参：已按流做单调钳制（容器/播放器都要求 dts 单调不减）
+     * @return false = 换算出错（已计数；输出保持上一次的值）
+     * @note 【v0.2.1 修的真 bug】这里以前把 **pts 也**钳了（`_pts_guard`），于是带 B 帧的源
+     *       （x264 的默认产物！）的显示顺序被破坏：实测 `bf.mp4` 的 cts 从
+     *       `80,160,40,40,160,40,40,160` 变成 `80,160,120,80,160,120,80,160`，
+     *       表现为"画面顺序错乱"而不报任何错（`ffmpeg -f null -` 只出 warning）。
+     *       pts 回退是 B 帧的**正常现象**，只观测（`ptsOutOfOrder()`），不改正数据。
+     */
     bool packetTimestampsMs(int64_t *pts_ms, int64_t *dts_ms);
 
     // 观测（全部是"能证明某件事发生过"的计数）
@@ -116,7 +125,9 @@ public:
     uint64_t totalBytes() const;
     uint64_t rejectedPackets() const;   // 超过 max_packet_size
     uint64_t rescaleFailures() const;   // 时间戳换算失败/缺失
-    uint64_t monotonicClamped() const;  // 时间戳回退被钳制的次数
+    uint64_t dtsClamped() const;        // **dts** 回退被钳制的次数（真异常：容器/播放器要求 dts 单调）
+    /// 【v0.2.1】pts 回退（乱序）的次数 —— **B 帧的正常现象**，只观测、不修改数据
+    uint64_t ptsOutOfOrder() const;
     const std::string &lastError() const;
 
 private:
@@ -127,8 +138,11 @@ private:
     std::string _path;
     std::vector<StreamInfo> _streams;
     AvPacket _pkt;
-    std::vector<MonotonicGuard> _pts_guard;   // 按流索引
-    std::vector<MonotonicGuard> _dts_guard;
+    std::vector<MonotonicGuard> _dts_guard;   // 按流索引（**只守 dts**）
+    /// 按流的"上一次 pts"（只为统计乱序次数；**不用它改值**）
+    std::vector<int64_t> _last_pts;
+    std::vector<bool> _has_last_pts;
+    uint64_t _pts_out_of_order = 0;
     const std::atomic<bool> *_abort = nullptr; // 外部中止标志（M5-c）
     int _pkt_stream_index = -1;
     int64_t _pkt_pts_ms = 0;

@@ -28,6 +28,7 @@ RAW_SAMPLE="$ROOT/samples/sample.h264"
 MKV_SAMPLE="$ROOT/samples/sample.mkv"   # M8 / FR-2.2
 TS_SAMPLE="$ROOT/samples/sample.ts"     # M8：AAC 在 TS 里是 ADTS
 HEVC_SAMPLE="$ROOT/samples/sample_hevc.mp4"  # M10-b：HEVC 源（缺 libx265 时不存在 → 用例跳过）
+BF_SAMPLE="$ROOT/samples/bf.mp4"        # v0.2.1：带 B 帧的样本（pts 乱序是正常现象）
 FLVJS="$ROOT/third_party/flv.js/flv.min.js"
 
 MEDIA_DIR="/tmp/mzmedia_acc_media"
@@ -42,6 +43,9 @@ FLVJS_OUT="/tmp/mzmedia_flvjs.js"
 TTFB_OUT="/tmp/mzmedia_ttfb.flv"
 TTFB_INFO="/tmp/mzmedia_ttfb.txt"
 OUT_TX="/tmp/mzmedia_flv_http_tx.flv"
+OUT_BF="/tmp/mzmedia_flv_http_bf.flv"
+OUT_BF_LOOP="/tmp/mzmedia_flv_http_bf_loop.flv"
+BF_STATS="/tmp/mzmedia_flv_http_bf_stats.json"
 OUT_TX_HEVC="/tmp/mzmedia_flv_http_tx_hevc.flv"
 TX_STATS="/tmp/mzmedia_flv_http_tx_stats.json"
 SRV_LOG="/tmp/mzmedia_flv_http_server.log"
@@ -100,6 +104,7 @@ cp "$SAMPLE" "$MEDIA_DIR/notes.sh"     # §6 用来验证"扩展名白名单"
 cp "$RAW_SAMPLE" "$MEDIA_DIR/clip.h264"
 cp "$MKV_SAMPLE" "$MEDIA_DIR/clip.mkv"    # §3b
 cp "$TS_SAMPLE" "$MEDIA_DIR/clip.ts"      # §3b（AAC 是 ADTS）
+cp "$BF_SAMPLE" "$MEDIA_DIR/bf.mp4"       # §12（B 帧源：pts 乱序 + 首包 dts 为负）
 
 SRV_PID=""
 LOOP_PID=""
@@ -595,13 +600,134 @@ PYSTATS
     fi
 fi
 
+echo "== 12) B 帧源（v0.2.1）：pts 不许被钳、CompositionTime 必须与源一致 =="
+# 为什么单列：`sample.mp4` 是**无 B 帧**的，所以整条链路在"帧顺序"这一维上从来没被验过；
+# 而 x264 默认就带 B 帧。v0.2.1 修的 bug 正是"Demuxer 把 pts 也做了单调钳制"——
+# 现象是**画面顺序错乱但不报错**，只能靠"cts 与源不一致"抓出来。
+code="$(curl -s -o "$OUT_BF" -w '%{http_code}' --max-time 10 "http://127.0.0.1:$PORT/live/bf.flv")"
+check "GET /live/bf.flv → 200" "$code" "200"
+set +e
+bf_out="$(python3 - "$OUT_BF" << 'PYBF'
+import sys
+data = open(sys.argv[1], 'rb').read()
+if data[:3] != b'FLV':
+    sys.exit("前 3 字节不是 FLV")
+pos = 13
+dts = []
+cts = []
+while pos + 11 <= len(data):
+    ttype = data[pos]
+    size = int.from_bytes(data[pos + 1:pos + 4], 'big')
+    ts = int.from_bytes(data[pos + 4:pos + 7], 'big') | (data[pos + 7] << 24)
+    body = data[pos + 11:pos + 11 + size]
+    if ttype == 9 and len(body) >= 5 and body[1] == 1:      # AVC NALU
+        c = int.from_bytes(body[2:5], 'big')
+        if c & 0x800000:
+            c -= 1 << 24
+        dts.append(ts)
+        cts.append(c)
+    pos += 11 + size + 4
+if len(dts) != 25:
+    sys.exit("视频 tag 数 = %d（期望 25）" % len(dts))
+if any(dts[i] <= dts[i - 1] for i in range(1, len(dts))):
+    sys.exit("dts 不严格递增：%s" % dts)
+if set(cts) - {40, 80, 160}:
+    sys.exit("CompositionTime 集合异常：%s（B 帧的 pts 被钳会得到 120/80 混杂）" % sorted(set(cts)))
+print("25 tag / cts=%s" % sorted(set(cts)))
+PYBF
+)"
+bf_rc=$?
+set -e
+if [ "$bf_rc" -eq 0 ]; then
+    printf '  ✔ %-34s %s\n' "B 帧 FLV：tag 数 / dts 单调 / cts 与源一致" "$bf_out"
+    pass=$((pass + 1))
+else
+    check_false_msg "B 帧 FLV：tag 数 / dts 单调 / cts 与源一致" "$bf_out"
+fi
+if [ -z "$(ffmpeg -v error -i "$OUT_BF" -f null - 2>&1 > /dev/null || true)" ]; then
+    check_true "B 帧流完整解码无 error（修前这里会出 non monotonically increasing dts）"
+else
+    check_false_msg "B 帧流完整解码无 error" \
+        "$(ffmpeg -v error -i "$OUT_BF" -f null - 2>&1 > /dev/null || true | head -2)"
+fi
+# 统计口径：pts 乱序是**正常现象**要 >0；dts 被钳是异常，必须为 0
+curl -s --max-time 3 "http://127.0.0.1:$PORT/api/stats" > "$BF_STATS"
+set +e
+bf_ts="$(python3 - "$BF_STATS" << 'PYTS'
+import json, sys
+d = json.load(open(sys.argv[1]))
+ooo = clamped = 0
+seen = 0
+for s in d.get("media_sources", []):
+    ts = s.get("producer", {}).get("ts")
+    if not ts:
+        continue
+    seen += 1
+    ooo = max(ooo, ts.get("pts_out_of_order", 0))
+    clamped = max(clamped, ts.get("dts_clamped", 0))
+print("sources=%d pts_out_of_order=%d dts_clamped=%d" % (seen, ooo, clamped))
+sys.exit(0 if (ooo > 0 and clamped == 0) else 1)
+PYTS
+)"
+bf_ts_rc=$?
+set -e
+if [ "$bf_ts_rc" -eq 0 ]; then
+    printf '  ✔ %-34s %s\n' "/api/stats 的时间戳观测（pts 乱序 / dts 钳制）" "$bf_ts"
+else
+    check_false_msg "/api/stats 的时间戳观测" "$bf_ts（要求 pts_out_of_order>0 且 dts_clamped=0）"
+fi
+# 循环 + 首包 dts 为负：每个接缝都不许倒退（v0.2.1 的第二个 bug）
+curl -sS -N --max-time 2 "http://127.0.0.1:$LOOP_PORT/live/bf.flv" -o "$OUT_BF_LOOP" || true
+set +e
+bf_loop="$(python3 - "$OUT_BF_LOOP" << 'PYLOOP'
+import sys
+data = open(sys.argv[1], 'rb').read()
+if data[:3] != b'FLV':
+    sys.exit("前 3 字节不是 FLV")
+pos = 13
+dts = []
+while pos + 11 <= len(data):
+    ttype = data[pos]
+    size = int.from_bytes(data[pos + 1:pos + 4], 'big')
+    ts = int.from_bytes(data[pos + 4:pos + 7], 'big') | (data[pos + 7] << 24)
+    body = data[pos + 11:pos + 11 + size]
+    # 只数**真正的视频帧**：AVC sequence header（body[1] == 0）的时间戳恒为 0，
+    # 把它算进来会造出一个假的"dts 重复"（本脚本自己踩过一次）
+    if ttype == 9 and len(body) >= 5 and body[1] == 1:
+        dts.append(ts)
+    pos += 11 + size + 4
+if len(dts) < 50:
+    sys.exit("跨接缝的 tag 太少（%d）" % len(dts))
+bad = [i for i in range(1, len(dts)) if dts[i] <= dts[i - 1]]
+if bad:
+    sys.exit("跨接缝 dts 倒退/重复 %d 处（首个在 index=%d：%d → %d）"
+             % (len(bad), bad[0], dts[bad[0] - 1], dts[bad[0]]))
+print("%d tag / 跨接缝 dts 严格递增" % len(dts))
+PYLOOP
+)"
+bf_loop_rc=$?
+set -e
+if [ "$bf_loop_rc" -eq 0 ]; then
+    printf '  ✔ %-34s %s\n' "循环 + 负首 dts：接缝不倒退" "$bf_loop"
+    pass=$((pass + 1))
+else
+    check_false_msg "循环 + 负首 dts：接缝不倒退" "$bf_loop"
+fi
+if [ -z "$(ffmpeg -v error -i "$OUT_BF_LOOP" -f null - 2>&1 > /dev/null || true)" ]; then
+    check_true "循环 B 帧流完整解码无 error"
+else
+    check_false_msg "循环 B 帧流完整解码无 error" \
+        "$(ffmpeg -v error -i "$OUT_BF_LOOP" -f null - 2>&1 > /dev/null || true | head -2)"
+fi
+
 echo "------------------------------------------------------------------------"
 echo "结果：通过 $pass 项 / 失败 $fail 项"
-echo "  产物：$OUT / $OUT_RAW / $OUT_LOOP / $OUT_LATE / $OUT_TX"
+echo "  产物：$OUT / $OUT_RAW / $OUT_LOOP / $OUT_LATE / $OUT_TX / $OUT_BF / $OUT_BF_LOOP"
 echo "  日志：$SRV_LOG / $LOOP_LOG / $TRANS_LOG"
 if [ "$fail" -gt 0 ]; then
     echo "结论：M6-c 未通过"
     exit 1
 fi
-echo "结论：M6-c + M10-b 通过（播放页/flv.js、MP4 与裸流与 MKV/TS 都能拉出合法 FLV；循环推流生效；"\
-"源结束后不挂连接；转码的开关语义/缩放/HEVC→H264/并发上限/speed 均生效）"
+echo "结论：M6-c + M10-b + v0.2.1 通过（播放页/flv.js、MP4 与裸流与 MKV/TS 都能拉出合法 FLV；"\
+"循环推流生效；源结束后不挂连接；转码的开关语义/缩放/HEVC→H264/并发上限/speed 均生效；"\
+"B 帧源的 CompositionTime 与源一致、循环接缝不倒退）"

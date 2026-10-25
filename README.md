@@ -12,6 +12,7 @@
 | **v0.1.0** | MP4 / H264 裸流 → **HTTP-FLV**，remux 零拷贝，多客户端共享 | ✅ **已发布**（tag `v0.1.0`；验收证据见 [docs/ACCEPTANCE_v0.1.0.md](docs/ACCEPTANCE_v0.1.0.md)） |
 | **v0.1.1** | 补丁：`Connection: close` 与畸形请求之后**真的关闭连接**（RFC 7230 §6.6） | ✅ **已发布**（tag `v0.1.1`；证据见 [docs/ACCEPTANCE_v0.1.1.md](docs/ACCEPTANCE_v0.1.1.md)） |
 | **v0.2.0** | MKV / TS 输入、**HLS** 输出、**转码**（含 HEVC → H264） | ✅ **已发布**（tag `v0.2.0`；验收证据见 [docs/ACCEPTANCE_v0.2.0.md](docs/ACCEPTANCE_v0.2.0.md)） |
+| **v0.2.1** | 补丁：**B 帧源**的时间戳（pts 不再被钳 → 显示顺序正确；TS 负时间戳整体平移；循环接缝不倒退） | ✅ **已发布**（tag `v0.2.1`；证据见 [docs/ACCEPTANCE_v0.2.1.md](docs/ACCEPTANCE_v0.2.1.md)） |
 | v0.3.0 | RTSP 输入、解码处理（滤镜/缩放/水印） | ⏳ 计划 |
 
 ### v0.2.0 验收摘要（实测，完整矩阵见验收报告）
@@ -23,6 +24,15 @@
 | **转码（NFR-5）** | 1080p→720p **3.03x**（媒体 4880 ms vs 墙钟 1688 ms，74 帧/s）；服务内 `/api/stats` 的 `speed` **3.26x**；HEVC→H264 实测可播 | **≥1.0x ✅ 首次达成** |
 | 并发/稳定性 | **10 路 × 1 小时**：每路完整可解、丢帧 0、fd 恒定、错误日志 0；ASAN 构建 10/10 | NFR-2/3/4 |
 | 质量（NFR-7） | `--clean-first` 重建 **0 warning**；**281 用例 / 24 分组**；ASAN 24/24；TSAN **370 用例 / 真问题 0** | 零警告 |
+
+### v0.2.1 补丁摘要（实测，详见 [验收报告](docs/ACCEPTANCE_v0.2.1.md)）
+
+| 场景（`bf.mp4`，`-bf 2`） | 修前 | 修后 |
+|---|---|---|
+| FLV 的 CompositionTime | `80,160,120,80,…`（B 帧被抬高 → **画面顺序错乱**） | `80,160,40,40,…`（**与源逐包一致**） |
+| `ffmpeg -f null -` | 3 条 `non monotonically increasing dts` | **零输出** |
+| TS 切片的 PES dts | `1.000, 1.000, 1.000`（负 dts 被钳 0） | `1.000, 1.040, 1.080`（整体平移，差值不变） |
+| `--loop` 接缝 dts | 961 → **921**（倒退 39 ms，每次循环抖一下） | 严格递增 |
 
 ### v0.1.0 验收摘要（历史，完整矩阵见 [验收报告](docs/ACCEPTANCE_v0.1.0.md)）
 
@@ -160,9 +170,9 @@ ffprobe -v error -show_entries stream=codec_name,width,height /tmp/tx.flv    # h
 ### 验证（每个脚本都会打印"通过 N 项 / 失败 N 项"）
 
 ```bash
-cd build && ctest                        # 24 个分组（281 个用例），**串行**跑（不要加 -j）
+cd build && ctest                        # 24 个分组（286 个用例），**串行**跑（不要加 -j）
 ./bin/mzmedia_unittest producer           # 只跑某组：分组名是**用例名的子串**
-../scripts/flv_http_test.sh               # 端到端：96 项（HTTP-FLV + MKV/TS + 播放页 + 循环 + 转码）
+../scripts/flv_http_test.sh               # 端到端：101 项（HTTP-FLV + MKV/TS + 播放页 + 循环 + 转码 + B 帧）
 ../scripts/hls_test.sh                    # HLS：32 项（m3u8 / 切片 / Range / 窗口 / 租约 / 播放页）
 ../scripts/ts_mux_test.sh                 # TS 封装：29 项（ffprobe/ffmpeg 四层判据）
 ../scripts/transcode_test.sh              # 转码：12 项（1080p→720p + NFR-5 speed）
@@ -189,7 +199,8 @@ cd build && ctest                        # 24 个分组（281 个用例），**�
 | [docs/SPEC.md](docs/SPEC.md) | **需求规格（唯一规格来源）**：能力矩阵、流水线、功能/非功能需求、成功标准 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构设计：分层、线程模型、一源多消费者、资源管理 |
 | [docs/CODEC_MATRIX.md](docs/CODEC_MATRIX.md) | 输入 × 输出的可行性判定（何时 remux、何时必须转码） |
-| [docs/ACCEPTANCE_v0.2.0.md](docs/ACCEPTANCE_v0.2.0.md) | **v0.2.0 验收报告（当前版本）**：逐条 SC/NFR/FR → 状态 + 证据命令 + 实测数字 + 变异验证 + 未验证清单 |
+| [docs/ACCEPTANCE_v0.2.1.md](docs/ACCEPTANCE_v0.2.1.md) | **v0.2.1 补丁验收报告（当前版本）**：B 帧源时间戳三处缺陷的修前/修后实测 + 变异验证 |
+| [docs/ACCEPTANCE_v0.2.0.md](docs/ACCEPTANCE_v0.2.0.md) | **v0.2.0 验收报告**：逐条 SC/NFR/FR → 状态 + 证据命令 + 实测数字 + 变异验证 + 未验证清单 |
 | [docs/ACCEPTANCE_v0.1.0.md](docs/ACCEPTANCE_v0.1.0.md) | **v0.1.0 验收报告**：逐条 SC/NFR/FR → 状态 + 证据命令 + 实测数字 + 复现步骤 + 未达成清单 |
 | [docs/ACCEPTANCE_v0.1.1.md](docs/ACCEPTANCE_v0.1.1.md) | **v0.1.1 补丁验收报告**：两个缺陷的修前/修后实测、变异验证、门禁数字、已知边界 |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 里程碑任务分解与风险 |

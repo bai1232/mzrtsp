@@ -313,16 +313,30 @@ MpegTsMuxer::Result MpegTsMuxer::writePacket(const MediaPacket &packet, std::str
         return fail(Result::InvalidPacket, "包不属于这两路流（streamIndex 对不上）");
     }
 
-    // 负时间戳（MP4 编辑列表可能出现）直接钳到 0 并计数：把负值强转成 uint64 会得到天文数字，
-    // 那是"能播但时间轴全乱"的经典成因（实测：首包 PTS=0 时 ffmpeg 的 TS demuxer 还会
-    // 把它当回绕吐成 2^33，所以下面还要再加一个起点偏移）。
+    // 负时间戳（MP4 的编辑列表 / B 帧源的首包会出现）：把负值强转成 uint64 会得到天文数字，
+    // 那是"能播但时间轴全乱"的经典成因；另外首包 PTS=0 时 ffmpeg 的 TS demuxer 还会把它当
+    // 回绕吐成 2^33，所以下面还要再加一个起点偏移（kStartOffset90k）。
+    //
+    // 【v0.2.1 修的真 bug】**不能逐包"钳到 0"**：那会抹掉前几帧之间的 dts 差异。
+    // 实测 `bf.mp4`（B 帧源）源 dts = -80, -40, 0, 40 ms，被钳成 0, 0, 0, 40 →
+    // 前三个 PES 的 dts 完全相同，播放端只能靠猜。
+    // 改成：**首个包**确定一个 muxer 级基准 `_base_ms = max(0, -min(pts, dts))`，
+    // 之后所有时间戳整体 + base（**差值不变**，音画相对关系不变）；移位后仍为负的
+    // （比如首个包是视频 0ms、音频的 -23ms 随后才到）才钳 0 并计数 —— 与 FLV 侧同一套口径。
     const int64_t pts_ms_raw = packet.ptsMs();
     const int64_t dts_ms_raw = packet.dtsMs();
-    if (pts_ms_raw < 0 || dts_ms_raw < 0) {
-        ++_negative_ts_clamped;
+    if (!_base_set) {
+        const int64_t lowest = (pts_ms_raw < dts_ms_raw) ? pts_ms_raw : dts_ms_raw;
+        _base_ms = (lowest < 0) ? -lowest : 0;   // 让首包最小时间戳落在 0
+        _base_set = true;
     }
-    const int64_t pts_ms = (pts_ms_raw > 0) ? pts_ms_raw : 0;
-    const int64_t dts_ms = (dts_ms_raw > 0) ? dts_ms_raw : 0;
+    int64_t pts_ms = pts_ms_raw + _base_ms;
+    int64_t dts_ms = dts_ms_raw + _base_ms;
+    if (pts_ms < 0 || dts_ms < 0) {
+        ++_negative_ts_clamped;   // 移位后仍为负：只能钳 0（计数，不静默）
+        pts_ms = (pts_ms > 0) ? pts_ms : 0;
+        dts_ms = (dts_ms > 0) ? dts_ms : 0;
+    }
     const uint64_t pts90k = kStartOffset90k + static_cast<uint64_t>(pts_ms) * kTsClockHz / 1000;
     const uint64_t dts90k = kStartOffset90k + static_cast<uint64_t>(dts_ms) * kTsClockHz / 1000;
     _last_dts90k = dts90k & kTimestampMask;

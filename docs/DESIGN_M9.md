@@ -81,7 +81,8 @@ HTTP 侧只读切片，复用 `serveMemoryAsStatic()`（= HttpServer 里那套�
 | 切片存放 | **内存 ring（window 片）+ 单片/总量双上限** | 排除落盘（多一套清理与磁盘上限，NFR-6 的口径变脏） |
 | 探活 | m3u8 里 `#EXT-X-ENDLIST` 只在源 EOS 时出现 | 文件输入 + `--loop` 下窗口永不满，播放器当直播一直播 |
 | 切点 | **只认视频关键帧**（`is_video && packet.isKeyFrame()`） | 排除「用 `packet.isKeyFrame()` 直接判」：AAC 音频包的 key 标志**恒为 true** → 会切在音频包上（实测：切片时长变成音频的 2199ms、多出 40ms 尾巴片、跨片时间戳回退） |
-| 时间轴起点 | 每个 TS 切片的时间戳 = **90000**（1s）+ ms×90 | 排除「从 0 开始」：ffmpeg 的 mpegts demuxer 会把首包 PTS=0 当 33 位回绕，吐出 **2^33**（实测 8589934592） |
+| 时间轴起点 | 每个 TS 切片的时间戳 = **90000**（1s）+ **平移后**的 ms×90 | 排除「从 0 开始」：ffmpeg 的 mpegts demuxer 会把首包 PTS=0 当 33 位回绕，吐出 **2^33**（实测 8589934592） |
+| 负时间戳的处理（v0.2.1） | **首包确定一个整体平移量** `_base_ms = max(0, -min(pts,dts))`，之后所有包整体 + base（**差值不变**） | 排除「逐包钳到 0」：那会抹掉前几帧的 dts 差异（实测 `bf.mp4` 源 dts -80,-40,0,40 被钳成 0,0,0,40 → 三个 PES 的 dts 完全相同）。平移后仍为负的才钳 0 并计数（`negativeTsClamped()`） |
 
 ## 4. 分批
 
@@ -109,7 +110,8 @@ HTTP 侧只读切片，复用 `serveMemoryAsStatic()`（= HttpServer 里那套�
 | 5 | `PAT/PMT` 的 CRC 写错 | 手写位域 | 用例验 CRC 由 `crc32Mpeg` 生成；`ffprobe` 认得出就是对的 |
 | 6 | **PES 头两个 flags 字节写反**（把 `PTS_DTS_flags` 放进 byte6） | 任何切片 | ffmpeg 会认为「没有时间戳」，把那 5/10 字节当 header_data 跳过 → `pts=N/A`，**解码看起来完全正常**。单测当时把错的布局断言成了对的 → 已加**外部判据**：`ts_mux_test.sh` 断言 `pts != N/A` 且 dts 单调 |
 | 7 | 音频包 key 标志恒真导致切点错位 | AAC 音频 | 见 §3.2 决策表「切点」；用例 `hls_cuts_only_on_video_keyframes` 锁住 |
-| 8 | 首包 PTS=0 被 ffmpeg 当回绕 | 源时间轴从 0 开始 | 加 1s 起点偏移（`kStartOffset90k`）；`ts_mux_test.sh` 断言首包 pts=90000 |
+| 8 | 首包 PTS=0 被 ffmpeg 当回绕 | 源时间轴从 0 开始 | 加 1s 起点偏移（`kStartOffset90k`）；`ts_mux_test.sh` 断言首包 pts 可读（= 90000 + 平移量） |
+| 9 | 首包 dts 为负（MP4 编辑列表 / B 帧源）| 源从负数开始 | v0.2.1：整体平移到 0 起（差值不变）；**不再逐包钳 0**（`baseShiftMs()` 可查；用例 `mpegts_negative_first_dts_is_shifted_not_clamped`） |
 
 ## 7. 决策记录
 

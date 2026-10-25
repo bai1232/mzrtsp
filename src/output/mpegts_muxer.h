@@ -107,6 +107,12 @@ public:
         return _last_dts90k;
     }
     /// 负时间戳被钳到 0 的次数（正常应为 0；非 0 说明源时间轴有负值）
+    /// 【v0.2.1】muxer 级的负时间戳基准（毫秒）：首包最小时间戳为负时整体抬到 0
+    /// @note 它是"整体平移"，**不改变**任何两包之间的差值（音画关系因此不受影响）
+    int64_t baseShiftMs() const {
+        return _base_ms;
+    }
+    /// 移位后**仍**为负、只能钳到 0 的包数（正常应为 0；非 0 说明时间轴本身异常）
     uint64_t negativeTsClamped() const {
         return _negative_ts_clamped;
     }
@@ -148,6 +154,8 @@ private:
     static constexpr uint64_t kStartOffset90k = 90000;
     /// 负时间戳（部分 MP4 的编辑列表会给负 dts）被钳到 0 的次数
     uint64_t _negative_ts_clamped = 0;
+    int64_t _base_ms = 0;      ///< 负时间戳的整体平移量（首包确定，之后不变）
+    bool _base_set = false;
 };
 
 } // namespace mzmedia

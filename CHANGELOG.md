@@ -7,6 +7,40 @@
 
 （下一版内容：v0.3 计划见 [docs/ROADMAP.md](docs/ROADMAP.md)）
 
+## [0.2.1] - 2026-10-25
+
+> 发布证据见 **[docs/ACCEPTANCE_v0.2.1.md](docs/ACCEPTANCE_v0.2.1.md)**（修前/修后实测 + 变异验证 + 门禁）。
+> 纯补丁版（`Z` 位递增）：**只修缺陷，不新增能力**，但修的是"最常见的输入会踩到"的正确性问题。
+
+### Fixed（**B 帧源的时间戳**：三处同族缺陷）
+- **`Demuxer` 把 pts 也做了单调钳制**（`_pts_guard`）→ B 帧源的显示顺序被篡改。
+  实测 `bf.mp4`（x264 默认带 B 帧）的 CompositionTime 从源的 `80,160,40,40,160,40,40,160`
+  变成 `80,160,120,80,160,120,80,160`（pts 出现 200,200,200 这种重复）→ **画面顺序错乱，
+  但不报任何错**（`ffmpeg -f null -` 只出 `non monotonically increasing dts` 警告）。
+  修法：pts **不再钳制**（B 帧的 pts 乱序是正常现象，只计数 `ptsOutOfOrder()`），dts 继续钳
+  （容器/播放器要求 dts 单调）。
+- **`MpegTsMuxer` 逐包把负时间戳钳到 0** → 前几帧的 dts 差异被抹掉（`bf.mp4` 的 dts
+  `-80,-40,0,40` 被钳成 `0,0,0,40`，三个 PES 的 dts 完全相同）。改成**首包确定整体平移量**
+  （`_base_ms = max(0, -min(pts,dts))`），之后所有包整体 + base、**差值不变**；
+  移位后仍为负的才钳 0 并计数。
+- **循环重开的趟偏移没算首包 dts** → 首包 dts 为负的源在每个接缝处**倒退**（实测 `bf.mp4`：
+  961ms → 921ms，倒退 39ms）。改成 `偏移 += pass_end - pass_start`；转码路径同步改成按
+  **绝对时间轴**（锚点 + 总帧数 × 步长）算接缝修正量。
+
+### Added（可观测性）
+- `/api/stats` 的每源 `producer.ts` 段：`{"pts_out_of_order":N,"dts_clamped":M}` ——
+  `pts_out_of_order > 0` 才说明"这条链路没把 B 帧信息搞丢"，`dts_clamped` 非 0 才是真异常。
+- `MpegTsMuxer::baseShiftMs()`（负时间戳的整体平移量）。
+
+### Tests
+- 单测 **+5 例**（281 → 286）：`ffmpeg_bframes_pts_are_preserved_and_dts_stays_monotonic`、
+  `producer_bframes_pts_pass_through_unclamped`、`producer_loop_with_negative_first_dts_does_not_regress`、
+  `flv_bframes_composition_time_comes_from_source`、`mpegts_negative_first_dts_is_shifted_not_clamped`。
+- `flv_http_test.sh` **96 → 101 项**：新增 §12「B 帧源」—— 25 个视频 tag 的 cts 必须与源一致、
+  `ffmpeg -f null -` 零输出、`/api/stats` 的 `pts_out_of_order>0 且 dts_clamped=0`、
+  **循环 + 负首 dts 的接缝不倒退**。
+- 变异验证 3 组：把 pts 钳回去 / 趟偏移退回旧公式 / TS 退回逐包钳 0 → 对应用例**全部变红**。
+
 ## [0.2.0] - 2026-10-25
 
 > 发布证据见 **[docs/ACCEPTANCE_v0.2.0.md](docs/ACCEPTANCE_v0.2.0.md)**（逐条 SC/NFR/FR 的状态 + 证据命令 + 实测数字）。

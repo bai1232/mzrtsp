@@ -308,6 +308,10 @@ void DemuxerProducer::trackPass(int index, int64_t raw_dts_ms) {
         return; // 不在快照里（理论上不该发生；宁可少记一笔也不要越界写）
     }
     PassTrack &track = _pass[static_cast<size_t>(index)];
+    if (!track.has_first) {
+        track.first_dts = raw_dts_ms;   // 【v0.2.1】记下这一趟该流的起点（可能是负数）
+        track.has_first = true;
+    }
     if (!track.has_last) {
         track.last_dts = raw_dts_ms;
         track.has_last = true;
@@ -355,6 +359,22 @@ int64_t DemuxerProducer::passEndMs() {
     return end > 0 ? end : 1;
 }
 
+int64_t DemuxerProducer::passStartMs() {
+    int64_t start = 0;
+    bool any = false;
+    for (const auto &track : _pass) {
+        if (!track.has_first) {
+            continue;
+        }
+        // 取**最小**的首包 dts：偏移要让"最早开始的那条流"接得上，其余流自然更晚（不会倒退）
+        if (!any || track.first_dts < start) {
+            start = track.first_dts;
+            any = true;
+        }
+    }
+    return any ? start : 0;
+}
+
 bool DemuxerProducer::reopenForLoop() {
     // 偏移必须在关文件**之前**算（要用当前这趟的流信息与 dts 轨迹）
     const int64_t pass_end = passEndMs();
@@ -398,24 +418,35 @@ bool DemuxerProducer::reopenForLoop() {
     //   转码器给的是"帧序号 × 步长"，而这一趟的真实媒体时长是 pass_end（两者可能差几十毫秒：
     //   音频 1024 样本/帧 ≈ 23.22ms 这类小数帧长会累积）。在接缝处补齐差额，
     //   视频与透传音频才会一直在同一条时间轴上（否则每趟漂一点，长跑就音画不同步）。
+    // 【v0.2.1】偏移 = 这一趟的**真实长度**（`pass_end - pass_start`）。
+    // 少了 `pass_start` 这一项时，首包 dts 为负的源（B 帧 / MP4 编辑列表）会在接缝处**倒退**：
+    // 实测 `bf.mp4` 的首包 dts = -80ms、末包 960ms，按旧公式下一趟从 921ms 开始（倒退 39ms），
+    // 循环播放每个接缝都抖一下 —— FLV 与 TS 两条路径都受影响。
+    const int64_t pass_start = passStartMs();
+    const int64_t pass_length = pass_end - pass_start;
+
+    // 转码路径的接缝修正：它自己生成时间轴（"锚点 + 帧序号 × 步长"，跨趟**连续**），
+    // 与透传音频的间距来自"本趟实际转出多少毫秒"与"这一趟真实多长"之间的差额：
+    //   shift += 本趟真实长度 − 本趟转出的媒体时长
+    // （用**增量**而不是"绝对位置"：帧序号是全局连续的，按绝对位置算会把前几趟的偏移重复扣掉）
     if (_transcoder) {
         const int64_t frames_this_pass =
             static_cast<int64_t>(_tx_frames_out - _tx_frames_at_pass_start);
         const int64_t video_pass_ms = static_cast<int64_t>(
             std::llround(static_cast<double>(frames_this_pass) * _tx_frame_step_ms));
-        _tx_ts_shift += pass_end - video_pass_ms;
+        _tx_ts_shift += pass_length - video_pass_ms;
         _tx_frames_at_pass_start = _tx_frames_out;
         InfoP("DemuxerProducer: 转码接缝对齐 —— 本趟 %lld 帧（%lld ms）vs 真实 %lld ms，"
-              "时间轴修正后累计 %+lld ms",
+              "修正后累计 %+lld ms",
               static_cast<long long>(frames_this_pass), static_cast<long long>(video_pass_ms),
-              static_cast<long long>(pass_end), static_cast<long long>(_tx_ts_shift));
+              static_cast<long long>(pass_length), static_cast<long long>(_tx_ts_shift));
     }
-    _loop_offset_ms.fetch_add(pass_end);
+    _loop_offset_ms.fetch_add(pass_length);
     _pass.assign(_demux.streams().size(), PassTrack{}); // 新一趟从零开始记
     ++_loops;
-    InfoP("DemuxerProducer: 循环重开第 %llu 次：偏移 +%lld ms（本趟到 %lld ms）",
-          static_cast<unsigned long long>(_loops.load()), static_cast<long long>(pass_end),
-          static_cast<long long>(pass_end));
+    InfoP("DemuxerProducer: 循环重开第 %llu 次：本趟 [%lld, %lld] ms → 偏移 +%lld ms",
+          static_cast<unsigned long long>(_loops.load()), static_cast<long long>(pass_start),
+          static_cast<long long>(pass_end), static_cast<long long>(pass_length));
     return true;
 }
 

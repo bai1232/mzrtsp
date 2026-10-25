@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -270,7 +271,7 @@ MZ_TEST(ffmpeg_demux_timestamps_monotonic_per_stream) {
         ++checked;
     }
     MZ_ASSERT_GT(checked, 0u);
-    MZ_ASSERT_EQ(demuxer.monotonicClamped(), 0u);   // 干净样本不该发生回退
+    MZ_ASSERT_EQ(demuxer.dtsClamped(), 0u);        // 干净样本不该发生 dts 回退
 }
 
 MZ_TEST(ffmpeg_demux_max_streams_limit_rejects) {
@@ -979,4 +980,71 @@ MZ_TEST(ffmpeg_codec_matrix_transcode_branch_needs_real_capability) {
     MZ_ASSERT_EQ(static_cast<int>(decideOutput(AV_CODEC_ID_HEVC, AV_CODEC_ID_AAC, "flv", real)),
                  static_cast<int>(real.hevc_to_h264() ? CopyOrTranscode::Transcode
                                                       : CopyOrTranscode::Unsupported));
+}
+
+MZ_TEST(ffmpeg_bframes_pts_are_preserved_and_dts_stays_monotonic) {
+    // 【v0.2.1 修的真 bug】`Demuxer` 以前把 **pts 也**做单调钳制（`_pts_guard`），
+    // 而带 B 帧的源（x264 的默认产物）pts 本来就是乱序的：
+    //   源（bf.mp4，-bf 2）解码序 pts = 0, 120, 40, 80, 240, 160, 200, 360 ms
+    //   被钳后变成              = 0, 120, 120, 120, 240, 240, 240, 360
+    // 于是 FLV 的 CompositionTime 从 {80,160,40,40,160,40,40,160} 变成 {80,160,120,80,...}
+    // → **画面顺序错乱，但不报任何错**（ffmpeg -f null - 只出 warning）。
+    // 本用例锁三件事：① pts 回退被**计数**（说明确实是原样的乱序）② dts 仍严格递增
+    // ③ pts 的**集合**仍是 25 帧的 40ms 栅格（钳制会把重复值塞进来，集合会变小）。
+    const std::string path = samplePath("bf.mp4");
+    MZ_ASSERT_FALSE(path.empty());
+    if (path.empty()) {
+        return;
+    }
+    Demuxer demux;
+    MZ_ASSERT_TRUE(demux.open(path));
+    const StreamInfo *video = demux.firstVideo();
+    MZ_ASSERT_NOT_NULL(video);
+    if (video == nullptr) {
+        return;
+    }
+    std::vector<int64_t> pts_values;
+    int64_t last_dts = 0;
+    bool dts_monotonic = true;
+    bool first = true;
+    int guard = 0;
+    while (guard++ < 500) {
+        const Demuxer::ReadResult r = demux.readPacket();
+        if (r == Demuxer::ReadResult::Eof) {
+            break;
+        }
+        MZ_ASSERT_EQ(r, Demuxer::ReadResult::Packet);
+        if (r != Demuxer::ReadResult::Packet) {
+            MZ_FAIL("读包失败：" + demux.lastError());
+            return;
+        }
+        if (demux.packetStreamIndex() != video->index) {
+            continue;
+        }
+        int64_t pts = 0;
+        int64_t dts = 0;
+        MZ_ASSERT_TRUE(demux.packetTimestampsMs(&pts, &dts));
+        if (!first && dts < last_dts) {
+            dts_monotonic = false;
+        }
+        last_dts = dts;
+        first = false;
+        pts_values.push_back(pts);
+        MZ_ASSERT_TRUE(pts - dts >= 0);      // 显示时刻不早于解码时刻
+        MZ_ASSERT_TRUE(pts - dts <= 200);    // 一帧 40ms、B 帧最多跨 5 帧
+    }
+    MZ_ASSERT_EQ(pts_values.size(), 25u);
+    MZ_ASSERT_TRUE(dts_monotonic);
+    // ★ 核心断言：B 帧的 pts **必须**有回退（钳制会把 40/80 抬到 120，回退就消失了）
+    MZ_ASSERT_GT(demux.ptsOutOfOrder(), 0u);
+    MZ_ASSERT_EQ(demux.dtsClamped(), 0u);   // dts 本来就是递增的，不该被钳
+    // pts 集合 = 25 帧 × 40ms 栅格（钳制会造出重复值 → 集合变小 → 红）
+    std::set<int64_t> unique_pts(pts_values.begin(), pts_values.end());
+    MZ_ASSERT_EQ(unique_pts.size(), 25u);
+    int64_t lowest = *unique_pts.begin();
+    int64_t highest = *unique_pts.rbegin();
+    MZ_ASSERT_EQ(highest - lowest, 24 * 40);
+    for (int64_t v : unique_pts) {
+        MZ_ASSERT_EQ((v - lowest) % 40, 0);
+    }
 }

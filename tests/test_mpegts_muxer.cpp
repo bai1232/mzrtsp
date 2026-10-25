@@ -322,3 +322,34 @@ MZ_TEST(mpegts_small_frames_are_still_188_aligned) {
         assertTsFraming(ts, "小帧");
     }
 }
+
+MZ_TEST(mpegts_negative_first_dts_is_shifted_not_clamped) {
+    // 【v0.2.1 修的真 bug】以前对**每个包**的负时间戳都"钳到 0"，于是前几帧的 dts 差异被抹掉：
+    //   源 dts = -80, -40, 0, 40 ms → 钳成 0, 0, 0, 40 → 三个 PES 的 dts 完全相同
+    //   （实测 bf.mp4 的切片里能看到 pts/dts 都挤在 1.000000）。
+    // 现在改成"首包确定一个整体平移量"，**差值不变**；本用例锁的正是"差值不变"。
+    StreamInfo video = makeVideoInfo();
+    MpegTsMuxer muxer(MpegTsMuxer::Streams{&video, nullptr});
+    MZ_ASSERT_EQ(muxer.prepare(), MpegTsMuxer::Result::Ok);
+    MZ_ASSERT_EQ(muxer.baseShiftMs(), 0);   // 还没写包：没有平移
+
+    const int64_t dts_seq[4] = {-80, -40, 0, 40};
+    const int64_t pts_seq[4] = {0, 120, 40, 80};
+    std::vector<uint8_t> idr;
+    idr.push_back(0x65);   // IDR
+    idr.resize(40, 0x88);
+    const std::vector<uint8_t> avcc = makeAvccPayload(idr);
+    for (int i = 0; i < 4; ++i) {
+        MediaPacket::Ptr p = makePacket(MediaKind::Video, video.index, avcc, i == 0, dts_seq[i],
+                                        pts_seq[i]);
+        MZ_ASSERT_NOT_NULL(p.get());
+        std::string ts;
+        MZ_ASSERT_EQ(muxer.writePacket(*p, &ts), MpegTsMuxer::Result::Ok);
+        MZ_ASSERT_EQ(ts.size() % MpegTsMuxer::kTsPacketSize, 0u);
+    }
+    // 首包最小时间戳 -80 → 整体抬 80ms，之后**不再逐包钳**
+    MZ_ASSERT_EQ(muxer.baseShiftMs(), 80);
+    MZ_ASSERT_EQ(muxer.negativeTsClamped(), 0u);   // 移位后没有任何包为负 → 一次都没钳
+    // 最后一个包的 dts 应该是 40+80 = 120ms → 90kHz 的 10800，再加 +90000 起点偏移
+    MZ_ASSERT_EQ(muxer.lastDts90k(), static_cast<uint64_t>(90000 + 120 * 90));
+}

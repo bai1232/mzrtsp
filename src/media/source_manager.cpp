@@ -647,6 +647,9 @@ std::string SourceManager::dumpStatsJson() const {
                                                                 p.openedAtMs());
             out += ",\"skipped_unknown\":" + std::to_string(p.skippedUnknownStreams());
             out += ",\"ts_failures\":" + std::to_string(p.timestampFailures());
+            // 【v0.2.1】时间戳守卫的观测：pts 乱序是 B 帧的正常现象（不改正数据），dts 钳制才异常
+            out += ",\"ts\":{\"pts_out_of_order\":" + std::to_string(p.ptsOutOfOrder());
+            out += ",\"dts_clamped\":" + std::to_string(p.dtsClamped()) + "}";
             out += ",\"annex_b_video\":" + std::string(p.annexBVideo() ? "true" : "false");
             out += ",\"annex_b_packets\":" + std::to_string(p.annexBPackets());
             out += ",\"loops\":" + std::to_string(p.loopCount());

@@ -876,3 +876,96 @@ MZ_TEST(producer_transcode_loop_keeps_audio_and_video_aligned) {
     // 双计趟偏移的 bug 会让 gap 直接跳到 ~2000ms（一趟的长度），所以这个界既能过也能红
     MZ_ASSERT_LT(max_gap, 300);
 }
+
+// ---------------------------------------------------------------------------
+// 【v0.2.1】B 帧源：pts 必须原样透传，循环接缝不许倒退
+// ---------------------------------------------------------------------------
+
+MZ_TEST(producer_bframes_pts_pass_through_unclamped) {
+    const std::string path = samplePath("bf.mp4");
+    MZ_ASSERT_FALSE(path.empty());
+    if (path.empty()) {
+        return;
+    }
+    DemuxerProducer producer;
+    MZ_ASSERT_TRUE(producer.open(path));
+    int video = 0;
+    int64_t last_dts = 0;
+    bool dts_monotonic = true;
+    bool first = true;
+    bool saw_pts_regression = false;
+    int64_t last_pts = 0;
+    int guard = 0;
+    while (guard++ < 500) {
+        MediaPacket::Ptr packet;
+        std::string error;
+        const SourcePump::ReadResult r = producer.read(&packet, &error);
+        if (r == SourcePump::ReadResult::EndOfStream) {
+            break;
+        }
+        MZ_ASSERT_EQ(r, SourcePump::ReadResult::Packet);
+        if (r != SourcePump::ReadResult::Packet) {
+            MZ_FAIL("读包失败：" + error);
+            return;
+        }
+        if (packet->kind() != MediaKind::Video) {
+            continue;
+        }
+        if (!first && packet->dtsMs() < last_dts) {
+            dts_monotonic = false;
+        }
+        if (!first && packet->ptsMs() < last_pts) {
+            saw_pts_regression = true; // B 帧的正常现象：生产者**不许**把它抹平
+        }
+        last_dts = packet->dtsMs();
+        last_pts = packet->ptsMs();
+        first = false;
+        ++video;
+    }
+    MZ_ASSERT_EQ(video, 25);
+    MZ_ASSERT_TRUE(dts_monotonic);        // dts 仍单调
+    MZ_ASSERT_TRUE(saw_pts_regression);   // ★ pts 回退被保留（钳制会让它消失）
+    MZ_ASSERT_GT(producer.ptsOutOfOrder(), 0u);
+    MZ_ASSERT_EQ(producer.dtsClamped(), 0u);
+}
+
+MZ_TEST(producer_loop_with_negative_first_dts_does_not_regress) {
+    // 【v0.2.1 修的真 bug】`bf.mp4` 的首包 dts 是 **-80ms**。循环重开时旧公式把趟偏移算成
+    // "末包 + 帧长"（= 1001ms），而下一趟的首包是 -80 + 1001 = 921ms < 上一趟末包 960ms
+    // → **每个接缝 dts 倒退 39ms**（FLV/TS 两条路径都抖）。修法：偏移改用 `pass_end - pass_start`。
+    const std::string path = samplePath("bf.mp4");
+    MZ_ASSERT_FALSE(path.empty());
+    if (path.empty()) {
+        return;
+    }
+    DemuxerProducer::Config config;
+    config.loop = true;
+    DemuxerProducer producer(config);
+    MZ_ASSERT_TRUE(producer.open(path));
+    int64_t last_dts = 0;
+    bool monotonic = true;
+    int count = 0;
+    int guard = 0;
+    // 读够两趟半（25 帧/趟 @1s），确保跨过至少两个接缝
+    while (guard++ < 500 && count < 60) {
+        MediaPacket::Ptr packet;
+        std::string error;
+        const SourcePump::ReadResult r = producer.read(&packet, &error);
+        MZ_ASSERT_EQ(r, SourcePump::ReadResult::Packet); // 循环模式不该 Eof
+        if (r != SourcePump::ReadResult::Packet) {
+            MZ_FAIL("循环读包失败：" + error);
+            return;
+        }
+        if (packet->kind() != MediaKind::Video) {
+            continue;
+        }
+        if (count > 0 && packet->dtsMs() <= last_dts) {
+            monotonic = false; // 倒退**或重复**都算失败（重复会让播放器卡住）
+        }
+        last_dts = packet->dtsMs();
+        ++count;
+    }
+    MZ_ASSERT_GT(producer.loopCount(), 0u);   // 确实跨了接缝
+    MZ_ASSERT_GT(count, 50);                  // 读到了第二趟之后
+    MZ_ASSERT_TRUE(monotonic);
+}

@@ -127,6 +127,15 @@ public:
     uint64_t outMediaMs() const {
         return _out_media_ms;
     }
+    /// 输出时间轴的**锚点**（毫秒）：= 第一个输入包的 dts（透明地把源起点带进输出时间轴）
+    /// @note 循环重开时要用它算"下一个输出帧应该落在哪"，才能与透传音频共用同一条时间轴
+    int64_t tsOffsetMs() const {
+        return _have_offset ? _ts_offset_ms : 0;
+    }
+    /// 是否已经确定锚点（还没喂过包时为 false）
+    bool hasTsOffset() const {
+        return _have_offset;
+    }
     /// 是否需要缩放（false = 尺寸与像素格式都与目标一致，帧直接进编码器）
     bool scaling() const {
         return _sws != nullptr;

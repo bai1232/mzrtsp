@@ -39,6 +39,7 @@ core → network → http → ffmpeg → media → output
 |---|---|
 | `rescaleTimestamp(ts, src, dst, *out)` | 返回 `bool`：时间基非法或**结果溢出 int64** → `false`（用 `__int128` 精确判，不做就近截断） |
 | `MonotonicGuard::apply(ts)` | 保证不减；回退时钳到上一次的值并 `++monotonicClampCount()` |
+| **谁用它**（v0.2.1 起） | **只守 dts**（`_dts_guard`）。pts **不钳**：B 帧源的 pts 天生乱序（解码序 I P B B 的 pts 可能是 0, 120, 40, 80），钳了就是**篡改显示顺序**（实测把 cts `{80,160,40,40,…}` 变成 `{80,160,120,80,…}`，画面顺序错乱但**不报错**）。pts 回退只计数（`ptsOutOfOrder()`），不改正数据 |
 
 为什么单独拆出来：换算是纯整数逻辑 —— 单测不需要样本、不需要 libav*，能进最快的分组。
 
@@ -62,7 +63,7 @@ const std::atomic<bool> *setAbortFlag(const std::atomic<bool> *);  // ★M5-c �
 | 单包上限 | `pkt->size > max_packet_size` → 拒绝 + 计数 + 释放 | 不缓存、不截断；异常文件不能把内存拉爆 |
 | 时间戳 | 换算 + 按流单调钳制；失败/缺失都计数 | 播放器把 dts 回退当跳帧；静默改数据不可接受 |
 | **初始化数据（M6-a 新增）** | `StreamInfo::extradata` 由 `Demuxer` **拷贝**带出（H264=avcC / AAC=AudioSpecificConfig） | FLV 的 sequence header 直接用它；不拷贝的话 `AVFormatContext` 一关就没了，而 sequence header 是**每个连接都要发**的 |
-| 观测 | `totalPackets/totalBytes/rejectedPackets/rescaleFailures/monotonicClamped` + `lastError()` | 每个上限与降级都要能被证明"发生过" |
+| 观测 | `totalPackets/totalBytes/rejectedPackets/rescaleFailures/dtsClamped/ptsOutOfOrder` + `lastError()` | 每个上限与降级都要能被证明"发生过"；`ptsOutOfOrder` 还是"B 帧信息没被毁掉"的最直观指标（v0.2.1） |
 
 ## 4. 分批
 

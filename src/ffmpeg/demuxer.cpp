@@ -138,8 +138,9 @@ bool Demuxer::open(const std::string &path) {
         _fmt.reset();
         return false;
     }
-    _pts_guard.resize(_streams.size());
     _dts_guard.resize(_streams.size());
+    _last_pts.assign(_streams.size(), 0);
+    _has_last_pts.assign(_streams.size(), false);
     _path = path;
     return true;
 }
@@ -155,8 +156,9 @@ bool Demuxer::close() {
     _fmt.reset();
     _pkt.reset();
     _streams.clear();
-    _pts_guard.clear();
     _dts_guard.clear();
+    _last_pts.clear();
+    _has_last_pts.clear();
     _pkt_stream_index = -1;
     _pkt_pts_ms = 0;
     _pkt_dts_ms = 0;
@@ -239,7 +241,15 @@ Demuxer::ReadResult Demuxer::readPacket() {
             !rescaleTimestamp(raw_dts, src, ms, &dts_ms)) {
             ++_rescale_failures;   // 缺时间戳/换算失败：计数 + 保持上一次的值
         } else {
-            pts_ms = _pts_guard[idx].apply(pts_ms);
+            // 【v0.2.1】**pts 不做单调钳制**：B 帧源的 pts 天生乱序（同一个 GOP 里
+            // 解码序 I P B B 的 pts 可能是 0, 120, 40, 80），钳了就等于**篡改显示顺序**。
+            // 只统计"回退"次数（正常现象），让它一路传到封装层算 CompositionTime。
+            if (_has_last_pts[idx] && pts_ms < _last_pts[idx]) {
+                ++_pts_out_of_order;
+            }
+            _last_pts[idx] = pts_ms;
+            _has_last_pts[idx] = true;
+            // dts 必须单调（容器/播放器都要求），这里仍然钳 + 计数（真异常才会计数增长）
             dts_ms = _dts_guard[idx].apply(dts_ms);
             _pkt_pts_ms = pts_ms;
             _pkt_dts_ms = dts_ms;
@@ -286,15 +296,16 @@ uint64_t Demuxer::rescaleFailures() const {
     return _rescale_failures;
 }
 
-uint64_t Demuxer::monotonicClamped() const {
+uint64_t Demuxer::dtsClamped() const {
     uint64_t total = 0;
-    for (const auto &g : _pts_guard) {
-        total += g.monotonicClampCount();
-    }
     for (const auto &g : _dts_guard) {
         total += g.monotonicClampCount();
     }
     return total;
+}
+
+uint64_t Demuxer::ptsOutOfOrder() const {
+    return _pts_out_of_order;
 }
 
 const std::string &Demuxer::lastError() const {

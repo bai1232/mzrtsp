@@ -450,3 +450,91 @@ MZ_TEST(flv_muxes_real_mp4_to_file) {
     MZ_ASSERT_TRUE(fileExists(out_path));
     (void) std::remove(out_path.c_str());
 }
+
+MZ_TEST(flv_bframes_composition_time_comes_from_source) {
+    // 【v0.2.1】端到端锁"B 帧的显示顺序没被改"：把 `bf.mp4` 的 25 个真包喂给 FlvMuxer，
+    // 逐 tag 读出 CompositionTime，与"源 pts - 源 dts"**逐包相等**。
+    // 什么情况会红：`Demuxer` 又把 pts 钳了（cts 会变成 {80,160,120,80,...} 这种，对不上），
+    // 或者 FlvMuxer 用 dts 冒充 pts（cts 全 0）。注意：cts=0 全零也算红 —— 那正是"看起来能播"的假象。
+    const std::string path = samplePath("bf.mp4");
+    MZ_ASSERT_FALSE(path.empty());
+    if (path.empty()) {
+        return;
+    }
+    Demuxer demux;
+    MZ_ASSERT_TRUE(demux.open(path));
+    const StreamInfo *video = demux.firstVideo();
+    MZ_ASSERT_NOT_NULL(video);
+    if (video == nullptr) {
+        return;
+    }
+    FlvMuxer muxer(FlvMuxer::Streams{video, nullptr});
+    MZ_ASSERT_EQ(muxer.prepare(), FlvMuxer::Result::Ok);
+
+    std::vector<int64_t> expected_cts;
+    std::vector<uint32_t> expected_ts;
+    std::string tags;
+    int64_t base_set = 0;
+    bool base_known = false;
+    int guard = 0;
+    while (guard++ < 500) {
+        const Demuxer::ReadResult r = demux.readPacket();
+        if (r == Demuxer::ReadResult::Eof) {
+            break;
+        }
+        MZ_ASSERT_EQ(r, Demuxer::ReadResult::Packet);
+        if (r != Demuxer::ReadResult::Packet) {
+            return;
+        }
+        if (demux.packetStreamIndex() != video->index) {
+            continue;
+        }
+        int64_t pts = 0;
+        int64_t dts = 0;
+        MZ_ASSERT_TRUE(demux.packetTimestampsMs(&pts, &dts));
+        if (!base_known) {
+            base_set = dts; // FlvMuxer 的基准 = 首个包的 dts（这里手动对齐，保持断言与实现解耦）
+            base_known = true;
+        }
+        auto payload = std::make_shared<std::vector<uint8_t>>(16, 0x88);
+        MediaPacket::Ptr p = MediaPacket::create(MediaKind::Video, video->index, std::move(payload),
+                                                 expected_cts.empty(), dts, pts);
+        MZ_ASSERT_NOT_NULL(p.get());
+        std::string one;
+        MZ_ASSERT_EQ(muxer.writePacket(*p, &one), FlvMuxer::Result::Ok);
+        expected_cts.push_back(pts - dts);
+        expected_ts.push_back(static_cast<uint32_t>(static_cast<uint64_t>(dts - base_set)));
+        tags += one;
+    }
+    MZ_ASSERT_EQ(expected_cts.size(), 25u);
+
+    // 逐 tag 解析（每个 tag：11 字节头 + data + 4 字节 PreviousTagSize）
+    size_t pos = 0;
+    size_t tag_index = 0;
+    while (pos + 11 <= tags.size()) {
+        const size_t size = (static_cast<size_t>(static_cast<uint8_t>(tags[pos + 1])) << 16) |
+                            (static_cast<size_t>(static_cast<uint8_t>(tags[pos + 2])) << 8) |
+                            static_cast<size_t>(static_cast<uint8_t>(tags[pos + 3]));
+        const uint32_t ts = (static_cast<uint32_t>(static_cast<uint8_t>(tags[pos + 4])) << 16) |
+                            (static_cast<uint32_t>(static_cast<uint8_t>(tags[pos + 5])) << 8) |
+                            static_cast<uint32_t>(static_cast<uint8_t>(tags[pos + 6]));
+        if (tag_index < expected_cts.size()) {
+            MZ_ASSERT_EQ(ts, expected_ts[tag_index]);
+            const size_t data = pos + 11;
+            const uint32_t cts = readU24(tags, data + 2);
+            MZ_ASSERT_EQ(cts, static_cast<uint32_t>(expected_cts[tag_index]) & 0xFFFFFFu);
+        }
+        pos += 11 + size + 4;
+        ++tag_index;
+    }
+    MZ_ASSERT_EQ(tag_index, expected_cts.size());
+    // cts 不能"全是 0"（那说明 B 帧信息在链路里丢了，只是恰好能播）
+    bool any_nonzero = false;
+    for (int64_t v : expected_cts) {
+        if (v != 0) {
+            any_nonzero = true;
+        }
+        MZ_ASSERT_TRUE(v >= 0);
+    }
+    MZ_ASSERT_TRUE(any_nonzero);
+}

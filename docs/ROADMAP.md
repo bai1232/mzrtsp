@@ -30,6 +30,17 @@
 | 转码调度（**FR-1.3** / **FR-7.1**） | **M10-b ✅** 接进 `DemuxerProducer`（视频过 `Transcoder`、音频透传）与 `SourceManager`（转码源 = **独立源键**，`路径|h=720`）：lazy 启动（`acquire` 才建编解码器）、并发**硬上限**（默认 `nproc-1`，`0` 非法）、EOS 后让出名额；`--transcode` / `--transcode-height` / `--transcode-max`；URL `?transcode=1&h=`；`/api/stats` 的 `transcode.speed`。**不做**：转码+HLS（M10-c）、音频转码（SPEC §9） |
 | 验收（**NFR-5** / **SC-2** 的第二次验证） | **M10-a ✅** 转码 ≥1.0x 实时（1080p→720p x264 veryfast **2.89x** 端到端 / 服务内 `speed` **3.26x**）；**M10-b ✅** 转码流能播（`ffprobe` 认 h264 + aac、`ffmpeg -f null -` 零 error、HEVC→H264 生效）；新增输出/输入**不改 `media/` 分发层、`network/`**（`Transcoder` 只碰 `ffmpeg/`；转码源复用同一套 `MediaSource`） |
 
+## v0.2.1 —— B 帧源的时间戳（✅ **已发布 2026-10-25**，tag `v0.2.1`）
+
+> 补丁版：只修缺陷。证据见 **[docs/ACCEPTANCE_v0.2.1.md](ACCEPTANCE_v0.2.1.md)**。
+
+| 缺陷 | 影响 | 修法 |
+|---|---|---|
+| `Demuxer` 把 **pts 也**做单调钳制（`_pts_guard`） | B 帧源的显示顺序被篡改：CompositionTime 从 `{80,160,40,40}` 变成 `{80,160,120,80}`，**画面顺序错乱但不报错**（x264 默认带 B 帧 → 现实里的 MP4 大多踩中） | pts 不钳（乱序只计数 `ptsOutOfOrder()`）；dts 继续钳 |
+| `MpegTsMuxer` 逐包把负时间戳钳到 0 | 前几帧 dts 差异被抹掉（`-80,-40,0,40` → `0,0,0,40`，三个 PES 的 dts 完全相同） | 首包确定**整体平移量**，之后所有包 + base（差值不变）；仍为负的才钳 0 并计数 |
+| 循环重开的趟偏移没算首包 dts | 首包 dts 为负的源在**每个接缝倒退**（961 → 921 ms），循环播放每次抖一下 | 偏移改用 `pass_end − pass_start`；转码路径的接缝修正改成增量 |
+| **验收缺口**（根因）| 所有脚本/用例都用**无 B 帧**的 `sample.mp4` → 门禁全绿却测不到这条 | 新增 `bf.mp4` 的分层用例 5 例 + `flv_http_test.sh` §12（5 项），并加了 3 组变异验证 |
+
 ## v0.3.0 —— RTSP 输入 + 解码处理
 
 | 任务 | 说明 |
@@ -62,7 +73,7 @@
 | **FR-3.1** HTTP-FLV + 立即发 sequence header | M6-b / M6-c | `flv` 组逐字节、`flv_http_test.sh` §5（首帧 20–60 ms） |
 | **FR-3.2** HLS：2s 切片 / 窗口 6 / m3u8 字段 | **M9** | `hls_test.sh` 32 项 + `hls` 组 6 例 + `ts_mux_test.sh` 29 项 |
 | **FR-3.3** AAC 转发 / 无音频出纯视频 | M6-b / M8 | `flv` 组、`vonly.ts` 端到端、转码时音频透传（88→88） |
-| **FR-3.4** 音画同步 + 时间基换算（FLV ms / TS 90kHz） | M4 / M9-a / M10 | `mpegts` 组（90kHz / 回绕 / +90000 偏移）、`ts_mux_test.sh` 29 项、循环+转码对齐用例 |
+| **FR-3.4** 音画同步 + 时间基换算（FLV ms / TS 90kHz）+ **B 帧显示顺序** | M4 / M9-a / M10 / **v0.2.1** | `mpegts` 组（90kHz / 回绕 / +90000 偏移 / **负首 dts 整体平移**）、`ts_mux_test.sh` 29 项、`flv_http_test.sh` §12（B 帧 cts + 循环接缝）、循环+转码对齐用例 |
 | **FR-3.5** 按源时间轴与墙钟对齐推送 | M5（`Throttle`） | 单测 `media`、`srcmgr` 8 倍速、1 小时跑 68 包/s |
 | **FR-4.1** 路由 `/live/` `/hls/` `/api/stats` `/` | M3 / M6-b / **M9-b** | `flv_http_test.sh`、`hls_test.sh`、`http_test.sh` |
 | **FR-4.2** chunked / Content-Length / Range | M3 / M9-b | `http_test.sh`、`hls_test.sh` §4（切片 Range 206 + 188 B） |
