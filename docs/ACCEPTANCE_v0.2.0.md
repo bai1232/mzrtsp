@@ -274,7 +274,7 @@ cd build && ctest --output-on-failure
 
 | 步骤 | 实测 |
 |---|---|
-| clone | `clone=0`；`HEAD=44ae44d`；`git describe --tags` = **`v0.2.0`**（tag 与提��对得上） |
+| clone | `clone=0`；`HEAD=44ae44d`；`git describe --tags` = **`v0.2.0`**（tag 与提交对得上） |
 | `make_samples.sh` | `samples=0`（含 `sample.mkv` / `sample.ts` / `vonly.ts` / `sample1080.mp4` / `sample_hevc.mp4` / `sample_audio.aac`） |
 | `cmake -B build` | `configure=0` |
 | `cmake --build build -j4` | `build=0`，**`warnings=0`** |
