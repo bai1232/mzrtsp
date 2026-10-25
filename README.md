@@ -218,6 +218,7 @@ cd build && ctest                        # 25 个分组（294 个用例），**�
 | [docs/DESIGN_M4.md](docs/DESIGN_M4.md) | **FFmpeg 封装设计（M4）**：AvPtr RAII、时间基换算与单调守卫、Demuxer 上限与观测、决策记录 |
 | [docs/DESIGN_M5.md](docs/DESIGN_M5.md) | **媒体分发设计（M5）**：MediaPacket 零拷贝、FrameQueue 上限与丢帧策略、GopCache 接入保证、MediaSource 订阅者生命周期 |
 | [docs/DESIGN_M6.md](docs/DESIGN_M6.md) | **输出层设计（M6）**：FLV 字节布局逐字段、per-client 时间戳基准、sequence header 重发纪律、ffprobe 验收 |
+| [docs/DESIGN_M11.md](docs/DESIGN_M11.md) | **RTSP 输入设计（v0.3-a，待做）**：实测事实（读超时=断流检测、缺 SPS/PPS 必须拒绝）、重连策略、两轴落点、批次与测试计划、9 条待拍板 |
 | [docs/DESIGN_M9.md](docs/DESIGN_M9.md) | **HLS 设计（M9）**：TS 封装（PAT/PMT/PCR/90kHz）、切片只认视频关键帧、窗口与租约、决策与风险 |
 | [docs/DESIGN_M10.md](docs/DESIGN_M10.md) | **转码设计（M10）**：解码→sws→x264、自己生成 CFR 时间轴（为什么不能用源 pts）、服务接线与并发上限、`speed` 口径 |
 | [docs/AV_BASICS.md](docs/AV_BASICS.md) | **音视频基础（本项目需要的 20%）**：容器/编码、I-P-B、pts/dts、time_base、SPS/PPS；每条概念配可自己跑的命令 |
