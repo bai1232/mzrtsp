@@ -82,6 +82,25 @@ _session.setSeamCallback([this](int64_t pass_length_ms) {
 | 一种新的**读**能力（v0.3 的 RTSP 破流重连） | 只动 `SourceSession`（不动阶段、不动输出） |
 | 一种新的**输出格式** | 新写一个 `IMediaSink` 实现（这条轴 v0.1 起就是闭的：M9 加 HLS 只新增文件） |
 
+## 4.1 排除项：为什么 `FlvMuxer` / `MpegTsMuxer` **没有**共同基类
+
+这两个是"最容易想当然写成继承"的一对（输入都是 `MediaPacket`、输出都是字节）。不做的理由：
+
+| # | 事实 | 后果 |
+|---|---|---|
+| 1 | 操作集几乎不重叠：FLV = 一次 header + sequence header + 每包 tag（32 位 ms、per-client 基准、24 位 cts）；TS = **每片** PAT/PMT + PCR + PES（长度 0 或 ≤65535）+ 33 位 90kHz | 抽 `IMuxer` ⇒ 接口变成两个类的**并集**（最糟的接口形态） |
+| 2 | 生命周期不同：FLV **每连接一份**（N 实例、各自时间戳基准）；TS **每源一份**、被 `HlsWriter` 跨片复用 | 基类必须额外表达"可复用/不可复用"，抽象反而变复杂 |
+| 3 | **没有多态客户端**：`FlvSender` 只用 `FlvMuxer`，`HlsWriter` 只用 `MpegTsMuxer`，没有任何函数编程到"封装器"这个抽象上 | 引入基类后调用方要么 downcast，要么基类加 FLV/TS 特有方法 —— 比现状差 |
+
+**什么时候该抽**：出现**第三个**格式，且存在"按格式名统一驱动"的代码（例如一个
+`mzmedia-remux --format=flv|ts|fmp4` 工具）。那时接口按**驱动者需要**收窄成
+`begin()/write(packet)/end()`，而不是把已有两个类取并集。
+
+**真正共享、且值得抽的**（候选，未做）：两个 `enum class Result` 有 7 个同名同义项
+（`NoStreams` / `UnsupportedVideoCodec` / `UnsupportedAudioCodec` / `MissingExtradata` /
+`InvalidPacket` / `TooLarge` / `NotPrepared`），可以抽一个公共枚举 + `resultName()`；
+但改枚举会动 4 个测试文件的断言，属"接口相关、行为无关"的改动，等下次改 muxer 时顺手做。
+
 ## 5. 怎么证明"没改变行为"
 
 `scripts/refactor_equiv_check.sh`（**新增**，11 条）：

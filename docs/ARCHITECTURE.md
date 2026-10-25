@@ -29,7 +29,17 @@
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-**依赖方向**：只允许上层依赖下层。`Media` 层**不得**直接调用 `Http`；输出通过抽象接口（`IMediaSink`）与 `Media` 交互，从而做到"新增输出格式不改核心"（成功标准 SC-2）。
+**依赖方向**：只允许上层依赖下层。`Media` 层**不得**直接调用 `Http`。
+
+**输出与 `Media` 的接缝是什么（v0.2.3 修订，此前文档写错了）**：不是某个叫 `IMediaSink` 的接口
+（**代码里从来没有这个类**），而是两样具体的东西 ——
+① `Subscriber::setDrainCallback(...)`：谁来决定"什么时候把队列里的包搬走"；
+② 写出口结构体（`FlvSender::Sink{write, end, abort}`）：字节往哪儿写。
+
+于是"新增输出格式"= **新写一个消费者**（它自己持有一个封装器 + 一个写出口）+ 在 app 里挂一条路由；
+`Media`/`Network`/`Http` 都不用改。M9 加 HLS、M10-c 给 HLS 加转码，对核心目录（`media_source` /
+`subscriber` / `frame_queue` / `network` / `http`）的改动分别是 **19 行（新增函数）**、**0 行** —— 这就是
+SC-2 的实证（口径见 §1.1 的"开闭原则机检"）。
 
 **App 层（v0.1 实际形态，M6-c）**：`src/main.cpp` = `bin/mzmedia`，只做**接线**：
 命令行 → `SourceManager::Config`、把 `/live/` 与 `/flv.min.js` 两条路由挂到 `HttpServer`、
@@ -171,7 +181,7 @@ FFmpeg 是 C 库，所有上下文都要手动释放。**必须**封装成 C++ �
 | 应用入口 | `src/main.cpp` 只做**接线**（路由 / 配置 / 生命周期），零参数可启动 | 媒体逻辑一律在库里：app 拿不到 `Demuxer`/`FlvMuxer` 的内部知识，也不需要懂 FLV 字节（M6-c） |
 | 浏览器播放器 | `flv.js` **入库**（`third_party/`，Apache-2.0） | 浏览器原生不能播 FLV；引 CDN 会让"离线/演示环境"变成"服务坏了"。这是全仓唯一的第三方文件，C++ 侧仍然零第三方依赖 |
 | 文件语义 | 直播式重放，不支持 seek；`--loop` 用**连续时间轴**重开（不重置） | HTTP-FLV 是直播语义；seek 需重建时间轴，收益低。循环若把时间戳归零，播放端会看到回退（花屏）——所以偏移在解封装层累加（`DESIGN_M6.md` §4.6） |
-| 新增格式 | 通过 `IMediaSink` 抽象扩展 | 满足 SC-2"加格式不改核心" |
+| 新增格式 | 新写一个**消费者**（`drain 回调` + 写出口）+ app 挂路由；核心目录 0 改动 | 满足 SC-2"加格式不改核心"；具体见 §1 的"输出与 Media 的接缝" |
 | 依赖边界 | 网络自研，FFmpeg 只做编解码 | 并发模型与协议栈是能力展示点；编解码自研不现实 |
 
 ## 8. 目录结构（规划）
@@ -185,7 +195,7 @@ mzmedia/
 │   ├── http/          # HttpServer、HttpParser、HttpConnection、静态与测试页
 │   ├── ffmpeg/        # AvPtr、Demuxer、Remuxer、Transcoder、CodecMatrix
 │   ├── media/         # MediaSource、SourceManager、Subscriber、FrameQueue、GopCache
-│   ├── output/        # IMediaSink、FlvSender、HlsWriter
+│   ├── output/        # FlvMuxer/FlvSender、MpegTsMuxer、HlsWriter/HlsService（互不继承，理由见 §9）
 │   ├── stats/         # StatsCenter
 │   ├── mzmedia.h      # 伞头：使用方的单行包含入口（库内部禁止包含）
 │   └── main.cpp
@@ -212,8 +222,20 @@ mzmedia/
 
 新增一种输出格式只需三步，**不改动** Core/Network/Media：
 
-1. 实现 `IMediaSink`（例：`RtmpSink`）
-2. 在 `SourceManager` 注册该 sink 的路由前缀
+1. 写一个**消费者**：`source->subscribe()` + `subscriber->setDrainCallback(...)`，
+   回调里把队列搬进你自己的封装器，再通过你的写出口（例如 HTTP chunked / 文件 / socket）发出去。
+   （例：`FlvSender` = 订阅者 + `FlvMuxer` + `Sink{write,end,abort}`；`HlsWriter` = 订阅者 + `MpegTsMuxer` + 切片环）
+2. 在 `app` 里挂你的路由前缀（`main.cpp` 只做接线，一行）
 3. 加单元测试与验收脚本
 
-新增一种输入同理：实现 `IDemuxer` 并在 `CodecMatrix` 中登记其编码组合的可行性。
+**为什么不把封装器写成继承**（`FlvMuxer` / `MpegTsMuxer` 目前是平级独立类）：
+它们的**操作集几乎不重叠**（FLV：一次 header + sequence header + 32 位 ms / per-client 基准；
+TS：每片 PAT/PMT + PCR + 33 位 90kHz + 关键帧注入 SPS/PPS），**生命周期也不同**
+（FLV 每连接一份；TS 每源一份、被 `HlsWriter` 跨片复用），而且**没有任何函数会通过基类调用它们** ——
+硬抽 `IMuxer` 只会得到"两个类的并集接口"或"调用方 downcast"，两者都比现状差。
+等出现**第三个**格式且确有"按格式名统一驱动"的代码时，再抽一个按驱动者需要**收窄**的接口
+（`begin()/write(packet)/end()`）。判据写在 `DESIGN_REFACTOR_PIPELINE.md` §4 的排除项里。
+
+新增一种输入：**容器/协议层靠 FFmpeg 免费扩展**（`Demuxer::open` 直接吃 URL/新容器）；
+若带来**新的输入形状**（如 Annex-B / ADTS），加一个 `PacketStage` 实现即可（见 §1.1 的两条轴），
+不需要 `IDemuxer` —— 目前只有一个"读"实现，抽接口是"为想象中的第二个实现付账"。
