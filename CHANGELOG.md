@@ -5,8 +5,10 @@
 
 ## [Unreleased]
 
-（v0.3.0 进行中：**M11-a1 ✅**（RTSP 能连、能拉）、**a2 ✅**（断流自动重连、观众不掉线）；
-a3 1 小时长跑与验收文档待做。设计见 [docs/DESIGN_M11.md](docs/DESIGN_M11.md)）
+（v0.3.0：**M11-a1 ✅** RTSP 能连能拉、**a2 ✅** 断流自动重连（观众不掉线）、
+**a2b ✅** 名字进日志/stats + 音视频双轨 + 默认传输改 TCP + 网络 EOF 当断流、**a3 ✅** 1 小时长跑。
+发布依据见 [docs/ACCEPTANCE_v0.3.0.md](docs/ACCEPTANCE_v0.3.0.md)；设计见
+[docs/DESIGN_M11.md](docs/DESIGN_M11.md)）
 
 ### Added（**M11-a1：RTSP 输入**，v0.3-a 的第一批）
 - `--rtsp <url>[#name]`（可重复）：把 RTSP 源注册成 `/live/<name>.flv` 与 `/hls/<name>.m3u8`
@@ -66,6 +68,35 @@ a3 1 小时长跑与验收文档待做。设计见 [docs/DESIGN_M11.md](docs/DES
 - `SourceSession::_pending`（设计里"重连成功时先存第一个包、由 `read()` 补交"的预留队列）：
   实现时发现没必要 —— `read()` 读到新一段第一个包时就地算偏移、就地返回，少一个队列、
   少一处状态不一致的可能。死代码不留。
+
+
+### Added（**M11-a2b：名字、音视频、安全默认**，v0.3-a 的收尾批）
+- **入口名进观测**：`--rtsp <url>#name` 的 `name` 现在出现在**日志前缀**（`SourceSession[cam1]`、
+  `源已创建（懒启动）：[cam1] rtsp://…`）与 **`/api/stats`**（每源 `"names":["a","b"]` +
+  `rtsp.label`）。一个 URL 被多个名字引用时仍只拉**一次**上游，`names` 把这件事**显式**写出来。
+- **RTSP 音视频双轨**：SDP 里的第二条 `m=audio`（AAC / `MPEG4-GENERIC`，RFC 3640）现在会
+  正确转出 —— FLV 与 HLS 切片里都有 video+audio（实测 `h264 320x240` + `aac 44100/1`，
+  音频 384 包 0 次 dts 倒退）。
+- `scripts/rtsp_fake_server.py` 支持 `--audio-file <aac>`（ADTS → 裸 AAC + ASC，AAC-hbr 打包）
+  与 `--fps <n>`（时间戳步长按素材真实帧率）；`split_annexb` 换成 `re.finditer`：
+  **45 MB 素材的加载从 20–40 s 降到 0.07 s**（长跑前必须）。
+- `scripts/rtsp_soak.sh`（**新验收工具**）：1 小时长跑 —— 每分钟采 RSS/CPU/包数/重连数，
+  第 30 分钟**掐断一次上游**再重启，观众侧 FLV/HLS 全程不断，最后自动判 6 条（数据量、dts 不倒退、
+  时间轴覆盖、解码、重连计数、RSS 增长）。
+
+### Changed（**M11-a2b**）
+- **默认 `--rtsp-transport` 从 `auto` 改成 `tcp`**（【AI 定】，实测依据见 DESIGN_M11 §5.3）：
+  UDP 实测丢 1080p 的 RTP 分片（解码报 `bytestream -5`）、也丢过整条音频轨（只收到前 ~1 s，
+  47/431 包；`--speed 8` 或 TCP 都不复现，根因未完全定位，列入 v0.3.1）。
+  `auto`/`udp` 仍可选，脚本里单独验过两条路径。
+
+### Fixed（**M11-a2b**，都是这轮实测撞出来的）
+- **网络源的 EOF 被当成"播完了"**：TCP 交错传输下对端关连接时 `av_read_frame` 给的是 EOF，
+  原来直接 `Result::EndOfStream` → `SourcePump::endOfStream()` → **观众被正常结束踢下线**
+  （实测观众侧 `curl` 退出码 0、1 s 就断）。现在**网络源的 EOF 一律按断流处理**走重连，
+  只有本地文件才允许 EOF 作为终态。
+- **控制台日志整段丢**：stdout 重定向到文件是块缓冲，进程被 kill 时缓冲区里的 Info 行全没
+  （`源已创建 / 重连成功` 看不到，排查时误判成"重连没生效"）。`ConsoleWriter` 现在**逐行 flush**。
 
 
 ### Tests / 门禁

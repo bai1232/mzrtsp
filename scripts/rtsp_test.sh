@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# M11-a1 + a2 验收：RTSP 输入（能连上、能拉、缺参数集当场拒绝、断流自愈）
+# M11-a1 + a2 + a2b 验收：RTSP 输入（能连上、能拉、缺参数集当场拒绝、断流自愈、音视频两条轨）
 #
 # 为什么能用脚本验：真摄像机不可控，所以用一个**零依赖的假 RTSP 服务端**
 # （`scripts/rtsp_fake_server.py`，纯 python3 标准库）把"协议行为"变成可注入的：
@@ -27,6 +27,7 @@ RTSP_NOSPROP=$(( PORT + 101 ))
 RTSP_TCPONLY=$(( PORT + 102 ))
 RTSP_CLOSE=$(( PORT + 103 ))   # M11-a2：发 N 帧后关连接（对端消失）
 RTSP_SILENT=$(( PORT + 104 ))  # M11-a2：发 N 帧后半开（只靠读超时能发现）
+RTSP_AV=$(( PORT + 105 ))      # M11-a2b：H264 + AAC 两条轨（真摄像机都有声）
 OUT="/tmp/mzmedia_rtsp"
 SRV_PID=""
 FAKE_PIDS=""
@@ -72,12 +73,14 @@ start_fake "$RTSP_TCPONLY" --frames 400 --loop --after hold --tcp-only
 # 之后一直推流（--fault-close-first）—— 这样"重连成功"才会有后续数据可测
 start_fake "$RTSP_CLOSE" --frames 25 --after close --fault-close-first
 start_fake "$RTSP_SILENT" --frames 25 --after silent --fault-close-first
+# 音视频源：视频用 320x240 样本，音频用 samples/sample_audio.aac（mono 44.1k）
+start_fake "$RTSP_AV" --frames 400 --loop --after hold --audio-file "$ROOT/samples/sample_audio.aac"
 sleep 1.5
 ok_sources=0
-for port in "$RTSP_OK" "$RTSP_NOSPROP" "$RTSP_TCPONLY" "$RTSP_CLOSE" "$RTSP_SILENT"; do
+for port in "$RTSP_OK" "$RTSP_NOSPROP" "$RTSP_TCPONLY" "$RTSP_CLOSE" "$RTSP_SILENT" "$RTSP_AV"; do
     grep -q "监听 127.0.0.1:$port" "$OUT/fake_$port.log" && ok_sources=$((ok_sources + 1))
 done
-check "五个假 RTSP 源就绪" "$ok_sources" "5"
+check "六个假 RTSP 源就绪" "$ok_sources" "6"
 
 "$SERVER" --port "$PORT" --media-root "$ROOT/samples" --log-level info \
     --rtsp "rtsp://127.0.0.1:$RTSP_OK/live#cam1" \
@@ -86,6 +89,7 @@ check "五个假 RTSP 源就绪" "$ok_sources" "5"
     --rtsp "rtsp://user:secret123@127.0.0.1:$RTSP_OK/live#auth" \
     --rtsp "rtsp://127.0.0.1:$RTSP_CLOSE/live#brk" \
     --rtsp "rtsp://127.0.0.1:$RTSP_SILENT/live#half" \
+    --rtsp "rtsp://127.0.0.1:$RTSP_AV/live#av" \
     --rtsp-timeout-ms 3000 \
     > "$OUT/server.log" 2>&1 &
 SRV_PID=$!
@@ -98,7 +102,7 @@ if [ "$ready" != yes ]; then
     echo "错误：服务未就绪，日志：" >&2; cat "$OUT/server.log" >&2; exit 1
 fi
 BASE="http://127.0.0.1:$PORT"
-check_true "服务已就绪（带 4 个 RTSP 注册）"
+check_true "服务已就绪（7 路 RTSP 注册）"
 if grep -q "RTSP 输入" "$OUT/server.log"; then
     check_true "启动横幅列出 RTSP 源（脱敏）"
 else
@@ -152,11 +156,18 @@ rows = [(p, r) for p, r in rows if r]
 if not rows:
     sys.exit("stats 里没有 rtsp 段")
 p, r = rows[0]
-need = ["enabled", "state", "connects", "last_packet_age_ms"]
+need = ["enabled", "state", "connects", "last_packet_age_ms", "label", "url"]
 missing = [k for k in need if k not in r]
 if missing:
     sys.exit("缺少字段：%s" % missing)
-print("sources=%d state=%s age_ms=%s" % (len(rows), r["state"], r["last_packet_age_ms"]))
+# 【M11-a2b】名字必须一眼对上命令行（`#cam1`），而不是只有 IP
+names = [s.get("names") for s in d.get("media_sources", []) if s.get("path") == p]
+if r["label"] != "cam1":
+    sys.exit("label 不是 cam1：%r" % r["label"])
+if not names or names[0] != ["cam1"]:
+    sys.exit("names 不是 [cam1]：%r" % (names[0] if names else None))
+print("sources=%d state=%s age_ms=%s label=%s names=%s"
+      % (len(rows), r["state"], r["last_packet_age_ms"], r["label"], names[0]))
 PY
 )" 
 if [ -n "$rtsp_json" ]; then
@@ -184,11 +195,34 @@ else
     check_false "缺参数集的失败耗时" "${cost_ms} ms（要求 < 3000：不许空等 open 超时）"
 fi
 
-echo "== 5) 只接受 TCP 的源（UDP SETUP 被 461）：FFmpeg 自动回退 =="
+echo "== 5) 只接受 TCP 的源（UDP SETUP 被 461）与 UDP 传输（M11-a2b 改默认后仍要验）=="
+# 【M11-a2b】默认 transport 从 auto 改成 tcp（UDP 实测丢包，见 DESIGN_M11 §5.3）。
+# 但 `auto`/`udp` 仍是**可用**的，所以另起一个短命实例（同一批假源、transport=auto）单独验：
+#   ① 普通源走 UDP 仍能拉（不是"默认 tcp 就把 udp 路径废了"）；
+#   ② TCP-only 源（UDP SETUP 回 461）→ FFmpeg 自动回退 TCP。
 code=$(curl -s -o "$OUT/tcp.flv" -w '%{http_code}' --max-time 10 "$BASE/live/tcp.flv" || true)
 check "GET /live/tcp.flv → 200（TCP-only 源也能拉）" "$code" "200"
 check "TCP-only 源的编码" \
     "$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$OUT/tcp.flv" | awk 'NF' | head -1)" "h264"
+
+PORT_UDP=$(( PORT + 2 ))
+"$SERVER" --port "$PORT_UDP" --media-root "$ROOT/samples" --log-level info \
+    --rtsp "rtsp://127.0.0.1:$RTSP_OK/live#u1" \
+    --rtsp "rtsp://127.0.0.1:$RTSP_TCPONLY/live#u2" \
+    --rtsp-transport auto --rtsp-timeout-ms 3000 \
+    > "$OUT/server_udp.log" 2>&1 &
+UDP_PID=$!
+for _ in $(seq 1 60); do
+    if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$PORT_UDP/api/stats"; then break; fi
+    sleep 0.1
+done
+BASE_UDP="http://127.0.0.1:$PORT_UDP"
+code=$(curl -s -o "$OUT/udp.flv" -w '%{http_code}' --max-time 10 "$BASE_UDP/live/u1.flv" || true)
+check "transport=auto：普通源走 UDP 也能拉" "$code" "200"
+code=$(curl -s -o "$OUT/fallback.flv" -w '%{http_code}' --max-time 10 "$BASE_UDP/live/u2.flv" || true)
+check "transport=auto：TCP-only 源（461）自动回退成功" "$code" "200"
+kill -INT "$UDP_PID" 2> /dev/null || true
+wait "$UDP_PID" 2> /dev/null || true
 
 echo "== 6) 未注册的名字 → 404（URL 不能从请求里注入）=="
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$BASE/live/notregistered.flv")
@@ -252,10 +286,15 @@ self_heal() { # self_heal <名字> <端口> <说明>
     # 允许的只有已知的"重复 dts"一族（含 ffmpeg 的 "Last message repeated N times" 折叠行）
     errs=$(ffmpeg -v error -i "$flv" -f null - 2>&1 > /dev/null \
         | grep -vE "non monotonically increasing dts|Last message repeated [0-9]+ times" | head -2)
-    if [ "${frames:-0}" -ge 200 ] && [ -z "$errs" ]; then
+    # 帧数门限给 100 而不是 200：20 秒里能出多少帧取决于**退避节奏**（1+2+4+8…）
+    # 和"每个连接只发 25 帧"的设定，200 会把"退避算得准"误判成"数据没接上"。
+    # 真正的判据是上面的"持续有数据 + dts 不倒退 + 观众没被 EOS"，帧数只防"几乎没数据"。
+    if [ "${frames:-0}" -ge 100 ] && [ -z "$errs" ]; then
         check_true "$label：解出 $frames 帧、无其它解码错误"
+    elif [ -n "$errs" ]; then
+        check_false "$label：解出 $frames 帧、无其它解码错误" "$errs"
     else
-        check_false "$label：解出 $frames 帧、无其它解码错误" "${errs:-见日志}"
+        check_false "$label：解出 $frames 帧、无其它解码错误" "只解出 $frames 帧（<100）"
     fi
     # ④ stats：重连计数与状态
     curl -s --max-time 5 "$BASE/api/stats" > "$OUT/stats_$name.json"
@@ -265,9 +304,14 @@ path, port = sys.argv[1], sys.argv[2]
 d = json.load(open(path))
 # 多路 RTSP 源的 URL 可能同名不同端口（本用例就是这样），所以按端口定位，别按名字猜
 rtsp = None
+labeled = [n for s in d.get("media_sources", [])
+           for n in (s.get("names") or [])
+           if s.get("path", "").find(":%s/" % port) >= 0]
 for s in d.get("media_sources", []):
     r = (s.get("producer") or {}).get("rtsp")
-    if r and r.get("enabled") and (":%s/" % port) in (r.get("url") or ""):
+    if not (r and r.get("enabled")):
+        continue
+    if r.get("label") in labeled or (":%s/" % port) in (r.get("url") or ""):
         rtsp = r
 if rtsp is None:
     sys.exit("没有找到端口 %s 的 rtsp 段" % port)
@@ -282,6 +326,49 @@ PY
 }
 self_heal "brk" "$RTSP_CLOSE" "对端消失（--after close）"
 self_heal "half" "$RTSP_SILENT" "半开静默（--after silent，3s 读超时）"
+echo "== 9) RTSP 音视频（M11-a2b）：SDP 两条轨 → FLV/HLS 也必须两条 =="
+# 真摄像机基本都有声：这条用例补的是"RTSP 只验过视频轨"的缺口。
+# 红 = 音频被静默丢掉（只剩 1 条流）/ 音频解不出 / 音频 dts 倒退。
+av_flv="$OUT/av.flv"
+code=$(curl -s -o "$av_flv" -w '%{http_code}' --max-time 10 "$BASE/live/av.flv" || true)
+check "GET /live/av.flv → 200" "$code" "200"
+av_streams=$(ffprobe -v error -show_entries stream=codec_name,codec_type -of csv=p=0 "$av_flv" 2>/dev/null | grep -v '^$' | sort -u | tr '\n' ' ')
+check "FLV 里有两条流（video h264 + audio aac）" "$av_streams" "aac,audio h264,video "
+if [ -z "$(ffmpeg -v error -i "$av_flv" -t 6 -f null - 2>&1 | grep -vE "non monotonically increasing dts|Last message repeated [0-9]+ times")" ]; then
+    check_true "av：音视频都能解（除已知首包重复 dts）"
+else
+    check_false "av：音视频都能解（除已知首包重复 dts）" \
+        "$(ffmpeg -v error -i "$av_flv" -t 6 -f null - 2>&1 | head -2)"
+fi
+av_audio_dts=$(ffprobe -v error -select_streams a:0 -show_entries packet=dts_time -of csv=p=0 "$av_flv" 2>/dev/null \
+    | awk 'NF && $1 != "N/A" { v = $1 + 0; if (last != "" && v < last) back++; last = v; n++ } END { printf "%d/%d", n, back + 0 }')
+av_audio_n=${av_audio_dts%%/*}
+av_audio_back=${av_audio_dts##*/}
+if [ "${av_audio_n:-0}" -ge 100 ] && [ "${av_audio_back:-1}" -eq 0 ]; then
+    check_true "音频（$av_audio_n 包，0 次 dts 倒退）"
+else
+    check_false "音频包数与 dts 单调" "$av_audio_dts（期望包数≥100 且倒退=0）"
+fi
+# HLS：切片里也要有音频（音频只在 FLV 有 = 播放器静音却看不出来）
+curl -s -o /dev/null --max-time 5 "$BASE/hls/av.m3u8"
+sleep 6
+curl -s -o "$OUT/av.m3u8" --max-time 5 "$BASE/hls/av.m3u8"
+av_slice=$(grep -o '/hls/av-[0-9]*\.ts' "$OUT/av.m3u8" | tail -1)
+if [ -n "$av_slice" ]; then
+    curl -s -o "$OUT/av_slice.ts" --max-time 5 "$BASE$av_slice"
+    # 注意：TS 里 ffprobe 会把同一路流列两遍（PAT/PMT 重复 —— 本地 sample.ts 也一样），必须 sort -u
+    av_ts_streams=$(ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$OUT/av_slice.ts" 2>/dev/null | grep -v '^$' | sort -u | tr '\n' ' ')
+    check "HLS 切片里也有音频轨" "$av_ts_streams" "audio video "
+else
+    check_false "HLS 切片里也有音频轨" "播放列表没有切片：$(head -4 "$OUT/av.m3u8" | tr '\n' '|')"
+fi
+# 名字（M11-a2b）：日志里要看得到 `#av`，不是只有 IP
+if grep -q "\[av\]" "$OUT/server.log"; then
+    check_true "日志里能看到源的名字（[av]）"
+else
+    check_false "日志里能看到源的名字（[av]）" "没找到 [av]"
+fi
+
 # 重连日志必须能看（可观测性：不能只在 stats 里有个数字）
 reconn_logs=$(grep -c "断流 → " "$OUT/server.log" || true)
 if [ "${reconn_logs:-0}" -ge 2 ]; then
@@ -292,5 +379,5 @@ fi
 
 echo
 echo "结果：通过 $pass 项 / 失败 $fail 项（产物：$OUT）"
-[ "$fail" -eq 0 ] || { echo "结论：M11-a1 未通过"; exit 1; }
-echo "结论：M11-a1 + a2 通过（RTSP 能连能拉、缺参数集当场拒绝、TCP 回退、凭据脱敏；断流自动重连且观众不掉线）"
+[ "$fail" -eq 0 ] || { echo "结论：M11-a1/a2/a2b 未通过"; exit 1; }
+echo "结论：M11-a1 + a2 + a2b 通过（RTSP 能连能拉、缺参数集当场拒绝、TCP 回退、凭据脱敏；断流自动重连且观众不掉线；音视频两条轨都出 FLV/HLS；名字进日志与 stats）"

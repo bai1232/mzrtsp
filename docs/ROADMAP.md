@@ -66,7 +66,7 @@
 
 | 任务 | 说明 |
 |---|---|
-| RTSP 输入（**M11-a**，设计见 **[docs/DESIGN_M11.md](DESIGN_M11.md)**；**a1 ✅ a2 ✅ 已完成**，a3 长跑收尾中） | FFmpeg 作为客户端拉流；断流检测（**读超时为主判据**，实测 5.0 s 发现半开）与**自动重连**（指数退避 1→2→4→8→16→30 s）；**重连期不打断观众**（源线程不死、不发 EOS）；时间戳接续；前置校验"对端没给 SPS/PPS → 明确拒绝"；入口 `--rtsp`；凭据脱敏 |
+| RTSP 输入（**M11-a**，设计见 **[docs/DESIGN_M11.md](DESIGN_M11.md)**；**a1 ✅ a2 ✅ a2b ✅ a3 ✅**，发布依据 [ACCEPTANCE_v0.3.0.md](ACCEPTANCE_v0.3.0.md)） | FFmpeg 作为客户端拉流；断流检测（**读超时为主判据**，实测 5.0 s 发现半开）与**自动重连**（指数退避 1→2→4→8→16→30 s）；**重连期不打断观众**（源线程不死、不发 EOS）；时间戳接续；前置校验"对端没给 SPS/PPS → 明确拒绝"；入口 `--rtsp`；凭据脱敏 |
 | 解码处理 | `Filter` 链：缩放、水印、帧率变换（`libavfilter`，**需先 `apt install libavfilter-dev`**） |
 | 验收 | 从一台 RTSP 源（可用 `ffmpeg -re -f rtsp` 本机自建）拉流并转出 HTTP-FLV，连续 1 小时不断流 |
 
@@ -89,7 +89,7 @@
 | **FR-1.5** 释放后资源回基线 | M5-c / M7 | `concurrent_test.sh` fd 曲线、`srcmgr_release_all_stops_sources` |
 | **FR-2.1** MP4 + H264 裸流 | M4 / M6-c | `ffmpeg` 组、`producer` 组、`flv_http_test.sh` §2/§3 |
 | **FR-2.2** MKV / MPEG-TS 输入 | **M8** | `flv_http_test.sh` §3b（17 项）、`ffmpeg` 组 5 例 + `producer` 组 2 例 |
-| **FR-2.3** RTSP 输入 + 重连 | **M11-a1 / a2**（v0.3） | `scripts/rtsp_test.sh` 33 项（正常/UDP/TCP-only/缺 sprop/脱敏/断流重连×2）+ 单测 `rtsp` 组 5 例、`pipeline` 组重连 2 例；**未验证**：真机与 1 小时长跑（a3） |
+| **FR-2.3** RTSP 输入 + 重连 | **M11-a1 / a2 / a2b / a3**（v0.3） | `scripts/rtsp_test.sh` **41 项**（正常/UDP/TCP-only/缺 sprop/脱敏/断流重连×2/音视频/名字）+ `scripts/rtsp_soak.sh` 1 小时长跑（中途掐断上游）+ 单测 `rtsp` 5 例 / `pipeline` 4 例 / `srcmgr` 名字 1 例；**未验证**：真机 |
 | **FR-2.4** 边界（损坏/纯音频/VFR/时长未知）不崩 | M4 / M8 / M10 | `ffmpeg_demux_open_garbage_file_fails`、`producer_transcode_rejects_bad_requests`；VFR 无样本（未验证） |
 | **FR-3.1** HTTP-FLV + 立即发 sequence header | M6-b / M6-c | `flv` 组逐字节、`flv_http_test.sh` §5（首帧 20–60 ms） |
 | **FR-3.2** HLS：2s 切片 / 窗口 6 / m3u8 字段 | **M9** | `hls_test.sh` 32 项 + `hls` 组 6 例 + `ts_mux_test.sh` 29 项 |

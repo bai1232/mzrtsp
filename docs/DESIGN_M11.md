@@ -159,6 +159,7 @@ public:
 |---|---|---|
 | **M11-a1 ✅ 已完成**：能连上、能拉 | `Demuxer::open(path, options)` 重载 + 网络流 Limits 档 + §4.2 选项 + §4.8 前置校验 + `--rtsp` 入口 + `rtsp` 观测字段（状态恒 `playing`） | 假服务端 4 场景（UDP / TCP-only / 无 SPS-PPS / 关连接）；`ffprobe`/`ffmpeg` 从 `/live/<name>.flv` 拉到合法 FLV；`hls` 也能切 |
 | **M11-a2 ✅ 已完成**：断流能自愈 | `ReconnectPolicy`（新文件）+ `SourceSession` 接入 + 时间戳接续 + 状态机 + 退避日志 | 假服务端：`--after close` / `--after silent` → 自动重连、观众不掉线、跨重连 dts 不倒退（实测见 §5.2）；退避序列可断言（日志或 stats） |
+| **M11-a2b ✅ 已完成**：名字 + 音视频 + 传输默认 | `--rtsp #name` 进日志/stats；假服务端加 AAC 轨（RFC 3640）；默认 transport 改 `tcp`；网络 EOF 当断流；控制台日志逐行 flush | 假服务端 6 场景 41 项；真 1080p 素材走 TCP 零 error；音视频双流进 FLV/HLS |
 | **M11-a3**：验收与收尾 | `scripts/rtsp_test.sh`（假服务端驱动，含"半开"场景）+ 入库假服务端 + 文档（TESTING/ROADMAP/ACCEPTANCE）+ 全量门禁 | 脚本全绿；`refactor_equiv_check.sh` 11/11（证明本地文件路径零影响）；1 小时长跑（RTSP 源） |
 
 ## 5.1 M11-a1 实测记录（2026-10-25）
@@ -208,6 +209,37 @@ public:
   `read()` 读到新一段第一个包时，就地算偏移、就地返回（`_reconnect_needs_timeline`），
   少一个队列、少一次状态不一致的机会 —— `_pending` 已删除。
 
+## 5.3 M11-a2b 实测记录（2026-10-25，收尾批）
+
+这一批本来是"给源加个名字 + 用真素材跑长跑"，结果撞出三个**真问题**，都修了：
+
+| # | 现象（怎么发现的） | 根因 | 修法 |
+|---|---|---|---|
+| 1 | 默认 UDP 下，**音视频双轨**只收到前 ~1 s 音频（47/431 包），之后全没有 | 未完全定位：`--speed 8`（读得快）时不复现、`--rtsp-transport tcp` 时不复现、`ffprobe` 直连同源 UDP 正常；已排除 `max_delay` 重排窗口与探测上限 | **默认传输改 `tcp`**（另有原因 2）；UDP 保留但文档标注"音视频/高码率不建议"；列入 v0.3.1 待查 |
+| 2 | 1080p 源走 UDP：抓到的 FLV 解码报 `error while decoding MB … bytestream -5`（RTP 分片丢） | UDP 无重传 + 帧大（IDR ≈ 100 KB / 70 个分片） | 同上，默认 TCP |
+| 3 | **TCP 下对端关连接，观众被"正常结束"踢下线**（`curl` 退出码 0，1 s 就没了） | 对端关连接时 `av_read_frame` 给的是 **EOF**，`SourceSession::read` 把网络源的 EOF 当"播完了"→ `SourcePump::endOfStream()` | **网络源的 EOF 一律当断流**（`peer_gone`），只有本地文件才允许 EOF |
+
+顺带修掉的一个观测缺陷：
+
+- **控制台日志会整段丢**：stdout 重定向到文件时是**块缓冲**，进程被 kill 时缓冲里的 Info 行
+  全丢 —— 实测 `> server.log 2>&1 &` + SIGINT 后，文件里只剩 stderr 的 Warn/Error，
+  "源已创建 / 重连成功"一条都没有（我一开始因此误判成"重连没生效"）。现在 `ConsoleWriter`
+  **逐行 flush**（每秒个位数日志量，代价可忽略）。
+
+这一批的正向能力（实测）：
+
+| 项 | 结果 |
+|---|---|
+| 名字进观测（`--rtsp <url>#name`） | 日志 `源已创建（懒启动）：[cam1] rtsp://…`、`SourceSession[cam1]: 断流 → …`；`/api/stats` 每源 `"names":["a","b"]` + `rtsp.label`（**一个源被多个名字共享时都列出来**，因为上游只拉一次） |
+| RTSP **音视频** | SDP 两条 `m=` → 客户端出双流：`ffprobe` 认 `h264 320x240` + `aac 44100/1`；`-count_frames` 音频 384 包 0 次 dts 倒退；HLS 切片同样双流 |
+| 真 1080p 素材 | `video.h264`（1920×1080 23.976 fps）经 TCP 拉流、FLV 解码零 error（前提：`--fps 23.976` 给对，否则假源时间戳步长不对） |
+| 测试床性能 | 假服务端切 45 MB 的 Annex-B 从 **20–40 s 降到 0.07 s**（`split_annexb` 从逐字节扫改 `re.finditer`） |
+
+**设计变更（【AI 定】，需知会）**：`--rtsp-transport` 默认从 `auto` 改为 **`tcp`**。
+理由是可测的：UDP 在这台机器上丢过 1080p 分片、丢过整条音频轨；TCP 交错传输两者都干净。
+代价：TCP 需要一条稳定的控制连接（相机会话超时通常 60 s，FFmpeg 会自己发保活），
+延迟略高；对"不丢帧"优先的转流场景更合适。`auto`/`udp` 仍然可用（脚本里单独验过）。
+
 ## 6. 测试计划
 
 | 层级 | 用例 | 证明什么 / 什么会让它红 |
@@ -249,7 +281,8 @@ public:
 ## 9. 待拍板（≤5 问，各带推荐）
 
 1. **入口形态**：`--rtsp <url>[#name]`（推荐）还是给一个 `sources.conf` 配置文件？
-2. **默认 transport**：`auto`（FFmpeg 默认：UDP 优先、被拒回退 TCP，推荐）还是**默认强制 `tcp`**（无丢包、延迟稍高，对监控场景更稳）？
+2. ~~**默认 transport**~~ **已决（M11-a2b，见 §5.3）**：**默认 `tcp`**。实测 UDP 丢 1080p 分片、
+   也丢过音频轨；TCP 两者都干净。`auto`/`udp` 保留可选。
 3. **重连太久要不要主动 EOS**：推荐"**不**主动 EOS，只暴露 `last_packet_age_ms`"；若你更希望播放器自己重连，我可以加 `--rtsp-eos-after-ms`（有界、默认关闭）。
 4. **网络流读超时默认值**：推荐 **10 s**（事实 3/4 里 5 s 已能发现，但真实相机的关键帧间隔可能 2–4 s，10 s 更稳）；你若要求更快恢复，可给 3–5 s。
 5. **真机验收**：本机只有那台假服务端。要不要我按"假服务端 + 1 小时长跑"验收，并在文档里明确写「真机未验」；还是你那边能提供一台 RTSP 源（型号/URL）做真机 1 小时？

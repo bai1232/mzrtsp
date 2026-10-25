@@ -66,9 +66,15 @@ public:
         bool enabled = false;
         /// 网络流的读超时（毫秒）：一次读超过这么久没有包 = 断流（默认 10s，见 DESIGN_M11 §4.3）
         int timeout_ms = 10000;
-        /// 传输方式：`auto`（FFmpeg 默认：UDP 优先、被拒自动回退 TCP）/ `tcp` / `udp`
+        /// 【M11-a2b】给人看的名字（命令行 `--rtsp <url>#<name>`）：进日志前缀与 stats，
+        /// **不参与任何判断**（名字已由命令行校验过 `[A-Za-z0-9_.-]`）
+        std::string label;
+        /// 传输方式：`tcp`（**默认**：交错传输，不丢包）/ `auto`（UDP 优先、被拒回退 TCP）/ `udp`
+        /// @note 【M11-a2b】默认从 `auto` 改成 `tcp`，实测依据见 `docs/DESIGN_M11.md` §5.3：
+        ///       · 1080p 源走 UDP：抓到 357 个包里有解码错误（RTP 丢片）；
+        ///       · 音视频双轨走 UDP：音频只收到前 ~1s（47/431 包），TCP 完整。
         enum class Transport { Auto = 0, Tcp = 1, Udp = 2 };
-        Transport transport = Transport::Auto;
+        Transport transport = Transport::Tcp;
         /// 【M11-a2】断流重连（网络源）：退避 1→2→4→8→16→封顶 30s，读到第一个包才复位
         bool reconnect_enabled = true;
         int64_t backoff_initial_ms = 1000;

@@ -51,7 +51,7 @@ std::string jsonEscapeJsonString(const std::string &in) {
 
 DemuxerProducer::DemuxerProducer(const Config &config)
     : _config(config)
-    , _session(SourceSession::Config{config.demux, config.loop}) {}
+    , _session(SourceSession::Config{config.demux, config.loop, config.rtsp.label}) {}
 
 // 无参构造与"带 Config"分开写：`Config` 自带默认成员初始值，
 // 在类内把它当默认实参用会触发 [class.mem] 的"必须在类完成前初始化"限制（GCC 直接报错）。
@@ -170,6 +170,10 @@ std::string DemuxerProducer::rtspStatsJson() const {
     std::string out = "{\"enabled\":true,\"state\":\"";
     out += SourceSession::netStateName(_session.netState());
     out += "\",\"url\":\"" + redactMediaUrl(_session.path()) + "\"";
+    // 【M11-a2b】名字：`/api/stats` 里一眼能对上命令行（没有 label 就不出这个字段，不造假）
+    if (!_session.label().empty()) {
+        out += ",\"label\":\"" + jsonEscapeJsonString(_session.label()) + "\"";
+    }
     out += ",\"connects\":" + std::to_string(_session.connects());
     out += ",\"reconnects\":" + std::to_string(_session.reconnects());
     out += ",\"attempts\":" + std::to_string(_session.reconnectAttempts());

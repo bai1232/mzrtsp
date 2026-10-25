@@ -153,7 +153,7 @@ std::shared_ptr<HlsService::Entry> HlsService::acquireEntry(
     // 建源 + 切片器（**不要在持锁时做**：acquire 会 open 文件、可能耗时）
     // 【M10-c】转码规格**原样交给 SourceManager**：于是"转码 + HLS"复用的就是 /live/ 那条链路
     // （独立源键 + 并发硬上限 + 播完让出名额），一行新的调度逻辑都不需要
-    MediaSource::Ptr source = _manager->acquire(path, spec);
+    MediaSource::Ptr source = _manager->acquire(path, spec, name); // 【M11-a2b】名字进日志/stats
     if (!source) {
         if (error != nullptr) {
             *error = "源打不开（" + _manager->lastError() + "）";

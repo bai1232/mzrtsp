@@ -15,7 +15,7 @@
 | **v0.2.1** | 补丁：**B 帧源**的时间戳（pts 不再被钳 → 显示顺序正确；TS 负时间戳整体平移；循环接缝不倒退） | ✅ **已发布**（tag `v0.2.1`；证据见 [docs/ACCEPTANCE_v0.2.1.md](docs/ACCEPTANCE_v0.2.1.md)） |
 | **v0.2.2** | v0.2 收尾：**转码 + HLS**（`/hls/x.m3u8?transcode=1&h=720`） | ✅ **已发布**（tag `v0.2.2`；证据见 [docs/ACCEPTANCE_v0.2.2.md](docs/ACCEPTANCE_v0.2.2.md)） |
 | **v0.2.3** | 重构：`DemuxerProducer` 拆成「读（`SourceSession`）/ 形状（`PacketStage`）/ 编排」 | ✅ **已发布**（tag `v0.2.3`；行为不变的证据见 [docs/ACCEPTANCE_v0.2.3.md](docs/ACCEPTANCE_v0.2.3.md)） |
-| **v0.3.0** | RTSP 输入、解码处理（滤镜/缩放/水印） | 🚧 **进行中**：**a1 RTSP 输入 ✅**（能连、能拉 FLV/HLS、缺参数集当场拒绝、凭据脱敏）、**a2 断流自愈 ✅**（读超时判据、指数退避 1→30 s、重连不踢观众、时间戳接续）；a3 1 小时长跑待做。设计见 [docs/DESIGN_M11.md](docs/DESIGN_M11.md) |
+| **v0.3.0** | RTSP 输入、解码处理（滤镜/缩放/水印） | 🚧 **进行中**：**a1 RTSP 输入 ✅**（能连、能拉 FLV/HLS、缺参数集当场拒绝、凭据脱敏）、**a2 断流自愈 ✅**（读超时判据、指数退避 1→30 s、重连不踢观众、时间戳接续）、**a2b 收尾 ✅**（`#name` 进日志/stats、RTSP 音视频双轨、默认传输改 TCP）、**a3 1 小时长跑 ✅**。发布依据见 [docs/ACCEPTANCE_v0.3.0.md](docs/ACCEPTANCE_v0.3.0.md)。设计见 [docs/DESIGN_M11.md](docs/DESIGN_M11.md) |
 
 ### v0.2.0 验收摘要（实测，完整矩阵见验收报告）
 
@@ -52,7 +52,7 @@
 |---|---|---|---|
 | 输入 MP4 / H264 裸流 | ✅ | | |
 | 输入 MKV / TS | | ✅ | |
-| 输入 RTSP（含断流自动重连） | | | ✅ |
+| 输入 RTSP（含断流自动重连 / 音视频） | | | ✅ |
 | 视频 H264 / 音频 AAC | ✅ | | |
 | 输出 HTTP-FLV | ✅ | | |
 | 输出 HLS | | ✅ | |
@@ -193,7 +193,8 @@ cd build && ctest                        # 26 个分组（297 个用例），**�
 ../scripts/concurrent_test.sh             # 长跑：10 路 × 5 分钟（NFR-2/3/4/6 + 性能基线）
 ../scripts/tsan.sh                        # TSAN：严格组 0 报告
 ../scripts/refactor_equiv_check.sh        # 重构等价性：同一输入 → 同一输出**字节**
-../scripts/rtsp_test.sh                   # RTSP 输入 + 断流自愈 33 项（假 RTSP 服务端注入 6 类场景，零新依赖）
+../scripts/rtsp_test.sh                   # RTSP 输入 + 断流自愈 + 音视频 41 项（假 RTSP 服务端注入 7 类场景，零新依赖）
+../scripts/rtsp_soak.sh                   # 1 小时长跑（中途掐断一次上游，验自愈 + RSS）
 ```
 
 ## 部署提示（v0.1.0）

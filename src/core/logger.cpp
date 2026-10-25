@@ -135,6 +135,11 @@ void ConsoleWriter::write(const LogContext &ctx) {
     } else {
         std::fprintf(fp, "%s\n", line.c_str());
     }
+    // 【M11-a2b】逐行 flush：stdout 重定向到文件时是**块缓冲**，进程被 kill（含 SIGINT 退出被打断）
+    // 时缓冲区里的 Info 行会**整段丢掉** —— 实测 `> server.log 2>&1 &` + kill 后，
+    // 文件里只剩 stderr 的 Warn/Error，"源已创建/重连成功"全不见了。
+    // 日志量是每秒个位数，逐行 flush 的代价可以忽略；换来"日志里有的就是实际发生过的"。
+    std::fflush(fp);
 }
 
 void ConsoleWriter::flush() {

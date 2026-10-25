@@ -112,7 +112,8 @@ public:
      * @note 转码源与直通源是**两个独立的源**（各自解封装）：换来的是"不动 `media/` 的分发层"
      *       （SC-2），代价是同一个文件被 demux 两次、转码那一份多占 CPU。见 docs/DESIGN_M10.md §8
      */
-    MediaSource::Ptr acquire(const std::string &path, const TranscodeSpec &spec);
+    MediaSource::Ptr acquire(const std::string &path, const TranscodeSpec &spec,
+                             const std::string &label = std::string());
 
     /// 源键（`sourceKey(path, spec)`）：直通源 = 文件路径，转码源 = `路径|h=720` / `路径|src`
     static std::string sourceKey(const std::string &path, const TranscodeSpec &spec);
@@ -175,6 +176,9 @@ public:
 
 private:
     struct Entry {
+        /// 【M11-a2b】引用过这个源的**入口名**（RTSP 的 `#name`）：一个源可能被多个名字共享
+        /// （`--rtsp <url>#a` 与 `--rtsp <url>#b` 只拉一次上游）。去重、保序。
+        std::vector<std::string> names;
         /// map 键（直通源 = 文件路径；转码源 = `路径|h=720` / `路径|src`）
         std::string key;
         /// 真实文件路径（日志/stats 里给人看的那个）
@@ -186,6 +190,9 @@ private:
         size_t handles = 0;
         EventPoller::DelayTask::Ptr idle_task;
     };
+
+    /// 【M11-a2b】记住这个源被哪个入口名引用过（去重、保序；空名字不算）。调用方必须持 `_mutex`
+    static void rememberNameLocked(Entry &entry, const std::string &label);
 
     explicit SourceManager(const EventPoller::Ptr &poller);
 

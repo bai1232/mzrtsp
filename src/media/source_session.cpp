@@ -23,7 +23,8 @@ constexpr int64_t kLoopGapMs = 1;
 
 SourceSession::SourceSession(const Config &config)
     : _config(config)
-    , _demux(config.demux) {}
+    , _demux(config.demux)
+    , _label(config.label) {}
 
 void SourceSession::setError(const std::string &message) {
     std::lock_guard<std::mutex> lock(_mutex);
@@ -64,6 +65,13 @@ int64_t SourceSession::estimateFrameDurationMs(const StreamInfo &info) {
 
 bool SourceSession::open(const std::string &path) {
     return open(path, Demuxer::Options{});
+}
+
+std::string SourceSession::displayName() const {
+    if (!_label.empty()) {
+        return _label;
+    }
+    return redactMediaUrl(_path);
 }
 
 bool SourceSession::open(const std::string &path, const Demuxer::Options &options) {
@@ -342,7 +350,7 @@ bool SourceSession::reconnectNetwork(std::string *error) {
         }
         _net_state.store(NetState::Reconnecting);
         WarnP("SourceSession[%s]: 断流 → %lld ms 后第 %llu 次重连",
-              redactMediaUrl(_path).c_str(), static_cast<long long>(delay),
+              displayName().c_str(), static_cast<long long>(delay),
               static_cast<unsigned long long>(_policy.attempts()));
         if (!sleepInterruptibleMs(delay)) {
             if (error != nullptr) {
@@ -360,8 +368,7 @@ bool SourceSession::reconnectNetwork(std::string *error) {
                 _last_net_error = redactMediaUrl(_demux.lastError());
             }
             WarnP("SourceSession[%s]: 第 %llu 次重连打不开（%s）",
-                  redactMediaUrl(_path).c_str(),
-                  static_cast<unsigned long long>(_policy.attempts()),
+                  displayName().c_str(), static_cast<unsigned long long>(_policy.attempts()),
                   redactMediaUrl(_demux.lastError()).c_str());
             continue;
         }
@@ -385,7 +392,7 @@ bool SourceSession::reconnectNetwork(std::string *error) {
         ++_connects;
         ++_reconnects;
         _net_state.store(NetState::Playing);
-        InfoP("SourceSession[%s]: 重连成功（第 %llu 次尝试）", redactMediaUrl(_path).c_str(),
+        InfoP("SourceSession[%s]: 重连成功（第 %llu 次尝试）", displayName().c_str(),
               static_cast<unsigned long long>(_policy.attempts()));
         return true;   // 退避复位在"读到第一个包"之后（read() 里调 onSuccess）
     }
@@ -406,7 +413,12 @@ SourceSession::Result SourceSession::read(Packet *out, std::string *error) {
 
     while (true) {
         const Demuxer::ReadResult result = _demux.readPacket();
-        if (result == Demuxer::ReadResult::Eof) {
+        // 【M11-a2b】网络源的 **EOF 也是断流**：对端关掉 TCP（interleaved）时，`av_read_frame`
+        //   给的是 EOF 而不是 Error。以前这里直接当"播完了"→ `SourcePump::endOfStream()` →
+        //   **观众被踢下线**（实测：TCP 传输 + 对端 close，1 秒后 curl 拿到正常结束码 0）。
+        //   直播流没有"结尾"：网络源一律走重连，只有本地文件才允许 EOF。
+        const bool peer_gone = (result == Demuxer::ReadResult::Eof) && _network;
+        if (result == Demuxer::ReadResult::Eof && !peer_gone) {
             if (!_config.loop) {
                 return Result::EndOfStream;
             }
@@ -415,11 +427,12 @@ SourceSession::Result SourceSession::read(Packet *out, std::string *error) {
             }
             continue; // 重开成功：接着读新一趟（时间戳已由偏移接上）
         }
-        if (result == Demuxer::ReadResult::Error) {
-            const std::string reason = _demux.lastError();
+        if (result == Demuxer::ReadResult::Error || peer_gone) {
+            const std::string reason = peer_gone ? "对端关闭了连接（直播流的 EOF = 断流）"
+                                                 : _demux.lastError();
             setError(reason); // 如实转达（含超时/超限/损坏）
-            // 【M11-a2】网络源：断流/超时 → **进入重连**，绝不把 Error 抛给 SourcePump
-            //   （SourcePump 见 Error 就 endOfStream()，观众会掉线 —— 见 DESIGN_M11 §3）
+            // 【M11-a2】网络源：断流/超时/EOF → **进入重连**，绝不把结束抛给 SourcePump
+            //   （SourcePump 见 Error/EOS 就 endOfStream()，观众会掉线 —— 见 DESIGN_M11 §3）
             if (_network && _reconnect.enabled && !(_abort != nullptr && _abort->load())) {
                 {
                     std::lock_guard<std::mutex> lock(_net_mutex);
@@ -431,7 +444,7 @@ SourceSession::Result SourceSession::read(Packet *out, std::string *error) {
                     *error = lastError();
                     return Result::Error;
                 }
-                continue; // 重连成功：接着读（pending 为空，下一轮会读到新一段的包）
+                continue; // 重连成功：接着读（时间戳已在读到新一段第一个包时接上）
             }
             *error = lastError();
             return Result::Error;

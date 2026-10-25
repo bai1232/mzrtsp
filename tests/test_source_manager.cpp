@@ -211,6 +211,56 @@ MZ_TEST(srcmgr_lazy_start_and_reuse) {
     (void) poller->shutdown();
 }
 
+// ---------------------------------------------------------------------------
+// 【M11-a2b】入口名（RTSP 的 `#name`）要进 stats：一个源被多个名字共享时**都要列出来**
+//
+// 什么让它红：
+//   · names 没进 stats → 第一条断言（多路 RTSP 就只能靠 IP 认人）；
+//   · 同一名字重复 acquire 又追加一次 → 第二条断言（列表会越来越长）；
+//   · 第二个名字没记上 → 第三条断言（"a 与 b 共享一个源"这件事就看不见了）。
+// ---------------------------------------------------------------------------
+
+MZ_TEST(srcmgr_stats_exposes_entry_names) {
+    const std::string path = samplePath("sample.mp4");
+    MZ_ASSERT_FALSE(path.empty());
+    if (path.empty()) {
+        return;
+    }
+    auto poller = EventPoller::create("test-srcmgr-names");
+    auto manager = SourceManager::create(poller);
+
+    auto h1 = manager->acquire(path, SourceManager::TranscodeSpec{}, "cam_front");
+    MZ_ASSERT_NOT_NULL(h1.get());
+    if (!h1) {
+        (void) poller->shutdown();
+        return;
+    }
+    std::string stats = manager->dumpStatsJson();
+    MZ_ASSERT_TRUE(stats.find("\"names\":[\"cam_front\"]") != std::string::npos);
+
+    // 同一个名字再来一次：不重复追加
+    auto h2 = manager->acquire(path, SourceManager::TranscodeSpec{}, "cam_front");
+    MZ_ASSERT_NOT_NULL(h2.get());
+    MZ_ASSERT_TRUE(h1.get() == h2.get());
+    stats = manager->dumpStatsJson();
+    MZ_ASSERT_TRUE(stats.find("\"cam_front\",\"cam_front\"") == std::string::npos);
+
+    // 第二个名字指向同一个源：两个名字都要在（这正是"一源多路由"的事实）
+    auto h3 = manager->acquire(path, SourceManager::TranscodeSpec{}, "cam_back");
+    MZ_ASSERT_NOT_NULL(h3.get());
+    MZ_ASSERT_TRUE(h1.get() == h3.get());
+    stats = manager->dumpStatsJson();
+    MZ_ASSERT_TRUE(stats.find("\"names\":[\"cam_front\",\"cam_back\"]") != std::string::npos);
+
+    // 没名字的 acquire 不能把空字符串塞进列表
+    auto h4 = manager->acquire(path);
+    MZ_ASSERT_NOT_NULL(h4.get());
+    stats = manager->dumpStatsJson();
+    MZ_ASSERT_TRUE(stats.find("\"names\":[\"cam_front\",\"cam_back\",\"\"]") == std::string::npos);
+
+    (void) poller->shutdown();
+}
+
 MZ_TEST(srcmgr_idle_release_without_cache) {
     const std::string path = samplePath("sample.mp4");
     MZ_ASSERT_FALSE(path.empty());

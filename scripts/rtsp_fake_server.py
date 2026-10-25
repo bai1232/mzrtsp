@@ -18,6 +18,8 @@
       close  = 直接关连接（对端收到 RST / EOF）
       silent = **保持连接但不发数据**（模拟"半开"：只靠读超时才能发现）
       hold   = 继续空转（保持连接，不发也不关）
+  · `--audio-file <file.aac>`：再开一条 **AAC 音频轨**（RFC 3640 / AAC-hbr，SDP 带 `config=`），
+    用来验 RTSP 的**音视频**路径（真摄像机基本都有声）；`--fps` 按素材真实帧率给
   · `--fault-close-first`：故障只发生在**第一条**连接，之后一直推流（模拟相机重启后恢复）——
     没有它，"每轮 25 帧就断"永远测不出自愈，只能测出"反复断"
 
@@ -28,6 +30,7 @@
 """
 import argparse
 import base64
+import re
 import socket
 import struct
 import sys
@@ -38,20 +41,15 @@ SSRC = 0x12345678
 
 
 def split_annexb(data):
-    """按 00 00 01 / 00 00 00 01 切 Annex-B → [(nal_bytes, is_key)]"""
+    """按 00 00 01 / 00 00 00 01 切 Annex-B → [nal_bytes]
+
+    **为什么用 re 而不是逐字节扫**：45MB 的真实素材逐字节扫要 20–40 s（纯 Python 循环），
+    一小时的验收工具不能有这种启动开销；`re.finditer` 在 C 层扫，毫秒级。
+    语义与逐字节版本等价：`00 00 00 01` 里也含 `00 00 01`，从偏移 +1 处命中，起点一致。
+    """
+    starts = [m.start() + 3 for m in re.finditer(b"\x00\x00\x01", data)]
     nals = []
-    i = 0
     n = len(data)
-    starts = []
-    while i < n - 3:
-        if data[i] == 0 and data[i + 1] == 0 and data[i + 2] == 1:
-            starts.append(i + 3)
-            i += 3
-        elif i < n - 4 and data[i] == 0 and data[i + 1] == 0 and data[i + 2] == 0 and data[i + 3] == 1:
-            starts.append(i + 4)
-            i += 4
-        else:
-            i += 1
     for idx, s in enumerate(starts):
         e = starts[idx + 1] - 3 if idx + 1 < len(starts) else n
         # 回退掉下一个起始码里的 0
@@ -59,9 +57,6 @@ def split_annexb(data):
             e -= 1
         if e > s:
             nal = data[s:e]
-            # 去掉尾部可能残留的 0
-            while nal and nal[-1] == 0:
-                nal = nal[:-1]
             if nal:
                 nals.append(nal)
     return nals
@@ -114,22 +109,64 @@ class Server:
         pps = next((n for n in nals if (n[0] & 0x1F) == 8), b"")
         self.sdp_sps = base64.b64encode(sps).decode()
         self.sdp_pps = base64.b64encode(pps).decode()
-        # 只保留视频 VCL 帧（1/5），并按"多少帧一包"分组：这里简单按 NAL 逐帧发
+        # 只保留视频 VCL 帧（1/5）：这里按 NAL 逐帧发
         self.frames = [n for n in nals if (n[0] & 0x1F) in (1, 5)]
-        self.transport = "tcp"
-        self.peer = None
-        self.udp = None
+        self.fps = float(args.fps)
+        # 音频轨（可选）：`--audio-file` 给一个 ADTS(.aac) → 裸 AAC 帧 + ASC（SDP 的 config=）
+        self.audio_frames = []
+        self.audio_asc = b""
+        self.audio_rate = 44100
+        self.audio_channels = 2
+        if args.audio_file:
+            self.load_adts(args.audio_file)
         self.conn_seq = 0  # 第几条连接（1 起）：`--fault-close-first` 靠它只坑第一条
-        self.log(f"就绪：SPS {len(sps)}B / PPS {len(pps)}B，可发 {len(self.frames)} 帧")
+        self.log(f"就绪：SPS {len(sps)}B / PPS {len(pps)}B，可发 {len(self.frames)} 帧 @ {self.fps:g}fps")
+        if self.audio_frames:
+            self.log(f"音频轨：{len(self.audio_frames)} 帧 AAC，{self.audio_rate}Hz/{self.audio_channels}ch，"
+                     f"ASC={self.audio_asc.hex()}")
 
     def log(self, msg):
         print(f"[srv] {msg}", flush=True)
+
+    def load_adts(self, path):
+        """把 ADTS 拆成裸 AAC 帧（RFC 3640 的 payload 里不要 ADTS 头），并算出 ASC"""
+        data = open(path, "rb").read()
+        pos = 0
+        first = True
+        sfi = 4
+        chan = 2
+        profile = 1
+        while pos + 7 <= len(data):
+            h = data[pos:pos + 7]
+            if h[0] != 0xFF or (h[1] & 0xF0) != 0xF0:
+                break  # 不是 ADTS 头：停止（不猜）
+            protection_absent = h[1] & 0x01
+            profile = (h[2] >> 6) & 0x03
+            sfi = (h[2] >> 2) & 0x0F
+            chan = ((h[2] & 0x01) << 2) | ((h[3] >> 6) & 0x03)
+            frame_len = ((h[3] & 0x03) << 11) | (h[4] << 3) | ((h[5] >> 5) & 0x07)
+            header_len = 7 if protection_absent else 9
+            if frame_len <= header_len:
+                break
+            self.audio_frames.append(data[pos + header_len:pos + frame_len])
+            pos += frame_len
+            if first:
+                first = False
+        if not self.audio_frames:
+            raise SystemExit(f"读不出 ADTS 帧：{path}")
+        rates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000]
+        self.audio_rate = rates[sfi] if sfi < len(rates) else 44100
+        self.audio_channels = chan if chan else 2
+        # AudioSpecificConfig：5bit object type（profile+1）| 4bit 采样率索引 | 4bit 声道
+        obj = profile + 1
+        asc = (obj << 11) | (sfi << 7) | (self.audio_channels << 3)
+        self.audio_asc = bytes([(asc >> 8) & 0xFF, asc & 0xFF])
 
     def sdp(self, with_params):
         fmtp = "packetization-mode=1"
         if with_params:
             fmtp += f";sprop-parameter-sets={self.sdp_sps},{self.sdp_pps}"
-        return (
+        sdp = (
             "v=0\r\n"
             "o=- 0 0 IN IP4 127.0.0.1\r\n"
             "s=mzmedia-test\r\n"
@@ -140,8 +177,41 @@ class Server:
             f"a=fmtp:96 {fmtp}\r\n"
             "a=control:trackID=0\r\n"
         )
+        if self.audio_frames:
+            sdp += (
+                "m=audio 0 RTP/AVP 97\r\n"
+                f"a=rtpmap:97 MPEG4-GENERIC/{self.audio_rate}/{self.audio_channels}\r\n"
+                "a=fmtp:97 profile-level-id=1;mode=AAC-hbr;sizelength=13;"
+                f"indexlength=3;indexdeltalength=3;config={self.audio_asc.hex()}\r\n"
+                "a=control:trackID=1\r\n"
+            )
+        return sdp
+
+    def send_packet(self, conn, state, track, pkt):
+        """把一帧 RTP 发出去：UDP 走该轨自己的端口，TCP 交错走该轨的通道"""
+        tr = state["transports"].get(track)
+        if tr is None:
+            return True
+        if tr["kind"] == "udp":
+            try:
+                tr["sock"].sendto(pkt, (tr["peer"][0], tr["cport"]))
+            except OSError as e:
+                self.log(f"UDP 写失败（对端走了？）：{e}")
+                return False
+        else:
+            frame = b"$" + bytes([tr["rtp_ch"]]) + struct.pack("!H", len(pkt)) + pkt
+            try:
+                with state["write_lock"]:
+                    conn.sendall(frame)
+            except OSError as e:
+                self.log(f"TCP 写失败（对端走了？）：{e}")
+                return False
+        return True
 
     def handle(self, conn):
+        # 【每连接一份】轨传输表 + 停止标志：共享会串台（旧连接的线程把新连接搅乱）
+        state = {"transports": {}, "stop": threading.Event(),
+                 "write_lock": threading.Lock()}
         buf = b""
         session = "mz-test-session;timeout=60"
         while True:
@@ -161,64 +231,69 @@ class Server:
             lines = head.decode("utf-8", "replace").split("\r\n")
             method, uri, _ = (lines[0].split(" ") + ["", "", ""])[:3]
             cseq = "1"
+            transport = ""
             for ln in lines[1:]:
-                if ln.lower().startswith("cseq:"):
+                low = ln.lower()
+                if low.startswith("cseq:"):
                     cseq = ln.split(":", 1)[1].strip()
+                elif low.startswith("transport:"):
+                    transport = ln.split(":", 1)[1].strip()
             self.log(f"<- {method} {uri} (CSeq {cseq})")
-            self.peer = conn.getpeername()
+            peer = conn.getpeername()
             if method == "OPTIONS":
                 resp = "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n\r\n"
             elif method == "DESCRIBE":
-                sdp = self.sdp(not self.args.no_sprop)
-                body = sdp.encode()
+                body = self.sdp(not self.args.no_sprop).encode()
                 resp = (f"Content-Type: application/sdp\r\n"
                         f"Content-Length: {len(body)}\r\n\r\n").encode() + body
             elif method == "SETUP":
-                transport = ""
-                for ln in lines[1:]:
-                    if ln.lower().startswith("transport:"):
-                        transport = ln.split(":", 1)[1].strip()
-                self.log(f"   客户端 Transport: {transport}")
+                import re as _re
+                m = _re.search(r"trackID=(\d+)", uri)
+                track = int(m.group(1)) if m else 0
+                self.log(f"   客户端 Transport：{transport}（trackID={track}）")
                 if "TCP" in transport.upper():
-                    self.transport = "tcp"
-                    resp = (f"Transport: RTP/AVP/TCP;unicast;interleaved=0-1;ssrc={SSRC:08X}\r\n"
+                    ch = 0
+                    mc = _re.search(r"interleaved=(\d+)-(\d+)", transport)
+                    if mc:
+                        ch = int(mc.group(1))
+                    state["transports"][track] = {"kind": "tcp", "rtp_ch": ch, "rtcp_ch": ch + 1}
+                    resp = (f"Transport: RTP/AVP/TCP;unicast;interleaved={ch}-{ch + 1};"
+                            f"ssrc={SSRC:08X}\r\n"
                             f"Session: {session}\r\n\r\n")
                 elif self.args.tcp_only:
-                    # 模拟"只接受 TCP 的摄像机 / UDP 被防火墙挡住"
                     self.log("   拒绝 UDP SETUP（tcp_only）→ 461 Unsupported Transport")
                     conn.sendall(b"RTSP/1.0 461 Unsupported Transport\r\nCSeq: " +
                                  cseq.encode() + b"\r\n\r\n")
                     continue
                 else:
-                    # UDP：从客户端的 client_port=PPPP-QQQQ 里取端口
-                    import re as _re
-                    m = _re.search(r"client_port=(\d+)-(\d+)", transport)
-                    cport = int(m.group(1)) if m else 5000
-                    self.transport = ("udp", cport, self.peer)
-                    self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    self.udp.bind(("127.0.0.1", 0))
-                    sport = self.udp.getsockname()[1]
+                    mc = _re.search(r"client_port=(\d+)-(\d+)", transport)
+                    cport = int(mc.group(1)) if mc else 5000
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.bind(("127.0.0.1", 0))
+                    sport = sock.getsockname()[1]
+                    state["transports"][track] = {"kind": "udp", "sock": sock, "cport": cport,
+                                              "peer": peer}
                     resp = (f"Transport: RTP/AVP;unicast;client_port={cport}-{cport + 1};"
                             f"server_port={sport}-{sport + 1};ssrc={SSRC:08X}\r\n"
                             f"Session: {session}\r\n\r\n")
             elif method == "PLAY":
                 resp = (f"Session: {session}\r\n"
                         "Range: npt=0.000-\r\n\r\n")
+                state["stop"].clear()
+                threading.Thread(target=self.stream, args=(conn, state), daemon=True).start()
+                if self.audio_frames and 1 in state["transports"]:
+                    threading.Thread(target=self.stream_audio, args=(conn, state),
+                                     daemon=True).start()
             else:
-                resp = ""
-            status = "200 OK" if method != "TEARDOWN" else "200 OK"
-            head_out = f"RTSP/1.0 {status}\r\nCSeq: {cseq}\r\n".encode()
-            out = head_out + (resp if isinstance(resp, bytes) else resp.encode())
+                resp = "\r\n"
+            out = f"RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n".encode() + \
+                  (resp if isinstance(resp, bytes) else resp.encode())
             self.log(f"-> {out[:120]!r}")
             conn.sendall(out)
-            if method == "PLAY":
-                threading.Thread(target=self.stream, args=(conn,), daemon=True).start()
 
-    def stream(self, conn):
+    def stream(self, conn, state):
         rtp = Rtp(96, self.args.max_payload)
-        if getattr(self.args, "delay_ms", 0):
-            time.sleep(self.args.delay_ms / 1000.0)
-        ts_step = 90000 // 25
+        ts_step = int(90000 / self.fps)
         self.conn_seq += 1
         first = self.conn_seq == 1
         # `--fault-close-first`：只让**第一条**连接出故障（模拟相机重启/网络抖动），
@@ -228,6 +303,8 @@ class Server:
         loop = self.args.loop or not first
         limit = self.args.frames if first else 0  # 0 = 不限轮数，一直发
         n = min(self.args.frames, len(self.frames)) if first else len(self.frames)
+        if getattr(self.args, "delay_ms", 0):
+            time.sleep(self.args.delay_ms / 1000.0)
         t0 = time.time()
         sent = 0
         round_index = 0
@@ -245,22 +322,15 @@ class Server:
             ts = (i * ts_step) & 0xFFFFFFFF
             if getattr(self.args, "trace_ts", False) and sent < 8:
                 self.log(f"   发#{sent} i={i} ts={ts} bytes={len(nal)}")
-            is_last = True  # 一个 NAL 视为一帧（样本是 x264 逐帧单 slice）
-            try:
-                for pkt in rtp.packet(nal, ts, is_last):
-                    if isinstance(self.transport, tuple):
-                        _, cport, peer = self.transport
-                        self.udp.sendto(pkt, (peer[0], cport))
-                    else:
-                        conn.sendall(b"$" + bytes([0]) + struct.pack("!H", len(pkt)) + pkt)
-            except OSError as e:
-                self.log(f"写失败（对端走了？）：{e}")
-                return
-            target = t0 + (i + 1) / 25.0
+            for pkt in rtp.packet(nal, ts, True):
+                if not self.send_packet(conn, state, 0, pkt):
+                    return
+            target = t0 + (i + 1) / self.fps
             time.sleep(max(0.0, target - time.time()))
             sent += 1
             if loop and limit and sent >= limit:
                 break
+        state["stop"].set()  # 视频完了（或断了）：音频轨也停，别继续往死连接写
         self.log(f"已发 {sent} 帧（{round_index + 1} 轮）；after={fault}")
         if fault == "close":
             try:
@@ -273,6 +343,28 @@ class Server:
         else:
             time.sleep(600)
 
+    def stream_audio(self, conn, state):
+        """音频轨：AAC-hbr（RFC 3640），1024 样本一帧，按采样率实时发"""
+        rtp = Rtp(97, self.args.max_payload)
+        step = 1024
+        t0 = time.time()
+        i = 0
+        n = len(self.audio_frames)
+        while not state["stop"].is_set():
+            raw = self.audio_frames[i % n]
+            # AU-headers-length=16bit，AU-size=13bit，AU-index=3bit
+            au = struct.pack("!HH", 0x0010, ((len(raw) << 3) & 0xFFF8))
+            ts = (i * step) & 0xFFFFFFFF
+            for pkt in rtp.packet(au + raw, ts, True):
+                if not self.send_packet(conn, state, 1, pkt):
+                    return
+            i += 1
+            if getattr(self.args, "trace_ts", False) and i % 100 == 0:
+                self.log(f"   音频已发 {i} 帧（ts={ts}）")
+            target = t0 + (i * step) / self.audio_rate
+            time.sleep(max(0.0, target - time.time()))
+        self.log(f"音频轨已停（共发 {i} 帧）")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -284,6 +376,10 @@ def main():
     ap.add_argument("--tcp-only", action="store_true", help="只接受 TCP 交错传输（UDP SETUP → 461）")
     ap.add_argument("--max-payload", type=int, default=1400,
                     help="单个 RTP 包的负载上限（>= 帧大小即不分片；TCP 交错下可调大）")
+    ap.add_argument("--fps", type=float, default=25.0,
+                    help="视频轨帧率（时间戳步长 = 90000/fps；真实素材按 ffprobe 的 r_frame_rate 给）")
+    ap.add_argument("--audio-file", default="",
+                    help="可选：再发一条 AAC 音频轨（给一个 ADTS .aac 文件）→ 验 RTSP 音视频")
     ap.add_argument("--loop", action="store_true",
                     help="发完一轮从头再来（时间戳继续；关键帧周期性出现，供 HLS 切片）")
     ap.add_argument("--delay-ms", type=int, default=0, help="PLAY 后延迟多少毫秒才开始发帧（排查用）")

@@ -69,7 +69,7 @@ const char *kUsage =
     "  --transcode-max <n> 同时最多几路源在转码（默认 nproc-1；0 不是「不限」，是非法）\n"
     "  --rtsp <url>[#name] 以 RTSP 为输入（可重复；name 缺省 rtsp1、rtsp2…，用 /live/<name>.flv 拉）\n"
     "  --rtsp-timeout-ms <n>  网络流读超时（默认 10000；> 这个时间没有包就判定断流）\n"
-    "  --rtsp-transport <t>   auto|tcp|udp（默认 auto = UDP 优先、被拒自动回退 TCP）\n"
+    "  --rtsp-transport <t>   tcp|auto|udp（默认 tcp = 交错传输、不丢包；auto = UDP 优先、被拒回退 TCP）\n"
     "  --hls-lease-ms <n>  HLS 拉流请求的租约（默认 60000；到期且没人拉就释放源，FR-1.3）\n"
     "  --log-level <l>     trace|debug|info|warn|error|fatal（默认 info）\n"
     "  --log-file <path>   日志文件（默认 logs/mzmedia.log，64MB×5 滚动；FR-6.2）\n"
@@ -357,8 +357,10 @@ int main(int argc, char **argv) {
     // 【M11-a】RTSP 输入：命令行注册"名字 → URL"（**绝不**从 URL query 取地址，避免 SSRF）
     bool rtsp_enabled = false;
     int rtsp_timeout_ms = 10000;
+    // 【M11-a2b】默认 **tcp**（交错传输，不丢包）：UDP 在实测里丢过 1080p 的分片、
+    // 也丢过音频轨（详见 docs/DESIGN_M11.md §5.3）；`auto`/`udp` 仍然可选
     DemuxerProducer::RtspConfig::Transport rtsp_transport =
-        DemuxerProducer::RtspConfig::Transport::Auto;
+        DemuxerProducer::RtspConfig::Transport::Tcp;
     std::vector<std::pair<std::string, std::string>> rtsp_sources; // (name, url)
     // 【M10-b / FR-7.1】转码：默认**关**（不带 --transcode 时行为与 v0.1 完全一致）
     bool transcode_allowed = false;
@@ -689,7 +691,8 @@ int main(int argc, char **argv) {
                 }
                 // 懒启动 / 复用：同一个文件 × 同一个转码规格 共享同一个源（一源多消费者）
                 const uint64_t rejected_before = manager->totalTranscodeRejected();
-                MediaSource::Ptr source = manager->acquire(path, spec);
+                // 【M11-a2b】RTSP 源把 `#name` 带下去：日志前缀与 /api/stats 里能对上命令行
+                MediaSource::Ptr source = manager->acquire(path, spec, is_rtsp ? name : std::string());
                 if (!source) {
                     // 被拒的两类原因分开报：**并发已满是"稍后再试"（503）**，
                     // 编码解不了 / 参数非法是"这个源不行"（500）。

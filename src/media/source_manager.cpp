@@ -118,7 +118,20 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path) {
     return acquire(path, TranscodeSpec{});
 }
 
-MediaSource::Ptr SourceManager::acquire(const std::string &path, const TranscodeSpec &spec) {
+void SourceManager::rememberNameLocked(Entry &entry, const std::string &label) {
+    if (label.empty()) {
+        return;
+    }
+    for (const auto &existing : entry.names) {
+        if (existing == label) {
+            return;
+        }
+    }
+    entry.names.push_back(label);
+}
+
+MediaSource::Ptr SourceManager::acquire(const std::string &path, const TranscodeSpec &spec,
+                                        const std::string &label) {
     if (path.empty()) {
         {
             std::lock_guard<std::mutex> lock(_mutex);
@@ -142,6 +155,7 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path, const Transcode
                 entry->idle_task->cancel();
                 entry->idle_task.reset();
             }
+            rememberNameLocked(*entry, label); // 复用路上也要记名字（第二个名字就是从这里来的）
             ++entry->handles;
             ++_handles;
             ++_total_reused;
@@ -167,11 +181,16 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path, const Transcode
     fresh->key = key;
     fresh->file = path;
     fresh->spec = spec;
+    rememberNameLocked(*fresh, label);
     // 转码规格就地并进解封装配置：producer 是**唯一**知道怎么转的那一层
     DemuxerProducer::Config producer_config = config.producer;
     // 【M11-a】网络源用**自己的超时档**：一次读超过 rtsp.timeout_ms 没有包 = 断流。
     // 本地文件沿用原来的 5s（读磁盘不会"静默"这么久；网络会）。
     producer_config.rtsp = config.rtsp;
+    // 【M11-a2b】名字进 producer → 日志前缀（`SourceSession[cam1]`）与 stats
+    if (!label.empty()) {
+        producer_config.rtsp.label = label;
+    }
     if (isNetworkMediaUrl(path) && config.rtsp.timeout_ms > 0) {
         producer_config.demux.read_timeout_ms = config.rtsp.timeout_ms;
         // 打开（DESCRIBE/SETUP/PLAY + find_stream_info）也要给足时间：实测一步就要 1.1 s
@@ -240,6 +259,7 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path, const Transcode
             ++existing->handles;
             ++_handles;
             ++_total_reused;
+            rememberNameLocked(*existing, label);
             stopEntry(fresh); // 我们多建的那份作废（停线程很快：中止标志会打断读）
             return makeHandle(existing);
         }
@@ -249,7 +269,9 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path, const Transcode
         ++_total_created;
     }
 
-    InfoL << "源已创建（懒启动）：" << redactMediaUrl(key); // FR-6.3：关键事件（源创建）必须落日志
+    // FR-6.3：关键事件（源创建）必须落日志。【M11-a2b】带入口名，多路 RTSP 才分得清谁是谁
+    InfoL << "源已创建（懒启动）：" << (label.empty() ? "" : "[" + label + "] ")
+          << redactMediaUrl(key);
     return makeHandle(fresh);
 }
 
@@ -599,6 +621,7 @@ std::string SourceManager::dumpStatsJson() const {
     struct SnapshotItem {
         std::string key;  // map 键（转码源带 `|h=720` 这类后缀）
         std::string file; // 真实文件路径（给人看的）
+        std::vector<std::string> names; // 【M11-a2b】入口名（RTSP 的 #name）
         MediaSource::Ptr source;
         std::shared_ptr<DemuxerProducer> producer;
     };
@@ -626,6 +649,7 @@ std::string SourceManager::dumpStatsJson() const {
             SnapshotItem item;
             item.key = kv.first;
             item.file = kv.second->file;
+            item.names = kv.second->names;
             item.source = kv.second->source;
             item.producer = kv.second->producer;
             if (item.source) {
@@ -645,6 +669,17 @@ std::string SourceManager::dumpStatsJson() const {
         out += "{\"path\":\"" + jsonEscape(redactMediaUrl(item.file)) + "\",\"key\":\"" +
                jsonEscape(redactMediaUrl(item.key)) +
                "\"," + item.source->dumpStatsJson();
+        // 【M11-a2b】入口名：RTSP 的 `#name`（一个源可能被多个名字共享，见 `Entry::names`）
+        if (!item.names.empty()) {
+            out += ",\"names\":[";
+            for (size_t i = 0; i < item.names.size(); ++i) {
+                if (i != 0) {
+                    out += ",";
+                }
+                out += "\"" + jsonEscape(item.names[i]) + "\"";
+            }
+            out += "]";
+        }
         // M6-c：把"输入侧"的信息也带上（解码/循环/Annex-B 是否发生，一眼能看出来）
         if (item.producer) {
             const DemuxerProducer &p = *item.producer;

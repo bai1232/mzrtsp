@@ -42,6 +42,10 @@ public:
         Demuxer::Limits demux; ///< 流数 / 单包 / open 与 read 超时
         /// 循环重开（M6-c）：读到文件尾把文件重新打开，时间戳接着往后接
         bool loop = false;
+        /// 【M11-a2b】日志里给人看的名字（命令行 `--rtsp <url>#<name>` 的 name）
+        /// @note 空 = 退回脱敏后的 URL。**只影响可读性**，不参与任何判断
+        ///       （名字由命令行校验过 `[A-Za-z0-9_.-]`，所以不会带来注入/转义问题）
+        std::string label;
     };
 
     /// 【M11-a2】网络源的断流重连（本地文件不用）
@@ -81,6 +85,10 @@ public:
     /// 源是不是网络源（`rtsp://` / `rtsps://`）：上层据此决定"要不要前置校验 SPS/PPS"
     bool network() const {
         return _network;
+    }
+    /// 日志/stats 里给人看的名字（没配 label 时为空字符串）
+    const std::string &label() const {
+        return _label;
     }
     /// 关闭（幂等）；@return false = 本来就没打开
     bool close();
@@ -225,6 +233,9 @@ private:
     Config _config;
     Demuxer _demux;
     std::string _path;
+    std::string _label; ///< 给人看的名字（空 = 用脱敏 URL）
+    /// 日志里用的显示名：有 label 用 label，否则用脱敏后的 URL（**绝不**用带密码的原文）
+    std::string displayName() const;
     mutable std::mutex _mutex; // 保护 _last_error
     std::string _last_error;
 
