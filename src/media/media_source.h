@@ -208,6 +208,11 @@ public:
     /// 广播"不会再有数据了"；@return true = 状态发生改变。**可在任意线程调用**
     bool endOfStream();
 
+    /// 源是否已经写完（不再有数据）。**可在任意线程调用**
+    /// @note 【M10-b】转码并发上限用它判断"这一路还在干活吗"：播完的源不再吃 CPU，
+    ///       不该继续占着一个转码名额（否则一次拉流就会永久占死名额）
+    bool ended() const;
+
     /// **源线程**：推进一帧（喂 GOP 缓存 → 分发给所有订阅者 → 锁外唤醒）
     PushStats pushPacket(MediaPacket::Ptr packet);
 

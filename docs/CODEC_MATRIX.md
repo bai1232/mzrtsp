@@ -44,7 +44,7 @@
 | 2 | MP4 | H264 | 无 | ✅ **REMUX** | 纯视频 FLV，仅需 AVC sequence header |
 | 3 | MP4 | H264 | MP3 | ✅ **REMUX** | FLV 支持 MP3 |
 | 4 | H264 裸流 | H264 (Annex-B) | 无 | ✅ **REPACK** | 需从流中提取 SPS/PPS，并**把 Annex-B 起始码转成 AVCC 长度前缀** |
-| 5 | MP4 | **HEVC** | AAC | ❌ 不支持 | 浏览器播不了 → 转码为 H264（v0.2）或**返回 415** |
+| 5 | MP4 | **HEVC** | AAC | ⚠ 需转码 | 浏览器播不了 → **不转码 = 415**；`?transcode=1` 时解码重编成 H264（**M10-b ✅**，实测 h264 160x120、`ffmpeg` 零 error）。HEVC 的 Annex-B 裸流（TS）仍明确拒绝 |
 | 6 | MP4 | MPEG-4 Part 2 | AAC | ❌ 不支持 | FLV 不支持 → 转码或拒绝 |
 | 7 | 任意 | — | 仅音频 | ✅ 可播 | FLV 纯音频流；须在 SDP/响应中正确标识 |
 
@@ -55,7 +55,7 @@
 | 1 | MP4 (H264+AAC) | ✅ **REMUX** | 音视频分别转 ADTS 与 Annex-B 后写入 TS |
 | 2 | MP4 (H264+AAC) 已有 ADTS | ✅ **REMUX** | 直接进 TS |
 | 3 | H264 裸流 | ✅ **REPACK** | 补 SPS/PPS、每帧打 90kHz PTS/DTS |
-| 4 | 任意 HEVC | ❌ 不支持 | 与 FLV 同理（且本项目不做 H265） |
+| 4 | 任意 HEVC | ⚠ 需转码（TS 裸流仍 ❌） | 与 FLV 同理：可播编码只有 H264；M10-b 起 `?transcode=1` 可解 HEVC 再编 H264（需要 hvcC 初始化数据，TS 的 Annex-B 不构造 hvcC → 拒绝） |
 
 ## 5. 需要特别注意的转换点（易踩坑）
 

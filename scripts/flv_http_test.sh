@@ -9,7 +9,9 @@
 #   ④ NFR-1 首帧 < 1s（用"文件长到 2KB"近似首帧到达，见 §4 的说明）；
 #   ⑤ 边界：路径穿越 / 不存在的源 / 非法扩展名 / 断开后回收（NFR-6）；
 #   ⑥ `--loop` 真的循环（拉 3 秒 @4x 应得到约 12 秒媒体时长，且时间戳不回退）；
-#   ⑦ **源结束后再拉同一路会立刻结束**（M6-c 修的 bug：曾经会一直挂着不动）。
+#   ⑦ **源结束后再拉同一路会立刻结束**（M6-c 修的 bug：曾经会一直挂着不动）；
+#   ⑧ 【M10-b】转码：开关语义（未开 → 501，不降级）、参数校验（未知参数 400）、
+#      缩放（320x240 → 160x120）、HEVC → H264、并发上限（503）、stats 的 speed ≥ 1.0。
 #
 # 每个阶段用**各自的媒体文件**（复制到临时目录）：源的 EOS 与 GOP 缓存有状态，
 # 共用一份会被前一步的"读完了"影响，测出来的东西就不是这一阶段想测的了。
@@ -25,6 +27,7 @@ SAMPLE="$ROOT/samples/sample.mp4"
 RAW_SAMPLE="$ROOT/samples/sample.h264"
 MKV_SAMPLE="$ROOT/samples/sample.mkv"   # M8 / FR-2.2
 TS_SAMPLE="$ROOT/samples/sample.ts"     # M8：AAC 在 TS 里是 ADTS
+HEVC_SAMPLE="$ROOT/samples/sample_hevc.mp4"  # M10-b：HEVC 源（缺 libx265 时不存在 → 用例跳过）
 FLVJS="$ROOT/third_party/flv.js/flv.min.js"
 
 MEDIA_DIR="/tmp/mzmedia_acc_media"
@@ -38,10 +41,15 @@ PAGE="/tmp/mzmedia_page.html"
 FLVJS_OUT="/tmp/mzmedia_flvjs.js"
 TTFB_OUT="/tmp/mzmedia_ttfb.flv"
 TTFB_INFO="/tmp/mzmedia_ttfb.txt"
+OUT_TX="/tmp/mzmedia_flv_http_tx.flv"
+OUT_TX_HEVC="/tmp/mzmedia_flv_http_tx_hevc.flv"
+TX_STATS="/tmp/mzmedia_flv_http_tx_stats.json"
 SRV_LOG="/tmp/mzmedia_flv_http_server.log"
 LOOP_LOG="/tmp/mzmedia_flv_http_loop_server.log"
+TRANS_LOG="/tmp/mzmedia_flv_http_transcode_server.log"
 PORT=$(( (RANDOM % 3000) + 21000 ))
 LOOP_PORT=$(( PORT + 1 ))
+TRANS_PORT=$(( PORT + 2 ))
 
 [ -x "$SERVER" ] || { echo "错误：找不到 $SERVER，先执行 cmake --build build" >&2; exit 1; }
 [ -f "$SAMPLE" ] || { echo "错误：找不到样本，先执行 ./scripts/make_samples.sh" >&2; exit 1; }
@@ -95,12 +103,16 @@ cp "$TS_SAMPLE" "$MEDIA_DIR/clip.ts"      # §3b（AAC 是 ADTS）
 
 SRV_PID=""
 LOOP_PID=""
+TRANS_PID=""
 cleanup() {
     if [ -n "$SRV_PID" ]; then
         kill -INT "$SRV_PID" 2> /dev/null || true
     fi
     if [ -n "$LOOP_PID" ]; then
         kill -INT "$LOOP_PID" 2> /dev/null || true
+    fi
+    if [ -n "$TRANS_PID" ]; then
+        kill -INT "$TRANS_PID" 2> /dev/null || true
     fi
     wait 2> /dev/null || true
 }
@@ -369,7 +381,8 @@ subs="$(curl -s --max-time 3 "http://127.0.0.1:$PORT/api/stats" | tr -d ' ' | gr
 check "断开后订阅者已回收（subscribers）" "${subs:-x}" "0"
 # FR-6.1：媒体层统计确实拼进了 /api/stats（含 M6-c 的 Annex-B 与循环字段）
 stats="$(curl -s --max-time 3 "http://127.0.0.1:$PORT/api/stats" || true)"
-for key in '"source_manager"' '"media_sources"' '"producer"' '"annex_b_packets"' '"idle_deferred"'; do
+for key in '"source_manager"' '"media_sources"' '"producer"' '"annex_b_packets"' '"idle_deferred"' \
+    '"max_transcoding"'; do
     if printf '%s' "$stats" | grep -q -- "$key"; then
         check_true "/api/stats 含 $key"
     else
@@ -442,12 +455,153 @@ else
     fi
 fi
 
+echo "== 10) 转码（M10-b / FR-7.1）：开关语义 / 参数校验 =="
+# 主实例**没有** --transcode：带转码参数必须 501。**绝不能静默降级成直通** ——
+# 那会让用户以为"转过了"，实际拿到的还是原始码流（最贵的一类假成功）。
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/live/movie.flv?transcode=1")"
+check "未开转码时 ?transcode=1 → 501" "$code" "501"
+body="$(curl -s --max-time 5 "http://127.0.0.1:$PORT/live/movie.flv?transcode=1" || true)"
+if printf '%s' "$body" | grep -q -- '--transcode'; then
+    check_true "501 的提示里给出了「怎么开」"
+else
+    check_false_msg "501 的提示里给出了「怎么开」" "$body"
+fi
+# 参数校验：**未知参数一律 400**（拼错的参数静默忽略最难查）
+for q in 'h=120' 'transcode=abc' 'transcode=1&h=121' 'transcode=1&h=64' 'transcode=1&h=9999' \
+    'foo=1' 'transcode=1&transcode=1'; do
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/live/movie.flv?$q")"
+    check "非法查询参数 ?${q} → 400" "$code" "400"
+done
+# HLS 不接受转码参数（转码 + HLS 属 M10-c）：**明确拒绝**，不是"看起来生效了"
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/hls/movie.m3u8?transcode=1")"
+check "HLS + 转码参数 → 400（属 M10-c）" "$code" "400"
+
+echo "== 11) 转码（M10-b / NFR-5）：缩放 / HEVC → H264 / 并发上限 / speed =="
+cp "$SAMPLE" "$MEDIA_DIR/tx.mp4"    # 转码用（会被拉两次：默认上限 + 显式 h）
+cp "$SAMPLE" "$MEDIA_DIR/tx2.mp4"   # 并发上限用例要"第二路转码源"
+if [ -f "$HEVC_SAMPLE" ]; then
+    cp "$HEVC_SAMPLE" "$MEDIA_DIR/hevc.mp4"
+fi
+# --speed 0.25：2 秒样本拉成 8 秒，给"并发上限"用例留出时间窗
+"$SERVER" --port "$TRANS_PORT" --media-root "$MEDIA_DIR" --transcode --transcode-height 120 \
+    --transcode-max 1 --speed 0.25 > "$TRANS_LOG" 2>&1 &
+TRANS_PID=$!
+ready=no
+for _ in $(seq 1 80); do
+    if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$TRANS_PORT/api/stats"; then
+        ready=yes
+        break
+    fi
+    sleep 0.1
+done
+if [ "$ready" != yes ]; then
+    check_false_msg "转码实例就绪" "$(cat "$TRANS_LOG")"
+else
+    # 11.1 `?transcode=1`（不给 h）：把 --transcode-height 当**上限** → 320x240 缩到 160x120
+    code="$(curl -s -o "$OUT_TX" -w '%{http_code}' --max-time 20 \
+        "http://127.0.0.1:$TRANS_PORT/live/tx.mp4.flv?transcode=1")"
+    check "?transcode=1 → 200" "$code" "200"
+    check "转码后宽" "$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$OUT_TX")" "160"
+    check "转码后高" "$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT_TX")" "120"
+    check "转码后视频编码" "$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$OUT_TX")" "h264"
+    check "音频仍透传（aac）" "$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$OUT_TX")" "aac"
+    tx_frames="$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$OUT_TX")"
+    check_range "转码后视频帧数（源 50）" "${tx_frames:-0}" 48 52
+    if [ -z "$(ffmpeg -v error -i "$OUT_TX" -f null - 2>&1 > /dev/null || true)" ]; then
+        check_true "转码流完整解码无 error"
+    else
+        check_false_msg "转码流完整解码无 error" "$(ffmpeg -v error -i "$OUT_TX" -f null - 2>&1 > /dev/null || true)"
+    fi
+    # 时间戳单调（转码器自己生成 CFR 时间轴，跨包不能回退）
+    if ffprobe -v error -show_entries packet=dts_time -of csv=p=0 -select_streams v:0 "$OUT_TX" \
+        | awk 'NF && $1 != "N/A" { if (last != "" && $1 + 0 <= last) { bad = 1 } last = $1 + 0 } END { exit bad }'; then
+        check_true "转码流 dts 严格递增"
+    else
+        check_false_msg "转码流 dts 严格递增" "出现回退/重复"
+    fi
+    # 11.2 显式 h=120 与默认上限等价（同一个源键 → 复用）
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+        "http://127.0.0.1:$TRANS_PORT/live/tx.mp4.flv?transcode=1&h=120")"
+    check "?transcode=1&h=120 → 200" "$code" "200"
+    # 11.3 HEVC：不转码必须 415；转码后是 H264
+    if [ -f "$MEDIA_DIR/hevc.mp4" ]; then
+        code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+            "http://127.0.0.1:$TRANS_PORT/live/hevc.mp4.flv")"
+        check "HEVC 源不转码 → 415" "$code" "415"
+        code="$(curl -s -o "$OUT_TX_HEVC" -w '%{http_code}' --max-time 20 \
+            "http://127.0.0.1:$TRANS_PORT/live/hevc.mp4.flv?transcode=1")"
+        check "HEVC 源 ?transcode=1 → 200" "$code" "200"
+        check "HEVC → H264（编码）" \
+            "$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$OUT_TX_HEVC")" \
+            "h264"
+        check "HEVC → H264（高）" \
+            "$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT_TX_HEVC")" "120"
+        if [ -z "$(ffmpeg -v error -i "$OUT_TX_HEVC" -f null - 2>&1 > /dev/null || true)" ]; then
+            check_true "HEVC 转码产物完整解码无 error"
+        else
+            check_false_msg "HEVC 转码产物完整解码无 error" \
+                "$(ffmpeg -v error -i "$OUT_TX_HEVC" -f null - 2>&1 > /dev/null || true)"
+        fi
+    else
+        echo "  ~ 跳过 HEVC 用例（samples/sample_hevc.mp4 不存在：本机 FFmpeg 缺 libx265）"
+    fi
+    # 11.4 并发上限（--transcode-max 1）：第一路**正在转**时，第二路必须 503 且**不降级**
+    # 用一份新文件（tx3.mp4）：它的源键是新的，且 @0.25x 能持续约 8 秒，足够让第二路撞上上限。
+    # 注意别复用 tx.mp4 —— 它已经播完（EOS），不再占名额，那是**刻意**的行为（见 SourceManager 的注释）
+    cp "$SAMPLE" "$MEDIA_DIR/tx3.mp4"
+    curl -s -o /dev/null --max-time 25 "http://127.0.0.1:$TRANS_PORT/live/tx3.mp4.flv?transcode=1" &
+    HOLD_PID=$!
+    sleep 1
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+        "http://127.0.0.1:$TRANS_PORT/live/tx2.mp4.flv?transcode=1")"
+    wait "$HOLD_PID" 2> /dev/null || true
+    check "转码并发已满时第二路 → 503" "$code" "503"
+    # 11.5 stats：transcode 块 + speed（FR-6.1 的"实时倍数"）
+    curl -s --max-time 3 "http://127.0.0.1:$TRANS_PORT/api/stats" > "$TX_STATS"
+    tx_speed="$(python3 - "$TX_STATS" << 'PYSTATS'
+import json, sys
+d = json.load(open(sys.argv[1]))
+speeds = [s["producer"]["transcode"]["speed"]
+          for s in d.get("media_sources", [])
+          if s.get("producer", {}).get("transcode", {}).get("enabled")]
+print("%.2f" % max(speeds) if speeds else "0.00")
+PYSTATS
+)"
+    if awk -v v="$tx_speed" 'BEGIN { exit !(v >= 1.0) }'; then
+        printf '  ✔ %-34s speed=%s（要求 ≥1.0）\n' "转码实时倍数（NFR-5）" "$tx_speed"
+        pass=$((pass + 1))
+    else
+        check_false_msg "转码实时倍数（NFR-5）" "speed=${tx_speed:-0} 期望 ≥1.0"
+    fi
+    tx_json="$(python3 - "$TX_STATS" << 'PYSTATS'
+import json, sys
+d = json.load(open(sys.argv[1]))
+sm = d.get("source_manager", {})
+blocks = [s["producer"]["transcode"] for s in d.get("media_sources", [])
+          if s.get("producer", {}).get("transcode", {}).get("enabled")]
+b = blocks[0] if blocks else {}
+print("max=%s rejected=%s in_hevc=%s out=%sx%s cost_ms=%s" % (
+    sm.get("max_transcoding"), sm.get("transcode_rejected"),
+    any(x.get("in_hevc") for x in blocks), b.get("out_width"), b.get("out_height"),
+    b.get("cost_ms")))
+PYSTATS
+)"
+    # 至少有一路 in_hevc=true（跑过 HEVC→H264）且并发被拒过 1 次
+    if printf '%s' "$tx_json" | grep -q 'max=1' && printf '%s' "$tx_json" | grep -q 'rejected=[1-9]'; then
+        printf '  ✔ %-34s %s\n' "stats：并发上限与拒绝计数" "$tx_json"
+        pass=$((pass + 1))
+    else
+        check_false_msg "stats：并发上限与拒绝计数" "$tx_json"
+    fi
+fi
+
 echo "------------------------------------------------------------------------"
 echo "结果：通过 $pass 项 / 失败 $fail 项"
-echo "  产物：$OUT / $OUT_RAW / $OUT_LOOP / $OUT_LATE"
-echo "  日志：$SRV_LOG / $LOOP_LOG"
+echo "  产物：$OUT / $OUT_RAW / $OUT_LOOP / $OUT_LATE / $OUT_TX"
+echo "  日志：$SRV_LOG / $LOOP_LOG / $TRANS_LOG"
 if [ "$fail" -gt 0 ]; then
     echo "结论：M6-c 未通过"
     exit 1
 fi
-echo "结论：M6-c 通过（播放页 + flv.js 可取；MP4 与 H264 裸流都能拉出合法 FLV；循环推流生效；源结束后不挂连接）"
+echo "结论：M6-c + M10-b 通过（播放页/flv.js、MP4 与裸流与 MKV/TS 都能拉出合法 FLV；循环推流生效；"\
+"源结束后不挂连接；转码的开关语义/缩放/HEVC→H264/并发上限/speed 均生效）"

@@ -947,3 +947,36 @@ MZ_TEST(ffmpeg_aac_raw_to_adts_roundtrip) {
     MZ_ASSERT_FALSE(buildAdtsHeader(1, 13, 1, 10, header7));   // 表外采样率索引
     MZ_ASSERT_FALSE(buildAdtsHeader(1, 4, 0, 10, header7));    // channel_configuration = 0（PCE）
 }
+
+MZ_TEST(ffmpeg_codec_matrix_transcode_branch_needs_real_capability) {
+    // 【M10-b】HEVC → FLV 不是"永远不行"也不是"永远能转"：取决于**本机能力**
+    //   · 没有 HEVC 解码器 / 没有 H264 编码器 → Unsupported（旧的冻结行为）
+    //   · 两者都有 → Transcode（M10-b 的转码路径）
+    TranscodeCaps none;
+    MZ_ASSERT_EQ(static_cast<int>(decideOutput(AV_CODEC_ID_HEVC, AV_CODEC_ID_AAC, "flv", none)),
+                 static_cast<int>(CopyOrTranscode::Unsupported));
+
+    TranscodeCaps only_decode;
+    only_decode.hevc_decode = true;
+    MZ_ASSERT_EQ(
+        static_cast<int>(decideOutput(AV_CODEC_ID_HEVC, AV_CODEC_ID_AAC, "flv", only_decode)),
+        static_cast<int>(CopyOrTranscode::Unsupported));
+
+    TranscodeCaps both;
+    both.hevc_decode = true;
+    both.h264_encode = true;
+    MZ_ASSERT_TRUE(both.hevc_to_h264());
+    MZ_ASSERT_EQ(static_cast<int>(decideOutput(AV_CODEC_ID_HEVC, AV_CODEC_ID_AAC, "flv", both)),
+                 static_cast<int>(CopyOrTranscode::Transcode));
+
+    // H264 源不受"能力"影响：有转码能力也仍是 Remux（不转码就别乱转）
+    MZ_ASSERT_EQ(static_cast<int>(decideOutput(AV_CODEC_ID_H264, AV_CODEC_ID_AAC, "flv", both)),
+                 static_cast<int>(CopyOrTranscode::Remux));
+
+    // 本机探测出来的能力：与真实 avcodec 一致（这台机器上 libx264 + hevc 解码器都有）
+    const TranscodeCaps real = detectTranscodeCaps();
+    MZ_ASSERT_TRUE(real.h264_encode);
+    MZ_ASSERT_EQ(static_cast<int>(decideOutput(AV_CODEC_ID_HEVC, AV_CODEC_ID_AAC, "flv", real)),
+                 static_cast<int>(real.hevc_to_h264() ? CopyOrTranscode::Transcode
+                                                      : CopyOrTranscode::Unsupported));
+}

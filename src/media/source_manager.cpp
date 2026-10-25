@@ -14,6 +14,7 @@
 #include "core/logger.h"
 #include "core/util.h"
 
+#include <cstdio>
 #include <utility>
 #include <vector>
 
@@ -70,6 +71,12 @@ bool SourceManager::setConfig(const Config &config) {
     if (!probe.setLimits(config.source)) {
         return false;
     }
+    // 【M10-b】转码并发上限：0 不是"不限"（那会把机器打满），而是一个必须显式设定的硬上限
+    if (config.max_transcoding == 0 || config.max_transcoding > kHardMaxTranscoding) {
+        WarnL << "SourceManager::setConfig 被拒：max_transcoding=" << config.max_transcoding
+              << " 不在 [1, " << kHardMaxTranscoding << "]（0 = 不是「不限」）";
+        return false;
+    }
     std::lock_guard<std::mutex> lock(_mutex);
     _config = config;
     if (!_poller) {
@@ -83,7 +90,35 @@ SourceManager::Config SourceManager::config() const {
     return _config;
 }
 
+std::string SourceManager::TranscodeSpec::describe() const {
+    if (!enabled) {
+        return {}; // 不转码：源键就是文件路径（与 v0.1 完全一致）
+    }
+    std::string out;
+    if (out_height > 0) {
+        out = "h=" + std::to_string(out_height);
+    } else if (max_height > 0) {
+        out = "auto=" + std::to_string(max_height);
+    } else {
+        out = "src"; // 只重编码（分辨率不变）
+    }
+    if (out_bitrate_kbps > 0) {
+        out += "/b=" + std::to_string(out_bitrate_kbps);
+    }
+    return out;
+}
+
+std::string SourceManager::sourceKey(const std::string &path, const TranscodeSpec &spec) {
+    const std::string desc = spec.describe();
+    return desc.empty() ? path : path + "|" + desc;
+}
+
 MediaSource::Ptr SourceManager::acquire(const std::string &path) {
+    // 直通源：就是"不带转码规格"的那一档（v0.1 的行为完全不变）
+    return acquire(path, TranscodeSpec{});
+}
+
+MediaSource::Ptr SourceManager::acquire(const std::string &path, const TranscodeSpec &spec) {
     if (path.empty()) {
         {
             std::lock_guard<std::mutex> lock(_mutex);
@@ -93,11 +128,13 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path) {
         WarnL << "SourceManager::acquire 被拒：path 为空";
         return nullptr;
     }
+    // 同一个文件 × 同一个转码规格 = 同一个源；不同规格 = **两个独立的源**（各自解封装）
+    const std::string key = sourceKey(path, spec);
 
     Config config;
     {
         std::lock_guard<std::mutex> lock(_mutex);
-        const auto it = _entries.find(path);
+        const auto it = _entries.find(key);
         if (it != _entries.end()) {
             const auto &entry = it->second;
             // 复用：取消空闲计时（cancel 只写一个 atomic，任意线程可调）
@@ -111,12 +148,32 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path) {
             return makeHandle(entry);
         }
         config = _config;
+        // 【M10-b / FR-1.3】**并发上限在锁内判**：否则两个请求同时通过检查 → 超限
+        if (spec.enabled) {
+            const size_t running = transcodingCountLocked();
+            if (running >= config.max_transcoding) {
+                _last_error = "转码并发已满（正在转码 " + std::to_string(running) + "/" +
+                              std::to_string(config.max_transcoding) +
+                              " 路）——不降级成直通（那会给出一路「没转」的流）";
+                ++_total_transcode_rejected;
+                WarnL << "SourceManager::acquire 被拒：" << key << " → " << _last_error;
+                return nullptr;
+            }
+        }
     }
 
     // ---- 懒启动：IO 一律在锁外做 ----
     auto fresh = std::make_shared<Entry>();
-    fresh->path = path;
-    fresh->producer = std::make_shared<DemuxerProducer>(config.producer);
+    fresh->key = key;
+    fresh->file = path;
+    fresh->spec = spec;
+    // 转码规格就地并进解封装配置：producer 是**唯一**知道怎么转的那一层
+    DemuxerProducer::Config producer_config = config.producer;
+    producer_config.transcode.enabled = spec.enabled;
+    producer_config.transcode.out_height = spec.out_height;
+    producer_config.transcode.max_height = spec.max_height;
+    producer_config.transcode.out_bitrate_kbps = spec.out_bitrate_kbps;
+    fresh->producer = std::make_shared<DemuxerProducer>(producer_config);
     if (!fresh->producer->open(path)) {
         const std::string reason = fresh->producer->lastError();
         {
@@ -124,7 +181,7 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path) {
             _last_error = reason;
         }
         ++_total_acquire_rejected;
-        WarnL << "SourceManager::acquire 失败（不注册源）：" << path << " → " << reason;
+        WarnL << "SourceManager::acquire 失败（不注册源）：" << key << " → " << reason;
         return nullptr;
     }
 
@@ -137,7 +194,7 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path) {
             _last_error = reason;
         }
         ++_total_acquire_rejected;
-        WarnL << "SourceManager::acquire 失败（不注册源）：" << reason;
+        WarnL << "SourceManager::acquire 失败（不注册源）：" << key << " → " << reason;
         return nullptr;
     }
     // 把"要停了"接进 FFmpeg 的 interrupt_callback：stop() 才能真正打断 av_read_frame
@@ -156,14 +213,14 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path) {
             _last_error = "源线程启动失败";
         }
         ++_total_acquire_rejected;
-        WarnL << "SourceManager::acquire 失败：源线程启动失败（" << path << "）";
+        WarnL << "SourceManager::acquire 失败：源线程启动失败（" << key << "）";
         return nullptr;
     }
 
     {
         std::lock_guard<std::mutex> lock(_mutex);
         // 双重检查：open 期间可能已经有人把同一个 path 建好了（那条路也要走复用）
-        const auto it = _entries.find(path);
+        const auto it = _entries.find(key);
         if (it != _entries.end()) {
             const auto &existing = it->second;
             if (existing->idle_task) {
@@ -178,20 +235,26 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path) {
         }
         ++fresh->handles;
         ++_handles;
-        _entries[path] = fresh;
+        _entries[key] = fresh;
         ++_total_created;
     }
 
-    InfoL << "源已创建（懒启动）：" << path; // FR-6.3：关键事件（源创建）必须落日志
+    InfoL << "源已创建（懒启动）：" << key; // FR-6.3：关键事件（源创建）必须落日志
     return makeHandle(fresh);
 }
 
 SourceManager::MuxerStreams SourceManager::muxerStreamsFor(const std::string &path) const {
+    return muxerStreamsFor(path, TranscodeSpec{});
+}
+
+SourceManager::MuxerStreams SourceManager::muxerStreamsFor(const std::string &path,
+                                                           const TranscodeSpec &spec) const {
     MuxerStreams out;
+    const std::string key = sourceKey(path, spec);
     std::shared_ptr<DemuxerProducer> producer;
     {
         std::lock_guard<std::mutex> lock(_mutex);
-        const auto it = _entries.find(path);
+        const auto it = _entries.find(key);
         if (it == _entries.end()) {
             return out; // 没有这个源：两路都是 nullptr
         }
@@ -214,19 +277,19 @@ MediaSource::Ptr SourceManager::makeHandle(const std::shared_ptr<Entry> &entry) 
     MediaSource::Ptr keep = entry->source;
     MediaSource *raw = keep.get();
     std::weak_ptr<SourceManager> weak_self = weak_from_this();
-    const std::string path = entry->path;
-    return MediaSource::Ptr(raw, [weak_self, path, keep](MediaSource *) {
+    const std::string key = entry->key;
+    return MediaSource::Ptr(raw, [weak_self, key, keep](MediaSource *) {
         if (auto self = weak_self.lock()) {
-            self->onHandleReleased(path);
+            self->onHandleReleased(key);
         }
     });
 }
 
-void SourceManager::onHandleReleased(const std::string &path) {
+void SourceManager::onHandleReleased(const std::string &key) {
     uint32_t idle_ms = 0;
     {
         std::lock_guard<std::mutex> lock(_mutex);
-        const auto it = _entries.find(path);
+        const auto it = _entries.find(key);
         if (it == _entries.end()) {
             return; // 已经被释放（例如 releaseAll）→ 生命周期交给句柄里的 keep
         }
@@ -245,7 +308,7 @@ void SourceManager::onHandleReleased(const std::string &path) {
 
     if (idle_ms == 0 || !_poller) {
         // 不缓存模式：**仍然要守住"有订阅者在看就不释放"**（M6-c 修的 bug，见 tryIdleRelease）
-        if (!tryIdleRelease(path, idle_ms)) {
+        if (!tryIdleRelease(key, idle_ms)) {
             return; // 还有订阅者：已安排复查，等它走
         }
         return;
@@ -253,25 +316,25 @@ void SourceManager::onHandleReleased(const std::string &path) {
 
     // 计时器只能在轮询线程挂 → 投递过去；本就在轮询线程时 async 会内联执行
     std::weak_ptr<SourceManager> weak_self = weak_from_this();
-    const bool posted = _poller->async([weak_self, path] {
+    const bool posted = _poller->async([weak_self, key] {
         if (auto self = weak_self.lock()) {
-            self->armIdleTimer(path);
+            self->armIdleTimer(key);
         }
     });
     if (!posted) {
         // poller 已退出：**绝不能静默"永不释放"**（那就是泄漏）→ 退化为立即释放
         // （poller 都没了 = 正在关停，"保证观看"已无意义，所以这里不看订阅者）
         ++_total_idle_schedule_failed;
-        WarnL << "SourceManager：poller 已退出，源 " << path << " 退化为立即释放";
-        releaseEntry(path, true);
+        WarnL << "SourceManager：poller 已退出，源 " << key << " 退化为立即释放";
+        releaseEntry(key, true);
     }
 }
 
-void SourceManager::armIdleTimer(const std::string &path) {
+void SourceManager::armIdleTimer(const std::string &key) {
     uint32_t idle_ms = 0;
     {
         std::lock_guard<std::mutex> lock(_mutex);
-        const auto it = _entries.find(path);
+        const auto it = _entries.find(key);
         if (it == _entries.end()) {
             return; // 已被释放
         }
@@ -283,26 +346,26 @@ void SourceManager::armIdleTimer(const std::string &path) {
     }
 
     if (idle_ms == 0 || !_poller) {
-        (void) tryIdleRelease(path, idle_ms); // 同样要守住"有订阅者在看就不释放"
+        (void) tryIdleRelease(key, idle_ms); // 同样要守住"有订阅者在看就不释放"
         return;
     }
 
     std::weak_ptr<SourceManager> weak_self = weak_from_this();
-    EventPoller::DelayTask::Ptr task = _poller->doDelayTask(idle_ms, [weak_self, path]() -> uint64_t {
+    EventPoller::DelayTask::Ptr task = _poller->doDelayTask(idle_ms, [weak_self, key]() -> uint64_t {
         if (auto self = weak_self.lock()) {
-            self->onIdleTimeout(path);
+            self->onIdleTimeout(key);
         }
         return 0; // 一次性
     });
     if (!task) {
         ++_total_idle_schedule_failed;
-        WarnL << "SourceManager：定时器被拒（poller 已退出），源 " << path << " 立即释放";
-        releaseEntry(path, true);
+        WarnL << "SourceManager：定时器被拒（poller 已退出），源 " << key << " 立即释放";
+        releaseEntry(key, true);
         return;
     }
 
     std::lock_guard<std::mutex> lock(_mutex);
-    const auto it = _entries.find(path);
+    const auto it = _entries.find(key);
     if (it == _entries.end()) {
         task->cancel(); // 挂表期间被释放
         return;
@@ -310,11 +373,11 @@ void SourceManager::armIdleTimer(const std::string &path) {
     it->second->idle_task = task;
 }
 
-void SourceManager::onIdleTimeout(const std::string &path) {
+void SourceManager::onIdleTimeout(const std::string &key) {
     uint32_t idle_ms = 0;
     {
         std::lock_guard<std::mutex> lock(_mutex);
-        const auto it = _entries.find(path);
+        const auto it = _entries.find(key);
         if (it == _entries.end()) {
             return;
         }
@@ -325,23 +388,23 @@ void SourceManager::onIdleTimeout(const std::string &path) {
         it->second->idle_task.reset();
         idle_ms = _config.idle_release_ms;
     }
-    (void) tryIdleRelease(path, idle_ms);
+    (void) tryIdleRelease(key, idle_ms);
 }
 
-std::shared_ptr<SourceManager::Entry> SourceManager::findEntry(const std::string &path) const {
+std::shared_ptr<SourceManager::Entry> SourceManager::findEntry(const std::string &key) const {
     std::lock_guard<std::mutex> lock(_mutex);
-    const auto it = _entries.find(path);
+    const auto it = _entries.find(key);
     return it == _entries.end() ? nullptr : it->second;
 }
 
-bool SourceManager::tryIdleRelease(const std::string &path, uint32_t idle_ms) {
-    const std::shared_ptr<Entry> entry = findEntry(path);
+bool SourceManager::tryIdleRelease(const std::string &key, uint32_t idle_ms) {
+    const std::shared_ptr<Entry> entry = findEntry(key);
     if (!entry) {
         return true; // 条目已经不在了（releaseAll / 之前的复查释放过）
     }
     const size_t viewers = entry->source ? entry->source->subscriberCount() : 0;
     if (viewers == 0) {
-        releaseEntry(path, true);
+        releaseEntry(key, true);
         return true;
     }
 
@@ -359,16 +422,16 @@ bool SourceManager::tryIdleRelease(const std::string &path, uint32_t idle_ms) {
         if (recheck == 0) {
             recheck = 1; // 理论上 setConfig 已挡住 0；这里是最后一道（宁可 1ms 也不忙等）
         }
-        scheduleIdleRecheck(path, recheck);
+        scheduleIdleRecheck(key, recheck);
     } else {
-        scheduleIdleRecheck(path, idle_ms);
+        scheduleIdleRecheck(key, idle_ms);
     }
-    InfoL << "源 " << path << " 空闲计时到期，但还有 " << viewers << " 个订阅者在看 → 推迟释放（第 "
+    InfoL << "源 " << key << " 空闲计时到期，但还有 " << viewers << " 个订阅者在看 → 推迟释放（第 "
           << _total_idle_deferred.load() << " 次）";
     return false;
 }
 
-void SourceManager::scheduleIdleRecheck(const std::string &path, uint32_t delay_ms) {
+void SourceManager::scheduleIdleRecheck(const std::string &key, uint32_t delay_ms) {
     // **必须在轮询线程调用**（doDelayTask 的约定）：两个调用点分别来自
     // armIdleTimer / onIdleTimeout，二者都在轮询线程上
     if (!_poller) {
@@ -376,21 +439,21 @@ void SourceManager::scheduleIdleRecheck(const std::string &path, uint32_t delay_
     }
     std::weak_ptr<SourceManager> weak_self = weak_from_this();
     EventPoller::DelayTask::Ptr task =
-        _poller->doDelayTask(delay_ms, [weak_self, path]() -> uint64_t {
+        _poller->doDelayTask(delay_ms, [weak_self, key]() -> uint64_t {
             if (auto self = weak_self.lock()) {
-                self->onIdleTimeout(path);
+                self->onIdleTimeout(key);
             }
             return 0; // 一次性
         });
     if (!task) {
         ++_total_idle_schedule_failed;
-        WarnL << "SourceManager：复查定时器被拒（poller 已退出），源 " << path
+        WarnL << "SourceManager：复查定时器被拒（poller 已退出），源 " << key
               << " 留到 releaseAll() 再回收";
         return;
     }
 
     std::lock_guard<std::mutex> lock(_mutex);
-    const auto it = _entries.find(path);
+    const auto it = _entries.find(key);
     if (it == _entries.end()) {
         task->cancel(); // 挂表期间被释放
         return;
@@ -398,14 +461,14 @@ void SourceManager::scheduleIdleRecheck(const std::string &path, uint32_t delay_
     it->second->idle_task = task;
 }
 
-bool SourceManager::release(const std::string &path) {
+bool SourceManager::release(const std::string &key) {
     {
         std::lock_guard<std::mutex> lock(_mutex);
-        if (_entries.find(path) == _entries.end()) {
+        if (_entries.find(key) == _entries.end()) {
             return false;
         }
     }
-    releaseEntry(path, false);
+    releaseEntry(key, false);
     return true;
 }
 
@@ -418,17 +481,17 @@ size_t SourceManager::releaseAll() {
             paths.push_back(kv.first);
         }
     }
-    for (const auto &path : paths) {
-        releaseEntry(path, false);
+    for (const auto &key : paths) {
+        releaseEntry(key, false);
     }
     return paths.size();
 }
 
-void SourceManager::releaseEntry(const std::string &path, bool idle_triggered) {
+void SourceManager::releaseEntry(const std::string &key, bool idle_triggered) {
     std::shared_ptr<Entry> entry;
     {
         std::lock_guard<std::mutex> lock(_mutex);
-        const auto it = _entries.find(path);
+        const auto it = _entries.find(key);
         if (it == _entries.end()) {
             return;
         }
@@ -451,9 +514,9 @@ void SourceManager::releaseEntry(const std::string &path, bool idle_triggered) {
     stopEntry(entry); // 锁外：join 可能耗时
 
     if (idle_triggered) {
-        InfoL << "源空闲释放：" << path; // FR-6.3：关键事件（源释放）必须落日志
+        InfoL << "源空闲释放：" << key; // FR-6.3：关键事件（源释放）必须落日志
     } else {
-        InfoL << "源已释放：" << path;
+        InfoL << "源已释放：" << key;
     }
 }
 
@@ -461,6 +524,39 @@ void SourceManager::stopEntry(const std::shared_ptr<Entry> &entry) {
     if (entry && entry->pump) {
         (void) entry->pump->stop(); // 中止标志已接上 → 能立刻打断正在进行的读
     }
+}
+
+namespace {
+
+/// 定点两位小数（JSON 数字）：`speed` 这类比值不能靠 `std::to_string`（会给 6 位）
+std::string jsonFixed2(double value) {
+    char buffer[32] = {0};
+    std::snprintf(buffer, sizeof(buffer), "%.2f", value);
+    return std::string(buffer);
+}
+
+} // namespace
+
+size_t SourceManager::transcodingCount() const {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return transcodingCountLocked();
+}
+
+size_t SourceManager::transcodingCountLocked() const {
+    size_t count = 0;
+    for (const auto &kv : _entries) {
+        const std::shared_ptr<Entry> &entry = kv.second;
+        if (!entry->spec.enabled) {
+            continue;
+        }
+        // 播完（EOS）的源不再吃 CPU，不该继续占名额 —— 否则一次拉流就会**永久**占死一个名额，
+        // 后面的转码请求全部 503（实测踩到：2 秒样本播完后 h=120 仍被判成"正在转"）
+        if (entry->source && entry->source->ended()) {
+            continue;
+        }
+        ++count;
+    }
+    return count;
 }
 
 size_t SourceManager::sourceCount() const {
@@ -483,13 +579,16 @@ std::string SourceManager::dumpStats() const {
            " released=" + std::to_string(_total_released.load()) +
            " rejected=" + std::to_string(_total_acquire_rejected.load()) +
            " idle_schedule_failed=" + std::to_string(_total_idle_schedule_failed.load()) +
-           " idle_deferred=" + std::to_string(_total_idle_deferred.load()) + "}";
+           " idle_deferred=" + std::to_string(_total_idle_deferred.load()) +
+           " max_transcoding=" + std::to_string(_config.max_transcoding) +
+           " transcode_rejected=" + std::to_string(_total_transcode_rejected.load()) + "}";
 }
 
 std::string SourceManager::dumpStatsJson() const {
     // 契约：返回**合法 JSON 对象片段**（不含最外层花括号），键名用模块名做前缀避免与 http 侧撞名
     struct SnapshotItem {
-        std::string path;
+        std::string key;  // map 键（转码源带 `|h=720` 这类后缀）
+        std::string file; // 真实文件路径（给人看的）
         MediaSource::Ptr source;
         std::shared_ptr<DemuxerProducer> producer;
     };
@@ -508,10 +607,15 @@ std::string SourceManager::dumpStatsJson() const {
         out += ",\"released\":" + std::to_string(_total_released.load());
         out += ",\"rejected\":" + std::to_string(_total_acquire_rejected.load());
         out += ",\"idle_schedule_failed\":" + std::to_string(_total_idle_schedule_failed.load());
+        // 【M10-b / FR-1.3】转码并发：上限 / 当前在转几路 / 因超限被拒几次
+        out += ",\"max_transcoding\":" + std::to_string(_config.max_transcoding);
+        out += ",\"transcoding\":" + std::to_string(transcodingCountLocked());
+        out += ",\"transcode_rejected\":" + std::to_string(_total_transcode_rejected.load());
         out += "}";
         for (const auto &kv : _entries) {
             SnapshotItem item;
-            item.path = kv.first;
+            item.key = kv.first;
+            item.file = kv.second->file;
             item.source = kv.second->source;
             item.producer = kv.second->producer;
             if (item.source) {
@@ -528,7 +632,8 @@ std::string SourceManager::dumpStatsJson() const {
             out += ",";
         }
         first = false;
-        out += "{\"path\":\"" + jsonEscape(item.path) + "\"," + item.source->dumpStatsJson();
+        out += "{\"path\":\"" + jsonEscape(item.file) + "\",\"key\":\"" + jsonEscape(item.key) +
+               "\"," + item.source->dumpStatsJson();
         // M6-c：把"输入侧"的信息也带上（解码/循环/Annex-B 是否发生，一眼能看出来）
         if (item.producer) {
             const DemuxerProducer &p = *item.producer;
@@ -547,6 +652,21 @@ std::string SourceManager::dumpStatsJson() const {
             out += ",\"loops\":" + std::to_string(p.loopCount());
             out += ",\"loop_offset_ms\":" + std::to_string(p.loopOffsetMs());
             out += ",\"loop_failures\":" + std::to_string(p.loopFailures());
+            // 【M10-b / FR-6.1 / NFR-5】转码：形状 + 实时倍数（speed = 已输出媒体时长 / 已耗墙钟）
+            out += ",\"transcode\":{\"enabled\":" +
+                   std::string(p.transcodeEnabled() ? "true" : "false");
+            out += ",\"in_hevc\":" + std::string(p.transcodeInputHevc() ? "true" : "false");
+            out += ",\"out_width\":" + std::to_string(p.transcodeOutWidth());
+            out += ",\"out_height\":" + std::to_string(p.transcodeOutHeight());
+            out += ",\"scaling\":" + std::string(p.transcodeScaling() ? "true" : "false");
+            out += ",\"vfr\":" + std::string(p.transcodeVfr() ? "true" : "false");
+            out += ",\"inputs\":" + std::to_string(p.transcodeInputs());
+            out += ",\"outputs\":" + std::to_string(p.transcodeOutputs());
+            out += ",\"out_media_ms\":" + std::to_string(p.transcodeOutMediaMs());
+            out += ",\"cost_ms\":" + std::to_string(p.transcodeCostMs());
+            out += ",\"elapsed_ms\":" + std::to_string(p.transcodeElapsedMs());
+            out += ",\"speed\":" + jsonFixed2(p.transcodeSpeed());
+            out += "}";
             out += "}";
         }
         out += "}";

@@ -63,6 +63,10 @@ const char *kUsage =
     "  --web-root <dir>    静态网页目录（默认自动找 third_party/flv.js，提供 /flv.min.js）\n"
     "  --loop              循环推流：读到文件尾重开并把时间戳接着往后接（浏览器可长时间观看）\n"
     "  --speed <x>         推送倍速（默认 1.0；压测/调试用，> 1 会加快）\n"
+    "  --transcode         允许转码（默认关；开启后 URL 加 ?transcode=1[&h=720] 才真的转）\n"
+    "  --transcode-height <n>  默认目标高度（720）：没给 h= 时当「上限」用（源更高才缩）；\n"
+    "                      0 = 只重编码不缩放；显式 h= 须偶数且不高过源\n"
+    "  --transcode-max <n> 同时最多几路源在转码（默认 nproc-1；0 不是「不限」，是非法）\n"
     "  --hls-lease-ms <n>  HLS 拉流请求的租约（默认 60000；到期且没人拉就释放源，FR-1.3）\n"
     "  --log-level <l>     trace|debug|info|warn|error|fatal（默认 info）\n"
     "  --log-file <path>   日志文件（默认 logs/mzmedia.log，64MB×5 滚动；FR-6.2）\n"
@@ -71,6 +75,8 @@ const char *kUsage =
     "示例：\n"
     "  mzmedia --loop\n"
     "  curl -N http://127.0.0.1:8080/live/sample.flv | ffplay -\n"
+    "  mzmedia --transcode --transcode-height 480\n"
+    "  curl -N 'http://127.0.0.1:8080/live/sample.flv?transcode=1&h=480' | ffplay -\n"
     "  ffprobe -f flv http://127.0.0.1:8080/live/sample.mp4.flv   # H264 裸流也能拉\n";
 
 /// 只放行 `[A-Za-z0-9_.-]`，并显式拒绝 `..` / 以 '.' 开头 / 空 / 超长
@@ -200,6 +206,84 @@ bool resolveHlsPath(const std::string &media_root, const std::string &request_pa
     return true;
 }
 
+/**
+ * 【M10-b / FR-7.1】解析 `/live/` 的转码查询参数：`?transcode=1&h=720`
+ * @param spec 出参（成功时填好；`enabled == false` 表示拉原始码流）
+ * @param why  失败原因（调用方回 400）
+ * @return false = 参数非法（**未知参数一律拒**：静默忽略一个拼错的参数最难查）
+ */
+bool parseTranscodeQuery(const std::string &query, SourceManager::TranscodeSpec *spec,
+                         std::string *why) {
+    *spec = SourceManager::TranscodeSpec{};
+    if (query.empty()) {
+        return true; // 不带参数 = 拉原始码流（默认行为，与 v0.1 一致）
+    }
+    bool has_transcode = false;
+    bool transcode_on = false;
+    bool has_h = false;
+    int height = 0;
+    size_t pos = 0;
+    while (pos < query.size()) {
+        const size_t amp = query.find('&', pos);
+        const size_t end = (amp == std::string::npos) ? query.size() : amp;
+        const std::string pair = query.substr(pos, end - pos);
+        pos = end + 1; // 跳过 '&'
+        if (pair.empty()) {
+            *why = "查询串里有空参数项（形如 `&&` 或结尾的 `&`）";
+            return false;
+        }
+        const size_t eq = pair.find('=');
+        const std::string key = pair.substr(0, eq);
+        const std::string value = (eq == std::string::npos) ? std::string() : pair.substr(eq + 1);
+        if (key == "transcode") {
+            if (has_transcode) {
+                *why = "transcode 参数重复";
+                return false;
+            }
+            has_transcode = true;
+            if (value == "1" || value == "true" || value == "yes" || value == "on") {
+                transcode_on = true;
+            } else if (value == "0" || value == "false" || value == "no" || value == "off") {
+                transcode_on = false;
+            } else {
+                *why = "transcode 只接受 1/0（true/false/yes/no/on/off），当前「" + value + "」";
+                return false;
+            }
+        } else if (key == "h") {
+            if (has_h) {
+                *why = "h 参数重复";
+                return false;
+            }
+            has_h = true;
+            if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
+                *why = "h 必须是正整数（目标高度像素），当前「" + value + "」";
+                return false;
+            }
+            const long parsed = std::strtol(value.c_str(), nullptr, 10);
+            if (parsed < 120 || parsed > 2160) {
+                *why = "h 超出 [120, 2160]（有界：再小没意义，再大等于把 CPU 打满）";
+                return false;
+            }
+            if ((parsed & 1) != 0) {
+                *why = "h 必须是偶数（yuv420p 的色度下采样要求），当前 " + value;
+                return false;
+            }
+            height = static_cast<int>(parsed);
+        } else {
+            *why = "未知查询参数「" + key + "」（/live/ 只支持 transcode 与 h）";
+            return false;
+        }
+    }
+    if (has_h && !transcode_on) {
+        // 给了高度但没要求转码：多半是漏了 transcode=1。**不猜**，让用户把话说全
+        *why = "h 只在 transcode=1 时有效（不转码就没有「目标高度」这回事）";
+        return false;
+    }
+    spec->enabled = transcode_on;
+    spec->out_height = height;
+    return true;
+}
+
 /// 日志级别名 → 枚举；@return false = 不认识（调用方报错退出）
 bool parseLogLevel(const std::string &text, LogLevel *out) {
     if (text == "trace") {
@@ -265,6 +349,15 @@ int main(int argc, char **argv) {
     double speed = 1.0;
     uint32_t hls_lease_ms = 60000;   // FR-1.3 的 60s 同量级；可调是为了让验收脚本能验"租约到期释放"
     LogLevel level = LogLevel::Info;
+    // 【M10-b / FR-7.1】转码：默认**关**（不带 --transcode 时行为与 v0.1 完全一致）
+    bool transcode_allowed = false;
+    int transcode_height = 720;      // 默认把 1080p 降到 720p（NFR-5 的口径）
+    // 并发上限默认 nproc-1：留一个核给解封装/网络/日志（拿不到核数就按 2 算，不猜更大的机器）
+    unsigned cores = std::thread::hardware_concurrency();
+    if (cores == 0) {
+        cores = 2;
+    }
+    uint32_t transcode_max = (cores > 1) ? (cores - 1) : 1;
 
     for (int i = 1; i < argc; ++i) {
         const std::string key = argv[i];
@@ -294,6 +387,26 @@ int main(int argc, char **argv) {
                 std::fprintf(stderr, "--speed 非法：必须 (0, 1000]（0 不是「不限」）\n");
                 return 2;
             }
+        } else if (key == "--transcode") {
+            transcode_allowed = true;
+        } else if (key == "--transcode-height") {
+            const int parsed = std::atoi(value());
+            // 这里 0 **有明确含义**（只重编码、不缩放），不是"不限"；奇数/越界一律拒
+            if (parsed < 0 || parsed > 2160 ||
+                (parsed > 0 && (parsed < 120 || (parsed & 1) != 0))) {
+                std::fprintf(stderr,
+                             "--transcode-height 非法：%s（0 = 只重编码；否则必须是 [120, 2160] 的**偶数**）\n",
+                             argv[i]);
+                return 2;
+            }
+            transcode_height = parsed;
+        } else if (key == "--transcode-max") {
+            const int parsed = std::atoi(value());
+            if (parsed < 1 || parsed > 64) {
+                std::fprintf(stderr, "--transcode-max 非法：应为 1..64（0 不是「不限」，是非法）\n");
+                return 2;
+            }
+            transcode_max = static_cast<uint32_t>(parsed);
         } else if (key == "--hls-lease-ms") {
             const int parsed = std::atoi(value());
             if (parsed < 500 || parsed > 3600000) {
@@ -364,8 +477,10 @@ int main(int argc, char **argv) {
     manager_config.idle_release_ms = 60000; // ARCHITECTURE §7：无人观看 60s 后释放
     manager_config.throttle.speed = speed;
     manager_config.producer.loop = loop;
+    manager_config.max_transcoding = transcode_max; // FR-1.3：转码并发是硬上限，0 会被拒
     if (!manager->setConfig(manager_config)) {
-        ErrorP("SourceManager 配置非法（speed=%f loop=%d）", speed, loop ? 1 : 0);
+        ErrorP("SourceManager 配置非法（speed=%f loop=%d max_transcoding=%u）", speed, loop ? 1 : 0,
+               transcode_max);
         return 1;
     }
 
@@ -389,6 +504,15 @@ int main(int argc, char **argv) {
         // 必须在 start() 之前注册 /hls/：HttpServer::start() 里的 501 占位有 findHandler 守卫
         if (!server->setPrefixRoute(
                 "/hls/", [manager, hls, media_root](const HttpParser &req, HttpResponse &resp) {
+                    // 【M10-b】转码只做 /live/（HLS + 转码属 M10-c）。带相关参数时**明确拒绝**，
+                    // 而不是让它看起来生效了 —— 静默忽略参数是最难查的一类问题
+                    if (req.query().find("transcode") != std::string::npos ||
+                        req.query().find("h=") != std::string::npos) {
+                        resp.setStatus(400);
+                        resp.setBody("400 Bad Request：HLS 暂不支持转码参数（转码 + HLS 属 M10-c）；"
+                                     "转码请用 /live/<name>.flv?transcode=1&h=...\n");
+                        return;
+                    }
                     std::string name;
                     std::string path;
                     uint64_t seq = 0;
@@ -432,7 +556,8 @@ int main(int argc, char **argv) {
     // 所以**在 start() 之前**注册就能覆盖它（见 docs/DESIGN_M6.md §3.4）
     if (!server->setPrefixRoute(
             "/live/",
-            [poller, manager, media_root](const HttpParser &req, HttpResponse &resp) {
+            [poller, manager, media_root, transcode_allowed, transcode_height](
+                const HttpParser &req, HttpResponse &resp) {
                 std::string name;
                 std::string path;
                 if (!resolveMediaPath(media_root, req.path(), &name, &path)) {
@@ -448,15 +573,46 @@ int main(int argc, char **argv) {
                     return;
                 }
 
-                // 懒启动 / 复用：同名请求共享同一个源（一源多消费者）
-                MediaSource::Ptr source = manager->acquire(path);
-                if (!source) {
-                    resp.setStatus(500);
-                    resp.setBody("500 Internal Server Error：源打不开（" + manager->lastError() +
-                                 "）\n");
+                // 【M10-b】转码请求：`?transcode=1[&h=720]`；不带参数 = 原始码流（默认行为）
+                SourceManager::TranscodeSpec spec;
+                std::string query_why;
+                // `?transcode=1`：把 --transcode-height 当上限；`?transcode=1&h=480`：明确要 480p
+                if (!parseTranscodeQuery(req.query(), &spec, &query_why)) {
+                    resp.setStatus(400);
+                    resp.setBody("400 Bad Request：" + query_why +
+                                 "\n→ 形式：/live/<name>.flv?transcode=1&h=720\n");
                     return;
                 }
-                const SourceManager::MuxerStreams streams = manager->muxerStreamsFor(path);
+                if (spec.enabled) {
+                    if (!transcode_allowed) {
+                        // **不静默降级成直通**：那会让人以为"转过了"
+                        resp.setStatus(501);
+                        resp.setBody(
+                            "501 Not Implemented：本实例没有开启转码（启动时缺 --transcode）\n"
+                            "→ 用 `mzmedia --transcode` 启动；或去掉 ?transcode=1 拉**原始**码流\n");
+                        return;
+                    }
+                    // 没给 `h=` → 把 `--transcode-height` 当**上限**（源更高才缩，小的源保持原样），
+                    // 而不是"一定要这个高度" —— 否则 240p 的源会被"默认 720p"判成放大而拒绝
+                    spec.max_height = transcode_height;
+                }
+                // 懒启动 / 复用：同一个文件 × 同一个转码规格 共享同一个源（一源多消费者）
+                const uint64_t rejected_before = manager->totalTranscodeRejected();
+                MediaSource::Ptr source = manager->acquire(path, spec);
+                if (!source) {
+                    // 被拒的两类原因分开报：**并发已满是"稍后再试"（503）**，
+                    // 编码解不了 / 参数非法是"这个源不行"（500）。
+                    // 判定用**计数器差**而不是去 parse 错误文本（文本会变，计数器是契约）
+                    const bool saturated = manager->totalTranscodeRejected() > rejected_before;
+                    resp.setStatus(saturated ? 503 : 500);
+                    resp.setBody(std::string(saturated ? "503 Service Unavailable"
+                                                      : "500 Internal Server Error") +
+                                 "：源打不开（" + manager->lastError() + "）\n" +
+                                 (saturated ? "→ 转码并发已满，稍后重试；或去掉 ?transcode=1 拉原始码流\n"
+                                            : ""));
+                    return;
+                }
+                const SourceManager::MuxerStreams streams = manager->muxerStreamsFor(path, spec);
                 if (streams.video == nullptr && streams.audio == nullptr) {
                     resp.setStatus(500);
                     resp.setBody("500 Internal Server Error：这个源没有音视频流\n");
@@ -495,7 +651,8 @@ int main(int argc, char **argv) {
                 if (!sender) {
                     resp.setStatus(415);
                     resp.setBody("415 Unsupported Media Type：这路流封不了 FLV"
-                                 "（v0.1 需要 H264 + AAC；H264 裸流需带 SPS/PPS）\n");
+                                 "（需要 H264 + AAC；H264 裸流需带 SPS/PPS）\n"
+                                 "→ 若源是 HEVC，可用 ?transcode=1 转成 H264（服务端需 --transcode）\n");
                     return;
                 }
 
@@ -581,6 +738,12 @@ int main(int argc, char **argv) {
     std::printf("  媒体目录  : %s%s\n", media_root.c_str(), isDir(media_root) ? "" : "（不存在！）");
     std::printf("  日志文件  : %s\n", log_file.c_str());
     std::printf("  推送      : %gx%s\n", speed, loop ? "，循环推流" : "");
+    if (transcode_allowed) {
+        std::printf("  转码      : 开启（默认 %dp，最多 %u 路；URL 加 ?transcode=1&h=720）\n",
+                    transcode_height, transcode_max);
+    } else {
+        std::printf("  转码      : 关闭（--transcode 打开；HEVC 源当前会 415）\n");
+    }
     std::printf("  命令行拉流: curl -N http://127.0.0.1:%u/live/sample.flv | ffplay -\n",
                 static_cast<unsigned>(server->port()));
     std::printf("  Ctrl-C 退出\n\n");

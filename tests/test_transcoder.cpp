@@ -8,7 +8,9 @@
  *   空    没有视频流 / 空包 → 明确失败
  *   满    单次产出上限（max_out_packets）非法 → 拒绝；输出包数受控
  *   断开  flush() 幂等；flush 后还能拿到残余包（不静默丢最后几帧）
- *   超大  非 H264（HEVC）/ 缺 avcC / 只给宽不给高 → 全部明确拒绝
+ *   超大  不认识的编码（VP9）/ 缺初始化数据 / 只给宽不给高 → 全部明确拒绝
+ *         【M10-b 改动】HEVC 现在**可以进**（解码成 H264 是 M10-b 的一部分），
+ *         但仍然要求带初始化数据（hvcC/Annex-B）—— "HEVC 的 TS 裸流"依旧明确拒绝
  * ============================================================================
  */
 
@@ -91,11 +93,20 @@ MZ_TEST(transcode_rejects_bad_inputs) {
     video.extradata = std::make_shared<const std::vector<uint8_t>>(avcc);
 
     Transcoder::Config ok_config;
-    // ① 非 H264（HEVC）：明确拒绝（HEVC 要由 CodecMatrix 判定，不该悄悄进转码器）
-    StreamInfo hevc = video;
-    hevc.codec_id = AV_CODEC_ID_HEVC;
-    hevc.codec_name = "hevc";
-    MZ_ASSERT_TRUE(Transcoder::create(hevc, ok_config) == nullptr);
+    // ① 不认识的编码（VP9）：明确拒绝。**注意**：HEVC 在 M10-b 起是**合法输入**
+    //    （解码 HEVC 再编 H264 就是"转码"本身），所以这里不再拿 HEVC 当作拒绝样本；
+    //    HEVC 的边界改成"**没有初始化数据**就必须拒绝"（TS 裸流那条路）。
+    StreamInfo vp9 = video;
+    vp9.codec_id = AV_CODEC_ID_VP9;
+    vp9.codec_name = "vp9";
+    MZ_ASSERT_TRUE(Transcoder::create(vp9, ok_config) == nullptr);
+
+    // ①b HEVC 但缺初始化数据（hvcC）：明确拒绝 —— 没它解不了码，猜不得
+    StreamInfo hevc_no_extra = video;
+    hevc_no_extra.codec_id = AV_CODEC_ID_HEVC;
+    hevc_no_extra.codec_name = "hevc";
+    hevc_no_extra.extradata.reset();
+    MZ_ASSERT_TRUE(Transcoder::create(hevc_no_extra, ok_config) == nullptr);
     // ② 缺 avcC
     StreamInfo no_extra = video;
     no_extra.extradata.reset();

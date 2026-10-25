@@ -594,3 +594,285 @@ MZ_TEST(producer_ts_video_only_still_has_no_audio) {
     FlvMuxer muxer(FlvMuxer::Streams{producer.muxerVideo(), producer.muxerAudio()});
     MZ_ASSERT_EQ(muxer.prepare(), FlvMuxer::Result::Ok);
 }
+
+// ---------------------------------------------------------------------------
+// 【M10-b】转码：源 → 解码 → 缩放 → 编码 → 输出层看到的仍是"一路 H264"
+// ---------------------------------------------------------------------------
+
+MZ_TEST(producer_transcode_downscales_and_rewrites_avcc) {
+    const std::string path = samplePath("sample.mp4");
+    MZ_ASSERT_FALSE(path.empty());
+    if (path.empty()) {
+        return;
+    }
+
+    // 直通源：用来做**对照**（转码必须重建 avcC —— 分辨率变了，SPS 里的宽高就变了）
+    DemuxerProducer plain;
+    MZ_ASSERT_TRUE(plain.open(path));
+    MZ_ASSERT_NOT_NULL(plain.muxerVideo());
+
+    DemuxerProducer::Config config;
+    config.transcode.enabled = true;
+    config.transcode.out_height = 120; // 320x240 → 160x120（等比）
+    DemuxerProducer producer(config);
+    std::string error;
+    MZ_ASSERT_TRUE(producer.open(path));
+    MZ_ASSERT_TRUE(producer.transcodeEnabled());
+    MZ_ASSERT_FALSE(producer.transcodeInputHevc());
+    MZ_ASSERT_NOT_NULL(producer.muxerVideo());
+    MZ_ASSERT_NOT_NULL(producer.muxerAudio());
+    if (producer.muxerVideo() == nullptr) {
+        return;
+    }
+    // 输出层看到的流形状 = **转码后**的（宽高换了、编码仍是 H264、index 不变）
+    MZ_ASSERT_EQ(producer.muxerVideo()->width, 160);
+    MZ_ASSERT_EQ(producer.muxerVideo()->height, 120);
+    MZ_ASSERT_EQ(producer.muxerVideo()->codec_id, AV_CODEC_ID_H264);
+    MZ_ASSERT_TRUE(producer.muxerVideo()->extradata != nullptr);
+    MZ_ASSERT_EQ(producer.muxerVideo()->index, plain.muxerVideo()->index);
+    if (plain.muxerVideo()->extradata && producer.muxerVideo()->extradata) {
+        // avcC 必须**重建**：同尺寸时才会与原样一致，这里缩小了，SPS 一定不同
+        MZ_ASSERT_TRUE(*plain.muxerVideo()->extradata != *producer.muxerVideo()->extradata);
+        MZ_ASSERT_EQ(producer.muxerVideo()->extradata->at(0), 0x01u); // avcC 的 configurationVersion
+    }
+
+    int video = 0;
+    int audio = 0;
+    int key = 0;
+    int64_t last_dts = -1;
+    bool monotonic = true;
+    int guard = 0;
+    while (guard++ < 4000) {
+        MediaPacket::Ptr packet;
+        const SourcePump::ReadResult result = producer.read(&packet, &error);
+        if (result == SourcePump::ReadResult::EndOfStream) {
+            break;
+        }
+        MZ_ASSERT_EQ(result, SourcePump::ReadResult::Packet);
+        if (result != SourcePump::ReadResult::Packet) {
+            MZ_FAIL("转码读包失败：" + error);
+            return;
+        }
+        MZ_ASSERT_NOT_NULL(packet.get());
+        if (!packet) {
+            return;
+        }
+        if (packet->kind() == MediaKind::Video) {
+            int nal = 0;
+            MZ_ASSERT_TRUE(isAvccShaped(packet->data(), packet->size(), &nal)); // 输出仍是 AVCC
+            if (last_dts >= 0 && packet->dtsMs() <= last_dts) {
+                monotonic = false; // 转码器自造的 CFR 时间轴必须严格递增
+            }
+            last_dts = packet->dtsMs();
+            if (packet->isKeyFrame()) {
+                ++key;
+            }
+            ++video;
+        } else {
+            ++audio;
+        }
+    }
+    MZ_ASSERT_TRUE(monotonic);
+    MZ_ASSERT_EQ(video, 50);   // 源 50 帧 → 转码后仍 50 帧（一帧不少：flush 兜住了尾部）
+    MZ_ASSERT_EQ(audio, 88);   // 音频**原样透传**（SPEC §9 不做音频转码）
+    MZ_ASSERT_GT(key, 0);      // 至少开头一个关键帧（否则播放端起不来）
+    MZ_ASSERT_EQ(producer.transcodeInputs(), 50u);
+    MZ_ASSERT_EQ(producer.transcodeOutputs(), 50u); // flush 之后进出相等
+    MZ_ASSERT_GT(producer.transcodeOutMediaMs(), 1800u); // 2 秒样本（50 帧 × 40ms = 2000ms）
+    MZ_ASSERT_TRUE(producer.transcodeScaling());
+    MZ_ASSERT_FALSE(producer.transcodeVfr());            // 源是 CFR
+    MZ_ASSERT_GT(producer.transcodeCostMs(), 0);         // 真的花了时间（不是假的 0）
+    MZ_ASSERT_GT(producer.transcodeSpeed(), 0.0);        // 有可判定的实时倍数
+    MZ_ASSERT_GT(producer.transcodeElapsedMs(), 0);
+    MZ_ASSERT_STR_EQ(producer.lastError(), "");
+}
+
+MZ_TEST(producer_transcode_height_is_only_a_cap_by_default) {
+    const std::string path = samplePath("sample.mp4");
+    MZ_ASSERT_FALSE(path.empty());
+    if (path.empty()) {
+        return;
+    }
+    // 源只有 240p，上限设 720p：**不缩放**（也不报错）——
+    // 这是"`?transcode=1` 的意图是给我一路能播的流"，不该因为上限比源高就判成放大而拒绝
+    DemuxerProducer::Config config;
+    config.transcode.enabled = true;
+    config.transcode.max_height = 720;
+    DemuxerProducer producer(config);
+    MZ_ASSERT_TRUE(producer.open(path));
+    MZ_ASSERT_NOT_NULL(producer.muxerVideo());
+    if (producer.muxerVideo() == nullptr) {
+        return;
+    }
+    MZ_ASSERT_EQ(producer.muxerVideo()->width, 320);
+    MZ_ASSERT_EQ(producer.muxerVideo()->height, 240);
+    MZ_ASSERT_FALSE(producer.transcodeScaling()); // 同尺寸同像素格式 → 不建 sws
+}
+
+MZ_TEST(producer_transcode_rejects_bad_requests) {
+    const std::string path = samplePath("sample.mp4");
+    MZ_ASSERT_FALSE(path.empty());
+    if (path.empty()) {
+        return;
+    }
+    // 奇数高度：yuv420p 要求偶数。**不**"悄悄取偶"—— 参数写错了要让用户知道
+    {
+        DemuxerProducer::Config config;
+        config.transcode.enabled = true;
+        config.transcode.out_height = 121;
+        DemuxerProducer producer(config);
+        MZ_ASSERT_FALSE(producer.open(path));
+        MZ_ASSERT_TRUE(producer.lastError().find("偶数") != std::string::npos);
+        MZ_ASSERT_FALSE(producer.transcodeEnabled());
+    }
+    // 放大：明确拒绝（浪费 CPU 又不会更清楚）
+    {
+        DemuxerProducer::Config config;
+        config.transcode.enabled = true;
+        config.transcode.out_height = 480;
+        DemuxerProducer producer(config);
+        MZ_ASSERT_FALSE(producer.open(path));
+        MZ_ASSERT_TRUE(producer.lastError().find("不放大") != std::string::npos);
+    }
+    // 只有音频的源：转码只指视频，音频不转 → 明确拒绝（不产出"没画面"的流）
+    {
+        const std::string audio_only = samplePath("sample_audio.aac");
+        MZ_ASSERT_FALSE(audio_only.empty());
+        if (!audio_only.empty()) {
+            DemuxerProducer::Config config;
+            config.transcode.enabled = true;
+            config.transcode.max_height = 120;
+            DemuxerProducer producer(config);
+            MZ_ASSERT_FALSE(producer.open(audio_only));
+            MZ_ASSERT_TRUE(producer.lastError().find("只有音频") != std::string::npos);
+        }
+    }
+    // 关掉转码时：同样的源必须**照常**打开（默认行为不能被这批改动影响）
+    {
+        DemuxerProducer producer;
+        MZ_ASSERT_TRUE(producer.open(path));
+        MZ_ASSERT_FALSE(producer.transcodeEnabled());
+        MZ_ASSERT_EQ(producer.transcodeInputs(), 0u);
+    }
+}
+
+MZ_TEST(producer_transcode_hevc_becomes_h264) {
+    const std::string path = samplePath("sample_hevc.mp4");
+    if (path.empty()) {
+        // HEVC 样本要靠 libx265 现场生成；本机没有 libx265 时**明确打出跳过原因**
+        // （不是静默 pass：`make_samples.sh` 也会打一行 "跳过 sample_hevc.mp4"）
+        std::printf("    [跳过] samples/sample_hevc.mp4 不存在（本机 FFmpeg 缺 libx265）\n");
+        return;
+    }
+    // 先确认"不转码就进不了 FLV"：编码是 HEVC（输出层会在 FlvSender 那里 415）
+    {
+        DemuxerProducer plain;
+        MZ_ASSERT_TRUE(plain.open(path));
+        MZ_ASSERT_NOT_NULL(plain.muxerVideo());
+        if (plain.muxerVideo() != nullptr) {
+            MZ_ASSERT_EQ(plain.muxerVideo()->codec_id, AV_CODEC_ID_HEVC);
+        }
+    }
+    // 转码后：编解码器换成 H264，宽高按上限缩
+    DemuxerProducer::Config config;
+    config.transcode.enabled = true;
+    config.transcode.max_height = 120; // 源 240p → 缩到 120p
+    DemuxerProducer producer(config);
+    std::string error;
+    MZ_ASSERT_TRUE(producer.open(path));
+    MZ_ASSERT_TRUE(producer.transcodeEnabled());
+    MZ_ASSERT_TRUE(producer.transcodeInputHevc()); // 输入是 HEVC（诊断字段）
+    MZ_ASSERT_NOT_NULL(producer.muxerVideo());
+    if (producer.muxerVideo() == nullptr) {
+        return;
+    }
+    MZ_ASSERT_EQ(producer.muxerVideo()->codec_id, AV_CODEC_ID_H264); // 输出是 H264
+    MZ_ASSERT_EQ(producer.muxerVideo()->width, 160);
+    MZ_ASSERT_EQ(producer.muxerVideo()->height, 120);
+
+    int video = 0;
+    int guard = 0;
+    int64_t last_dts = -1;
+    bool monotonic = true;
+    while (guard++ < 4000) {
+        MediaPacket::Ptr packet;
+        const SourcePump::ReadResult result = producer.read(&packet, &error);
+        if (result == SourcePump::ReadResult::EndOfStream) {
+            break;
+        }
+        MZ_ASSERT_EQ(result, SourcePump::ReadResult::Packet);
+        if (result != SourcePump::ReadResult::Packet) {
+            MZ_FAIL("HEVC 转码读包失败：" + error);
+            return;
+        }
+        if (packet && packet->kind() == MediaKind::Video) {
+            int nal = 0;
+            MZ_ASSERT_TRUE(isAvccShaped(packet->data(), packet->size(), &nal));
+            if (last_dts >= 0 && packet->dtsMs() <= last_dts) {
+                monotonic = false;
+            }
+            last_dts = packet->dtsMs();
+            ++video;
+        }
+    }
+    MZ_ASSERT_TRUE(monotonic);
+    MZ_ASSERT_GT(video, 40); // 2 秒 @25fps ≈ 50 帧（允许少量解码/编码边界差异）
+    MZ_ASSERT_EQ(producer.transcodeInputs(), producer.transcodeOutputs());
+}
+
+MZ_TEST(producer_transcode_loop_keeps_audio_and_video_aligned) {
+    const std::string path = samplePath("sample.mp4");
+    MZ_ASSERT_FALSE(path.empty());
+    if (path.empty()) {
+        return;
+    }
+    // 循环 + 转码：**视频走"帧序号 × 步长"、音频走"原始 dts + 趟偏移"**，两条时间轴必须在
+    // 接缝处对齐。曾经的写法把趟偏移**又**加了一次（转码时间轴本来就连续）→ 实测视频跑到
+    // 14.0s、音频才 8.1s，音画完全错位；本用例锁的就是"跨过接缝后两条轴仍贴在一起"。
+    DemuxerProducer::Config config;
+    config.loop = true;
+    config.transcode.enabled = true;
+    config.transcode.out_height = 120;
+    DemuxerProducer producer(config);
+    std::string error;
+    MZ_ASSERT_TRUE(producer.open(path));
+    MZ_ASSERT_TRUE(producer.transcodeEnabled());
+
+    int64_t last_video = -1;
+    int64_t last_audio = -1;
+    int64_t max_gap = 0;
+    int guard = 0;
+    while (guard++ < 400) {
+        MediaPacket::Ptr packet;
+        const SourcePump::ReadResult result = producer.read(&packet, &error);
+        MZ_ASSERT_EQ(result, SourcePump::ReadResult::Packet); // 循环模式不该 Eof
+        if (result != SourcePump::ReadResult::Packet) {
+            MZ_FAIL("循环转码读包失败：" + error);
+            return;
+        }
+        if (!packet) {
+            return;
+        }
+        if (packet->kind() == MediaKind::Video) {
+            last_video = packet->dtsMs();
+        } else {
+            last_audio = packet->dtsMs();
+        }
+        if (last_video >= 0 && last_audio >= 0) {
+            const int64_t gap = last_video > last_audio ? last_video - last_audio
+                                                        : last_audio - last_video;
+            if (gap > max_gap) {
+                max_gap = gap;
+            }
+        }
+        // 跨过第一趟（2 秒样本）就够证明接缝对齐；再读下去只会拖长用例
+        if (last_video > 5000) {
+            break;
+        }
+    }
+    MZ_ASSERT_GT(producer.loopCount(), 0u);   // 确实跨了接缝（否则这条什么都没证明）
+    MZ_ASSERT_GT(last_video, 5000);           // 真的读到第二趟
+    // 300ms 的界：正常只有"解码器差一两帧"的延迟（≈80ms）；
+    // 双计趟偏移的 bug 会让 gap 直接跳到 ~2000ms（一趟的长度），所以这个界既能过也能红
+    MZ_ASSERT_LT(max_gap, 300);
+}

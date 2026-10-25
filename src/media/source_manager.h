@@ -58,6 +58,26 @@ public:
         Throttle::Config throttle;        // FR-3.5：默认开、1 倍速（压测/单测可调 speed）
         MediaSource::Limits source;       // 每源的队列 / GOP / 人数上限（推导值在 Limits 里）
         DemuxerProducer::Config producer; // 解封装上限（流数 / 单包 / 超时 / 循环重开）
+        /// 【M10-b / FR-1.3】同时最多几路源在转码
+        /// @note **0 非法**（它不是"不限"）：转码吃满 CPU 会让整台机器不可用，
+        ///       所以这是硬上限；应用层按 `nproc-1` 给初值，脚本可调小做确定性验收
+        size_t max_transcoding = 1;
+    };
+
+    /// 【M10-b】一路源的转码规格（`enabled` + 目标高度）
+    /// @note 它就是 `DemuxerProducer::Config::Transcode` 的"请求态"：`out_height == 0` = 只重编码
+    struct TranscodeSpec {
+        bool enabled = false;
+        /// **显式**目标高度（`h=`）：0 = 没给。给了就必须偶数且不高过源（否则明确拒绝）
+        int out_height = 0;
+        /// **上限**高度（`--transcode-height`）：源高于它就缩到它，源不高于它就**不缩放**
+        /// @note 与 `out_height` 分开的理由：`?transcode=1` 的意图是"给我一路能播的流"，
+        ///       不该因为源本身只有 240p 就被"默认 720p"判成放大而拒绝
+        int max_height = 0;
+        int out_bitrate_kbps = 0; ///< 0 = 推导（有界）
+        /// 进"源键 / 日志 / stats"的短描述：`""` = 不转码，`"src"` = 只重编码，
+        /// `"h=720"` = 显式缩到 720p，`"auto=720"` = 源高于 720p 才缩
+        std::string describe() const;
     };
 
     /// 输出层（FLV）要用的流信息快照（M6-c）
@@ -83,6 +103,18 @@ public:
      */
     MediaSource::Ptr acquire(const std::string &path);
 
+    /**
+     * 【M10-b】取得**转码源**（同一个文件 × 同一个转码规格 = 同一个源）
+     * @param spec `enabled == false` 时等价于 `acquire(path)`
+     * @return nullptr = 打不开 / 被拒（转码并发已满、参数非法；原因见 `lastError()`）
+     * @note 转码源与直通源是**两个独立的源**（各自解封装）：换来的是"不动 `media/` 的分发层"
+     *       （SC-2），代价是同一个文件被 demux 两次、转码那一份多占 CPU。见 docs/DESIGN_M10.md §8
+     */
+    MediaSource::Ptr acquire(const std::string &path, const TranscodeSpec &spec);
+
+    /// 源键（`sourceKey(path, spec)`）：直通源 = 文件路径，转码源 = `路径|h=720` / `路径|src`
+    static std::string sourceKey(const std::string &path, const TranscodeSpec &spec);
+
     /// 该源解封装出的流信息（M6-c：输出层写 FLV 的 sequence header 要用）
     /// @return 两路都是 nullptr = 没有这个源
     /// @note 返回的指针指向**源自己持有的快照**（不是 `Demuxer` 里的引用）：
@@ -90,6 +122,8 @@ public:
     ///       · 但**源必须先活着** —— 调用方用 `acquire()` 拿到的句柄或连接上的订阅者
     ///         来保证这一点（NFR-6 的断开即退订就是从这里来的）。
     MuxerStreams muxerStreamsFor(const std::string &path) const;
+    /// 【M10-b】转码源的流信息（`video` 给的是**转码后**的宽高与 avcC）
+    MuxerStreams muxerStreamsFor(const std::string &path, const TranscodeSpec &spec) const;
 
     /// 立刻释放某个源（不等空闲计时）；@return false = 没有这个源
     bool release(const std::string &path);
@@ -97,6 +131,8 @@ public:
     size_t releaseAll();
 
     size_t sourceCount() const;
+    /// 【M10-b】当前在转码的源数（用于"并发上限还剩几个"）
+    size_t transcodingCount() const;
     /// 当前在外的句柄数
     size_t handleCount() const;
     /// 一行统计（与 `MediaSource::dumpStats()` 同一风格）
@@ -130,10 +166,18 @@ public:
     uint64_t totalIdleDeferred() const {
         return _total_idle_deferred.load();
     }
+    /// 【M10-b】因"转码并发已满"被拒的次数（**不降级成直通**：宁可不给，也不给假的）
+    uint64_t totalTranscodeRejected() const {
+        return _total_transcode_rejected.load();
+    }
 
 private:
     struct Entry {
-        std::string path;
+        /// map 键（直通源 = 文件路径；转码源 = `路径|h=720` / `路径|src`）
+        std::string key;
+        /// 真实文件路径（日志/stats 里给人看的那个）
+        std::string file;
+        TranscodeSpec spec;
         MediaSource::Ptr source;
         std::shared_ptr<SourcePump> pump;
         std::shared_ptr<DemuxerProducer> producer;
@@ -144,22 +188,26 @@ private:
     explicit SourceManager(const EventPoller::Ptr &poller);
 
     MediaSource::Ptr makeHandle(const std::shared_ptr<Entry> &entry);
-    void onHandleReleased(const std::string &path);
+    void onHandleReleased(const std::string &key);
     /// **必须在轮询线程调用**（doDelayTask 的约定）
-    void armIdleTimer(const std::string &path);
-    void onIdleTimeout(const std::string &path);
+    void armIdleTimer(const std::string &key);
+    void onIdleTimeout(const std::string &key);
     /// 取条目（返回副本，供**不持锁**时用它的字段）；没有则 nullptr
-    std::shared_ptr<Entry> findEntry(const std::string &path) const;
+    std::shared_ptr<Entry> findEntry(const std::string &key) const;
+    /// 【M10-b】在转码的源数（**调用方必须已持锁**：dumpStatsJson 在锁内拼这段）
+    size_t transcodingCountLocked() const;
     /// 空闲释放的统一守卫（M6-c 修的真问题）：**有订阅者就不释放**
     /// @return true = 已释放；false = 还有订阅者（已重新安排复查）
-    bool tryIdleRelease(const std::string &path, uint32_t idle_ms);
+    bool tryIdleRelease(const std::string &key, uint32_t idle_ms);
     /// 还有订阅者时的复查调度（**必须在轮询线程调用**）
-    void scheduleIdleRecheck(const std::string &path, uint32_t delay_ms);
+    void scheduleIdleRecheck(const std::string &key, uint32_t delay_ms);
     /// 摘除条目（锁内）+ 停线程（锁外，join 可能耗时）
-    void releaseEntry(const std::string &path, bool idle_triggered);
+    void releaseEntry(const std::string &key, bool idle_triggered);
     static void stopEntry(const std::shared_ptr<Entry> &entry);
 
     static constexpr uint32_t kHardMaxIdleMs = 30u * 60u * 1000u; // 30 分钟
+    /// 转码并发的硬上限（按核数 × 8 都够了；再大就是配置错误，不是"想开更多"）
+    static constexpr size_t kHardMaxTranscoding = 64;
 
     EventPoller::Ptr _poller;
     mutable std::mutex _mutex;
@@ -174,6 +222,7 @@ private:
     std::atomic<uint64_t> _total_acquire_rejected{0};
     std::atomic<uint64_t> _total_idle_schedule_failed{0};
     std::atomic<uint64_t> _total_idle_deferred{0};
+    std::atomic<uint64_t> _total_transcode_rejected{0};
     std::atomic<uint64_t> _handles{0};
 };
 

@@ -105,13 +105,18 @@ Transcoder::Result Transcoder::fail(Result result, const std::string &message) {
 }
 
 Transcoder::Ptr Transcoder::create(const StreamInfo &src_video, const Config &config) {
-    if (src_video.codec_id != AV_CODEC_ID_H264) {
-        ErrorP("Transcoder: 只接受 H264 输入（当前「%s」）—— 其它编码应由 CodecMatrix 判定/拒绝",
+    // 【M10-b】可接受的输入：H264（任何容器）与 HEVC（**必须带 hvcC 初始化数据**，即 MP4/MKV）。
+    // HEVC 的 Annex-B 裸流（TS）不在这里支持：那需要现场构造 hvcC（与 avcC 对称的另一套格式），
+    // 没有实测样本前不做 —— 明确拒绝，不猜。
+    const bool is_h264 = src_video.codec_id == AV_CODEC_ID_H264;
+    const bool is_hevc = src_video.codec_id == AV_CODEC_ID_HEVC;
+    if (!is_h264 && !is_hevc) {
+        ErrorP("Transcoder: 只接受 H264 / HEVC 输入（当前「%s」）—— 其它编码应由 CodecMatrix 判定/拒绝",
                src_video.codec_name.c_str());
         return nullptr;
     }
     if (!src_video.extradata || src_video.extradata->empty()) {
-        ErrorP("Transcoder: 源视频缺 avcC（没有初始化数据就解不了码）");
+        ErrorP("Transcoder: 源视频缺初始化数据（H264 要 avcC，HEVC 要 hvcC）—— 没它解不了码");
         return nullptr;
     }
     if (config.max_out_packets <= 0 || config.gop_frames <= 0) {
@@ -146,9 +151,12 @@ Transcoder::Ptr Transcoder::create(const StreamInfo &src_video, const Config &co
     self->_config = config;
 
     // ---------------- 解码器 ----------------
-    const AVCodec *decoder = avcodec_find_decoder(AV_CODEC_ID_H264);
+    // 【M10-b】解码器跟着**输入编码**走：H264 源用 H264 解码器，HEVC 源用 HEVC 解码器。
+    // 输出永远是新编码的 H264（浏览器只认这个），所以"输入编码"只影响这一段。
+    const AVCodec *decoder = avcodec_find_decoder(src_video.codec_id);
     if (decoder == nullptr) {
-        ErrorP("Transcoder: 本机 FFmpeg 没有 H264 解码器");
+        ErrorP("Transcoder: 本机 FFmpeg 没有「%s」解码器（无法解码该源）",
+               src_video.codec_name.c_str());
         return nullptr;
     }
     self->_dec.reset(avcodec_alloc_context3(decoder));
@@ -164,7 +172,7 @@ Transcoder::Ptr Transcoder::create(const StreamInfo &src_video, const Config &co
         dec.extradata = static_cast<uint8_t *>(
             av_mallocz(extra_size + AV_INPUT_BUFFER_PADDING_SIZE));
         if (dec.extradata == nullptr) {
-            ErrorP("Transcoder: 拷贝 avcC 失败（内存不足？）");
+            ErrorP("Transcoder: 拷贝初始化数据（avcC/hvcC）失败（内存不足？）");
             return nullptr;
         }
         std::memcpy(dec.extradata, src_video.extradata->data(), extra_size);
@@ -266,10 +274,10 @@ Transcoder::Ptr Transcoder::create(const StreamInfo &src_video, const Config &co
     self->_frame_step_ms = 1000.0 * static_cast<double>(framerate_den) /
                            static_cast<double>(framerate_num > 0 ? framerate_num : 25);
 
-    InfoP("Transcoder: 就绪 —— %dx%d → %dx%d，%d kbps，preset=veryfast tune=zerolatency，"
+    InfoP("Transcoder: 就绪 —— %s %dx%d → h264 %dx%d，%d kbps，preset=veryfast tune=zerolatency，"
           "GOP=%d，时间基 1/1000，avcC %zu 字节",
-          src_video.width, src_video.height, out_w, out_h, bitrate_kbps, config.gop_frames,
-          self->_out_info.extradata->size());
+          src_video.codec_name.c_str(), src_video.width, src_video.height, out_w, out_h,
+          bitrate_kbps, config.gop_frames, self->_out_info.extradata->size());
     return self;
 }
 

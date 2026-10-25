@@ -7,6 +7,45 @@
 
 （下一版内容；v0.2.0 计划见 [docs/ROADMAP.md](docs/ROADMAP.md)）
 
+### Added（**M10-b：转码接进服务**，闭环 NFR-5 / FR-1.3 / FR-7.1）
+- **转码源 = 独立源**（`SourceManager::sourceKey`）：同一个文件 × 同一个转码规格 = 一个源
+  （键形如 `samples/x.mp4|h=720`），与直通源**互不影响**。这样 `media/` 的分发层
+  （`MediaSource`/`Subscriber`/`FrameQueue`）**一行没改**（SC-2）。代价是同一文件被 demux 两次，
+  所以有**并发硬上限**。
+- `DemuxerProducer` 转码分支：视频包过 `Transcoder`（解码 → sws → x264），**音频原样透传**
+  （SPEC §9）。`read()` 允许"一次输入吐 0..N 个包"（产物先进**有界** `_pending`）；
+  **EOF 必须 `flush()`**（否则少最后几帧且不报错），**循环模式下不 flush**（解码器还要解下一趟）。
+- `CodecMatrix` **能力感知**分支：`decideOutput(video, audio, output, TranscodeCaps)` ——
+  有 HEVC 解码器 + H264 编码器时 HEVC → `Transcode`，否则仍是 `Unsupported`（旧函数行为不变）。
+  **HEVC → H264 实测可用**（`samples/sample_hevc.mp4`，由 `make_samples.sh` 用 libx265 现场生成）。
+- 命令行（FR-7.1）：`--transcode`（默认**关**）、`--transcode-height`（默认 720，当**上限**用；
+  0 = 只重编码，须偶数、≤2160）、`--transcode-max`（默认 `nproc-1`，`0` 非法）。
+- URL（FR-7.1）：`/live/x.flv?transcode=1[&h=720]`。**每条拒绝路径都明确**：
+  未开 `--transcode` → **501**（不降级成直通）；`h` 非数字/奇数/越界、非法 `transcode` 值、
+  未知参数、重复参数 → **400**；转码并发已满 → **503**；`/hls/*?transcode=1` → **400**（属 M10-c）。
+- `/api/stats`：`source_manager` 增 `max_transcoding` / `transcoding` / `transcode_rejected`；
+  每源增 `producer.transcode{enabled,in_hevc,out_width,out_height,scaling,vfr,inputs,outputs,
+  out_media_ms,cost_ms,elapsed_ms,speed}`（FR-6.1 的"实时倍数"）。
+- **`speed` 的口径**（这条是实测纠出来的）：`speed = 已输出媒体时长 / **转码本身**耗时`。
+  用"从开始到结束的墙钟"当分母会永远 ≈1.0（量到的是节流速度，不是转码速度，实测 0.97x）；
+  媒体时长按 `帧数 × 标称步长` 算（用输出 dts 跨度会被循环偏移造出的假间隙虚高：4.96s → 9.76s）。
+- 并发上限的"名额"按**还在干活**算：EOS 的源不再占名额（否则一次拉流就永久占死一个名额，
+  后续转码请求全部 503 —— 实测踩到，`MediaSource::ended()` 为此新增）。
+- 测试：`producer` 组 +4、`srcmgr` 组 +3、`ffmpeg` 组 +1；`flv_http_test.sh` **68 → 96 项**
+  （新增 §10 开关/参数、§11 缩放/帧数/音频透传/HEVC/并发/speed）；`make_samples.sh` 增
+  `sample_hevc.mp4`（缺 libx265 时明确跳过）与 `sample_audio.aac`。
+- **循环 + 转码的时间轴**（同一批踩到并修掉的 bug）：转码器的时间轴是"帧序号 × 步长"，跨趟**自动连续**，
+  再叠一次 `_loop_offset_ms` 就双计 —— 实测 `--loop` 下视频跑到 **14.0s**、音频才 **8.1s**，音画完全错位。
+  改法：转码路径改用 `_tx_ts_shift`，只在接缝处补 `pass_end − 这一趟转出的媒体时长` 的差额；
+  实测视频末包 **15.923s** vs 音频末包 **15.950s**（差 ≈ 一帧），并加了回归用例
+  `producer_transcode_loop_keeps_audio_and_video_aligned`（变异验证：改回双计 → 立红）。
+- **实测**（4 核 VM，门禁全跑）：`ctest` **24/24（281 用例）**、单进程 **281/281 / 62,841 断言**、
+  ASAN **24/24**、TSAN **370 用例 | 真问题 0**、脚本 `transcode` 12/12 + `flv_http` **96/96** +
+  `ts_mux` 29/29 + `hls` 32/32 + `flv_mux` 8/8 + `http` 全绿、`--clean-first` 重建 **0 warning**；
+  功能：320x240 → `?transcode=1` = 160x120、50 帧一帧不少、音频 88→88 透传、`ffmpeg -f null -` 零 error；
+  1080p→720p 服务内 **speed 3.26x**。
+- ⚠ **仍不做**：转码 + HLS（M10-c）、音频转码、HEVC 的 Annex-B 裸流、多码率 ABR/GPU 转码。
+
 ### Added（**M10-a：转码组件 `Transcoder`**，v0.2.0 的第三块）
 - `src/ffmpeg/transcoder.{h,cpp}`：**解码（avcodec）→ `libswscale` 缩放/像素格式 → x264 编码**
   （`preset=veryfast` + `tune=zerolatency` + `max_b_frames=0` + `AV_CODEC_FLAG_GLOBAL_HEADER`）。

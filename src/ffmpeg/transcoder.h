@@ -4,7 +4,9 @@
  * 形状来源：docs/DESIGN_M9.md（同一条"纯函数式加工"的纪律）、docs/ROADMAP.md v0.2 的转码行、
  *           上位需求 NFR-5「转码 ≥1.0x 实时（1080p→720p，x264 veryfast）」
  *
- * 只做一件事：**吃一个 H264 压缩包（AVCC），吐一串 H264 压缩包（AVCC）**。
+ * 只做一件事：**吃一个 H264/HEVC 压缩包（长度前缀 NAL），吐一串 H264 压缩包（AVCC）**。
+ * 输入编码（H264 或 HEVC）只影响解码器；输出**永远是 H264**（浏览器只认它）。
+ * 【M10-b】HEVC 输入必须自带初始化数据（MP4/MKV 的 hvcC）；HEVC 的 Annex-B 裸流不支持。
  *   · 不碰网络、不碰线程、不碰文件 —— 于是"转得对不对"可以交给 ffprobe 独立裁判；
  *   · 不碰音频：`SPEC.md` §9 明确"不做音频转码"，所以音频在调用方**原样透传**（remux）；
  *   · 输入输出都是 **AVCC**（不是 Annex-B）：因为下游 `FlvMuxer`/`MpegTsMuxer` 要的就是这个形状，
@@ -58,7 +60,7 @@ public:
     enum class Result : uint8_t {
         Ok = 0,
         BadConfig = 1,        ///< 宽高为奇数/负数、gop/max_out_packets 非法
-        UnsupportedCodec = 2, ///< 只有 H264 能进（HEVC 等需要在调用方先判 CodecMatrix）
+        UnsupportedCodec = 2, ///< 输入不是 H264/HEVC（其它编码应由 CodecMatrix 先判）
         NoDecoder = 3,        ///< 本机 FFmpeg 没有这个解码器
         NoEncoder = 4,        ///< 本机 FFmpeg 没有 H264 编码器（缺 libx264）
         DecodeFailed = 5,

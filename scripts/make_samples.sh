@@ -45,6 +45,27 @@ ffmpeg -y -i "$OUT/sample.mp4" -an -c:v copy -f mpegts "$OUT/vonly.ts" > /dev/nu
 ffmpeg -y -f lavfi -i "testsrc=size=1920x1080:rate=25" -t 5 -pix_fmt yuv420p \
     -c:v libx264 -preset veryfast -g 50 "$OUT/sample1080.mp4" > /dev/null 2>&1
 
+# M10-b（HEVC → H264 转码）：HEVC 源**只有转码才能进 FLV**（不转码 = 415）。
+# 用 libx265 现场造（不入库）；`-tag:v hvc1` 让 MP4 的 extradata 是标准 hvcC。
+# 造不出来（本机 FFmpeg 没有 libx265）时**不阻塞**其它样本，但会明确打一行原因 ——
+# 相关的验收项会自动跳过并打印"跳过"，不会假装通过。
+if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "libx265"; then
+    ffmpeg -y -f lavfi -i "testsrc=size=320x240:rate=25" -t 2 -pix_fmt yuv420p \
+        -c:v libx265 -preset ultrafast -x265-params log-level=none:keyint=50 \
+        -tag:v hvc1 "$OUT/sample_hevc.mp4" > /dev/null 2>&1
+    if [ ! -s "$OUT/sample_hevc.mp4" ]; then
+        echo "注意：sample_hevc.mp4 生成失败（HEVC 相关验收会跳过）" >&2
+        rm -f "$OUT/sample_hevc.mp4"
+    fi
+else
+    rm -f "$OUT/sample_hevc.mp4"
+    echo "注意：本机 FFmpeg 没有 libx265 → 跳过 sample_hevc.mp4（HEVC 相关验收会跳过）" >&2
+fi
+
+# M10-b（"只有音频的源不许转码"）：纯音频样本 —— FLV 的音频必须原样透传，
+# 而"转码"这个词在 v0.2 里只指视频，所以这类源要**明确拒绝**而不是转出个没画面的流。
+ffmpeg -y -i "$OUT/sample.mp4" -vn -c:a copy "$OUT/sample_audio.aac" > /dev/null 2>&1
+
 head -c 65536 /dev/urandom > "$OUT/garbage.bin"
 
 ls -l "$OUT"

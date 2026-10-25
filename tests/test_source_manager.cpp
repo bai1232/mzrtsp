@@ -585,3 +585,137 @@ MZ_TEST(srcmgr_muxer_streams_for_mp4_and_annexb) {
 
     (void) poller->shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// 【M10-b】转码源：独立源键 / 并发硬上限 / 配置校验
+// ---------------------------------------------------------------------------
+
+MZ_TEST(srcmgr_transcode_source_is_separate_from_passthrough) {
+    const std::string path = samplePath("sample.mp4");
+    MZ_ASSERT_FALSE(path.empty());
+    if (path.empty()) {
+        return;
+    }
+    auto poller = EventPoller::create("test-srcmgr-transcode");
+    auto manager = SourceManager::create(poller);
+    SourceManager::Config cfg;
+    cfg.idle_release_ms = 0; // 句柄一放就回收：用例结束时不留线程
+    cfg.max_transcoding = 2;
+    MZ_ASSERT_TRUE(manager->setConfig(cfg));
+
+    SourceManager::TranscodeSpec spec;
+    spec.enabled = true;
+    spec.out_height = 120;
+
+    // 源键：直通 = 文件路径，转码 = 路径 + 规格后缀（两者必须是**不同的源**）
+    MZ_ASSERT_STR_EQ(SourceManager::sourceKey(path, SourceManager::TranscodeSpec{}), path);
+    MZ_ASSERT_TRUE(SourceManager::sourceKey(path, spec) != path);
+    MZ_ASSERT_TRUE(SourceManager::sourceKey(path, spec).find("h=120") != std::string::npos);
+
+    auto passthrough = manager->acquire(path);
+    MZ_ASSERT_NOT_NULL(passthrough.get());
+    auto tx = manager->acquire(path, spec);
+    MZ_ASSERT_NOT_NULL(tx.get());
+    if (!passthrough || !tx) {
+        (void) poller->shutdown();
+        return;
+    }
+    MZ_ASSERT_TRUE(passthrough.get() != tx.get()); // 两个独立的源
+    MZ_ASSERT_EQ(manager->sourceCount(), 2u);
+    MZ_ASSERT_EQ(manager->transcodingCount(), 1u);
+
+    // 流信息：直通给源分辨率，转码给**转码后**的分辨率（输出层照这个写 FLV 元数据）
+    const auto plain_streams = manager->muxerStreamsFor(path);
+    const auto tx_streams = manager->muxerStreamsFor(path, spec);
+    MZ_ASSERT_NOT_NULL(plain_streams.video);
+    MZ_ASSERT_NOT_NULL(tx_streams.video);
+    if (plain_streams.video != nullptr && tx_streams.video != nullptr) {
+        MZ_ASSERT_EQ(plain_streams.video->height, 240);
+        MZ_ASSERT_EQ(tx_streams.video->height, 120);
+        MZ_ASSERT_EQ(tx_streams.video->width, 160);
+        MZ_ASSERT_EQ(tx_streams.video->codec_id, AV_CODEC_ID_H264);
+    }
+
+    // 同一路径 × 同一规格 → 复用同一个源（不是每请求一转）
+    auto tx_again = manager->acquire(path, spec);
+    MZ_ASSERT_NOT_NULL(tx_again.get());
+    if (tx_again) {
+        MZ_ASSERT_TRUE(tx_again.get() == tx.get());
+    }
+    MZ_ASSERT_EQ(manager->sourceCount(), 2u);
+    MZ_ASSERT_EQ(manager->totalReused(), 1u);
+
+    // 没有这个规格的源时：两路都是 nullptr（不猜、不"顺手建一个"）
+    SourceManager::TranscodeSpec other = spec;
+    other.out_height = 240;
+    const auto missing = manager->muxerStreamsFor(path, other);
+    MZ_ASSERT_TRUE(missing.video == nullptr);
+    MZ_ASSERT_TRUE(missing.audio == nullptr);
+
+    tx_again.reset();
+    tx.reset();
+    passthrough.reset();
+    (void) poller->shutdown();
+}
+
+MZ_TEST(srcmgr_transcode_concurrency_is_capped) {
+    const std::string path = samplePath("sample.mp4");
+    const std::string path2 = samplePath("sample.mkv");
+    MZ_ASSERT_FALSE(path.empty());
+    MZ_ASSERT_FALSE(path2.empty());
+    if (path.empty() || path2.empty()) {
+        return;
+    }
+    auto poller = EventPoller::create("test-srcmgr-txcap");
+    auto manager = SourceManager::create(poller);
+    SourceManager::Config cfg;
+    cfg.idle_release_ms = 0;
+    cfg.max_transcoding = 1; // 只允许一路
+    MZ_ASSERT_TRUE(manager->setConfig(cfg));
+
+    SourceManager::TranscodeSpec spec;
+    spec.enabled = true;
+    spec.out_height = 120;
+
+    auto first = manager->acquire(path, spec);
+    MZ_ASSERT_NOT_NULL(first.get());
+    // 第二路（**不同文件**）必须被拒：转码吃满 CPU 会让整台机器不可用
+    auto second = manager->acquire(path2, spec);
+    MZ_ASSERT_TRUE(second == nullptr);
+    MZ_ASSERT_TRUE(manager->lastError().find("并发已满") != std::string::npos);
+    MZ_ASSERT_EQ(manager->totalTranscodeRejected(), 1u);
+    MZ_ASSERT_EQ(manager->sourceCount(), 1u);
+    // **不降级成直通**：被拒就是被拒，不会悄悄给一路"没转"的流
+    MZ_ASSERT_TRUE(manager->muxerStreamsFor(path2, spec).video == nullptr);
+
+    // 直通源不受转码上限影响（它不吃转码 CPU）
+    auto passthrough = manager->acquire(path2);
+    MZ_ASSERT_NOT_NULL(passthrough.get());
+    MZ_ASSERT_EQ(manager->sourceCount(), 2u);
+    MZ_ASSERT_EQ(manager->transcodingCount(), 1u);
+    passthrough.reset();
+
+    // 放掉唯一的转码源 → 名额回来（立刻释放，因为 idle_release_ms = 0）
+    first.reset();
+    MZ_ASSERT_EQ(manager->transcodingCount(), 0u);
+    auto retry = manager->acquire(path2, spec);
+    MZ_ASSERT_NOT_NULL(retry.get());
+    if (retry) {
+        MZ_ASSERT_EQ(manager->transcodingCount(), 1u);
+    }
+    retry.reset();
+    (void) poller->shutdown();
+}
+
+MZ_TEST(srcmgr_transcode_config_rejects_zero_limit) {
+    auto manager = SourceManager::create(nullptr);
+    SourceManager::Config cfg;
+    cfg.max_transcoding = 0; // 0 **不是**"不限"：那是把机器打满
+    MZ_ASSERT_FALSE(manager->setConfig(cfg));
+    cfg.max_transcoding = 1;
+    MZ_ASSERT_TRUE(manager->setConfig(cfg));
+    cfg.max_transcoding = 1000; // 超过硬上限也是配置错误，不是"想开更多"
+    MZ_ASSERT_FALSE(manager->setConfig(cfg));
+    // 被拒之后原配置保持不变（不允许"半生效"）
+    MZ_ASSERT_EQ(manager->config().max_transcoding, 1u);
+}

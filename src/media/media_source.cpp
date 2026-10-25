@@ -254,6 +254,11 @@ size_t MediaSource::subscriberCount() {
     return _entries.size();
 }
 
+bool MediaSource::ended() const {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _ended;
+}
+
 bool MediaSource::endOfStream() {
     bool changed = false;
     std::vector<Subscriber::Ptr> to_notify;

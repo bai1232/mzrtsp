@@ -15,8 +15,10 @@
 
 #include "core/logger.h"
 #include "ffmpeg/aac_util.h"
+#include "ffmpeg/codec_matrix.h"
 #include "ffmpeg/h264_util.h"
 
+#include <cmath>
 #include <utility>
 #include <vector>
 
@@ -79,6 +81,16 @@ bool DemuxerProducer::open(const std::string &path) {
     if (!prepareStreams()) {
         _demux.close(); // 初始化数据不可用：不留一个半开的对象
         _path.clear();
+        ErrorL << "DemuxerProducer::open 失败：" << lastError();
+        return false;
+    }
+    // 【M10-b】转码器必须在 `open()` 之内建好：`_video_info` 要立刻换成**输出**形状
+    // （分辨率/avcC 都变了），否则连接拿着源的分辨率写 FLV 元数据就是错的。
+    if (!openTranscoder()) {
+        _demux.close();
+        _path.clear();
+        _transcoder.reset();
+        _tx_enabled.store(false);
         ErrorL << "DemuxerProducer::open 失败：" << lastError();
         return false;
     }
@@ -382,6 +394,22 @@ bool DemuxerProducer::reopenForLoop() {
         return false;
     }
 
+    // 【M10-b】转码时视频时间轴也要"跳过这一趟的剩余部分"：
+    //   转码器给的是"帧序号 × 步长"，而这一趟的真实媒体时长是 pass_end（两者可能差几十毫秒：
+    //   音频 1024 样本/帧 ≈ 23.22ms 这类小数帧长会累积）。在接缝处补齐差额，
+    //   视频与透传音频才会一直在同一条时间轴上（否则每趟漂一点，长跑就音画不同步）。
+    if (_transcoder) {
+        const int64_t frames_this_pass =
+            static_cast<int64_t>(_tx_frames_out - _tx_frames_at_pass_start);
+        const int64_t video_pass_ms = static_cast<int64_t>(
+            std::llround(static_cast<double>(frames_this_pass) * _tx_frame_step_ms));
+        _tx_ts_shift += pass_end - video_pass_ms;
+        _tx_frames_at_pass_start = _tx_frames_out;
+        InfoP("DemuxerProducer: 转码接缝对齐 —— 本趟 %lld 帧（%lld ms）vs 真实 %lld ms，"
+              "时间轴修正后累计 %+lld ms",
+              static_cast<long long>(frames_this_pass), static_cast<long long>(video_pass_ms),
+              static_cast<long long>(pass_end), static_cast<long long>(_tx_ts_shift));
+    }
     _loop_offset_ms.fetch_add(pass_end);
     _pass.assign(_demux.streams().size(), PassTrack{}); // 新一趟从零开始记
     ++_loops;
@@ -403,10 +431,30 @@ SourcePump::ReadResult DemuxerProducer::read(MediaPacket::Ptr *packet, std::stri
         return SourcePump::ReadResult::Error;
     }
 
+    // 【M10-b】上一次输入吐出的包还没交完：先交（`SourcePump` 的契约是"一次一个包"）
+    if (!_pending.empty()) {
+        return servePending(packet);
+    }
+
     while (true) {
         const Demuxer::ReadResult result = _demux.readPacket();
         if (result == Demuxer::ReadResult::Eof) {
+            // 【M10-b】EOF 必须把编解码器里攒的帧冲出来（**漏了就是少最后几帧且不报错**）。
+            // 循环模式下**不** flush：那只是"这一趟结束"，解码器还要接着解下一趟。
+            if (_transcoder && !_tx_flushed && !_config.loop) {
+                if (!flushTranscoder()) {
+                    return SourcePump::ReadResult::Error;
+                }
+                _tx_flushed = true;
+                if (!_pending.empty()) {
+                    return servePending(packet);
+                }
+            }
             if (!_config.loop) {
+                // 【M10-b】转码到这里就结束了：冻结墙钟（否则源播完后 speed 会一路衰减成假数字）
+                if (_transcoder && _tx_end_ms.load() == 0) {
+                    _tx_end_ms.store(static_cast<int64_t>(getCurrentMillisecond()));
+                }
                 return SourcePump::ReadResult::EndOfStream;
             }
             if (!reopenForLoop()) {
@@ -474,6 +522,18 @@ SourcePump::ReadResult DemuxerProducer::read(MediaPacket::Ptr *packet, std::stri
                 pkt->data, pkt->data + static_cast<size_t>(pkt->size));
         }
 
+        // 【M10-b】转码：视频包过一道解码/缩放/编码，音频**原样透传**（SPEC §9 不做音频转码）。
+        // 一次输入可能吐出 0..N 个包：0 个就继续读下一个输入，>1 个先排队再一个一个交。
+        if (_transcoder && kind == MediaKind::Video) {
+            if (!transcodeVideo(*payload, dts_ms, pts_ms)) {
+                return SourcePump::ReadResult::Error;
+            }
+            if (_pending.empty()) {
+                continue; // 编解码器还在攒帧（正常现象，不是错误）
+            }
+            return servePending(packet);
+        }
+
         // 循环重开：把这一趟的时间戳整体挪到上一趟之后（FLV 时间戳必须递增）
         const int64_t offset = _loop_offset_ms.load();
         const int64_t out_dts = dts_ms + offset;
@@ -493,6 +553,206 @@ SourcePump::ReadResult DemuxerProducer::read(MediaPacket::Ptr *packet, std::stri
         *packet = std::move(media_packet);
         return SourcePump::ReadResult::Packet;
     }
+}
+
+// ===========================================================================
+// 【M10-b】转码
+// ===========================================================================
+
+bool DemuxerProducer::openTranscoder() {
+    if (!_config.transcode.enabled) {
+        return true; // 不转码：与 v0.1 完全一致
+    }
+    if (!_has_video_info) {
+        setError("转码需要视频流，但这个源只有音频（v0.2 不做音频转码）→ 明确拒绝");
+        return false;
+    }
+    // 音频必须是 AAC：FLV 只能装 AAC，而 SPEC §9 明确"不做音频转码"。
+    // 这一条**先判**：否则会白建一次编解码器、白转几帧才发现音频没法处理。
+    if (_has_audio_info && _audio_info.codec_id != AV_CODEC_ID_AAC) {
+        setError("音频编码是「" + _audio_info.codec_name +
+                 "」，FLV 只认 AAC，而 v0.2 明确不做音频转码 → 明确拒绝（不静默丢音轨）");
+        return false;
+    }
+
+    // 判定交给 CodecMatrix（单一口径）：**能力感知**的版本 —— HEVC 在有解码器+编码器时可转
+    const TranscodeCaps caps = detectTranscodeCaps();
+    const AVCodecID audio_codec = _has_audio_info ? _audio_info.codec_id : AV_CODEC_ID_NONE;
+    const CopyOrTranscode verdict = decideOutput(_video_info.codec_id, audio_codec, "flv", caps);
+    if (verdict == CopyOrTranscode::Unsupported) {
+        setError("转码被拒：CodecMatrix 判定「" + _video_info.codec_name +
+                 "」→ FLV 不可行（原因见日志：缺解码器/编码器）");
+        return false;
+    }
+
+    Transcoder::Config tc;
+    tc.out_bitrate_kbps = _config.transcode.out_bitrate_kbps;
+    tc.gop_frames = _config.transcode.gop_frames;
+    tc.max_out_packets = _config.transcode.max_out_packets;
+
+    // 目标高度有三种来源，优先级从高到低：
+    //   1) `out_height`（URL 的 `h=`）：用户明确要的高度 —— 与源一样 = 不缩放，比源高 = 拒绝；
+    //   2) `max_height`（`--transcode-height`）：只当**上限**用 —— 源高于它才缩；
+    //   3) 都没有：不缩放（只重编码）。
+    int want_height = _config.transcode.out_height;
+    const bool explicit_height = want_height > 0;
+    if (!explicit_height && _config.transcode.max_height > 0 && _video_info.height > 0 &&
+        _config.transcode.max_height < _video_info.height) {
+        want_height = _config.transcode.max_height;
+    }
+    if (want_height < 0 || (want_height > 0 && (want_height & 1) != 0)) {
+        setError("目标高度非法：" + std::to_string(want_height) +
+                 "（0 = 不缩放；否则必须是**偶数**正数 —— yuv420p 要求）");
+        return false;
+    }
+    if (want_height > 0) {
+        if (_video_info.width <= 0 || _video_info.height <= 0) {
+            setError("拿不到源分辨率（" + std::to_string(_video_info.width) + "x" +
+                     std::to_string(_video_info.height) + "）→ 无法等比缩放，明确拒绝");
+            return false;
+        }
+        if (want_height > _video_info.height && explicit_height) {
+            // 放大既浪费 CPU 又不会更清楚：这类"参数写错了"要当场拒，不能默默照做
+            setError("目标高度 " + std::to_string(want_height) + " 大于源高度 " +
+                     std::to_string(_video_info.height) + " → 明确拒绝（本服务不放大）");
+            return false;
+        }
+        if (want_height != _video_info.height) {
+            tc.out_height = want_height;
+            // 等比算宽（奇数宽由 Transcoder 取偶并 Warn）—— 用 llround 避免截断成 0
+            tc.out_width = static_cast<int>(std::llround(
+                static_cast<double>(_video_info.width) * static_cast<double>(want_height) /
+                static_cast<double>(_video_info.height)));
+        }
+        // want_height == 源高：out_width/out_height 保持 0 = 不缩放（只重编码）
+    }
+
+    Transcoder::Ptr built = Transcoder::create(_video_info, tc);
+    if (!built) {
+        setError("转码器建不起来（输入「" + _video_info.codec_name + "」 " +
+                 std::to_string(_video_info.width) + "x" + std::to_string(_video_info.height) +
+                 "；原因见日志：缺编解码器 / 初始化数据不可用 / 参数非法）");
+        return false;
+    }
+    _transcoder = built;
+    _tx_in_hevc.store(_video_info.codec_id == AV_CODEC_ID_HEVC);
+    // 输出按 CFR 生成（Transcoder 的时间轴 = 锚点 + 帧序号 × 步长），步长取自输出帧率
+    const TimeBase out_fps = built->videoInfo().frame_rate;
+    if (out_fps.num > 0 && out_fps.den > 0) {
+        _tx_frame_step_ms = 1000.0 * static_cast<double>(out_fps.den) /
+                            static_cast<double>(out_fps.num);
+    }
+    _tx_out_width.store(built->videoInfo().width);
+    _tx_out_height.store(built->videoInfo().height);
+    // ★ 关键：把快照换成**输出**形状（宽高 + 现场构造的 avcC）。
+    //   输出层从此看到的就是"一路 H264"，完全不知道它原来是 HEVC 或原来是 1080p。
+    _video_info = built->videoInfo();
+    _tx_enabled.store(true);
+    InfoP("DemuxerProducer: 转码已启用 —— %s %dx%d → h264 %dx%d（out_height=%d）",
+          _tx_in_hevc.load() ? "hevc" : "h264", _raw_video_info.width, _raw_video_info.height,
+          _tx_out_width.load(), _tx_out_height.load(), want_height);
+    return true;
+}
+
+bool DemuxerProducer::enqueueTranscoded(std::vector<Transcoder::OutPacket> *outs) {
+    // ★ 转码走 **`_tx_ts_shift`**，不是 `_loop_offset_ms`：转码器自己生成的时间轴是
+    //   "锚点 + 帧序号 × 步长"，跨趟**自动连续**；再叠一次趟偏移就会双计
+    //   （实测：`--loop` 下视频跑到 14.0s 而音频才 8.1s → 音画彻底错位）。
+    //   `_tx_ts_shift` 只在接缝处补"这一趟真实时长 − 这趟转出的媒体时长"的差额（见 reopenForLoop）。
+    const int64_t offset = _tx_ts_shift;
+    for (auto &item : *outs) {
+        const int64_t out_dts = item.dts_ms + offset;
+        const int64_t out_pts = item.pts_ms + offset;
+        MediaPacket::Ptr built = MediaPacket::create(MediaKind::Video, _video_info.index,
+                                                     std::move(item.data), item.key, out_dts, out_pts);
+        if (!built) {
+            setError("转码产物构造 MediaPacket 失败（时间戳/载荷非法）");
+            ErrorL << "DemuxerProducer: " << lastError();
+            return false;
+        }
+        ++_tx_frames_out;
+        // 媒体时长 = 帧数 × 标称帧步长（CFR 输出；用 dts 跨度会被循环偏移造出的假间隙虚高）
+        _tx_out_media_ms.store(static_cast<uint64_t>(
+            std::llround(static_cast<double>(_tx_frames_out) * _tx_frame_step_ms)));
+        ++_tx_outputs;
+        _pending.push_back(std::move(built));
+    }
+    return true;
+}
+
+bool DemuxerProducer::transcodeVideo(const std::vector<uint8_t> &avcc, int64_t dts_ms,
+                                     int64_t pts_ms) {
+    std::vector<Transcoder::OutPacket> outs;
+    // 只把**转码本身**的耗时计入 cost（不含解封装/节流/网络）：NFR-5 的 speed 分母
+    const uint64_t cost_begin_us = getCurrentMicrosecond();
+    const Transcoder::Result result =
+        _transcoder->transcode(avcc.data(), avcc.size(), dts_ms, pts_ms, &outs);
+    _tx_cost_us.fetch_add(static_cast<int64_t>(getCurrentMicrosecond() - cost_begin_us));
+    ++_tx_inputs;
+    if (_tx_first_ms.load() == 0) {
+        _tx_first_ms.store(static_cast<int64_t>(getCurrentMillisecond())); // speed 的墙钟基准
+    }
+    if (result != Transcoder::Result::Ok) {
+        setError(std::string("转码失败（") + Transcoder::resultName(result) + "）：" +
+                 _transcoder->lastError());
+        ErrorL << "DemuxerProducer: " << lastError();
+        return false;
+    }
+    // 观测：VFR 与"是否建了缩放器"由转码器决定，这里跨线程可见化（各一次 store 很便宜）
+    _tx_vfr.store(_transcoder->vfrDetected());
+    _tx_scaling.store(_transcoder->scaling());
+    return enqueueTranscoded(&outs);
+}
+
+bool DemuxerProducer::flushTranscoder() {
+    if (!_transcoder) {
+        return true;
+    }
+    std::vector<Transcoder::OutPacket> outs;
+    const uint64_t cost_begin_us = getCurrentMicrosecond();
+    const Transcoder::Result result = _transcoder->flush(&outs);
+    _tx_cost_us.fetch_add(static_cast<int64_t>(getCurrentMicrosecond() - cost_begin_us));
+    if (result != Transcoder::Result::Ok) {
+        setError(std::string("转码收尾失败（") + Transcoder::resultName(result) + "）：" +
+                 _transcoder->lastError());
+        ErrorL << "DemuxerProducer: " << lastError();
+        return false;
+    }
+    return enqueueTranscoded(&outs);
+}
+
+SourcePump::ReadResult DemuxerProducer::servePending(MediaPacket::Ptr *packet) {
+    MediaPacket::Ptr front = std::move(_pending.front());
+    _pending.pop_front();
+    ++_packets;
+    _bytes += front->size();
+    *packet = std::move(front);
+    return SourcePump::ReadResult::Packet;
+}
+
+int64_t DemuxerProducer::transcodeElapsedMs() const {
+    const int64_t first = _tx_first_ms.load();
+    if (first <= 0) {
+        return 0; // 还没开始转：没有"经过"可算（不制造 0 除）
+    }
+    // 已经转完就用冻结的时刻（否则源播完后它会一直涨，看起来像"越转越慢"）
+    const int64_t end = _tx_end_ms.load();
+    const int64_t now = (end > 0) ? end : static_cast<int64_t>(getCurrentMillisecond());
+    const int64_t elapsed = now - first;
+    return elapsed > 0 ? elapsed : 0;
+}
+
+int64_t DemuxerProducer::transcodeCostMs() const {
+    const int64_t cost_us = _tx_cost_us.load();
+    return cost_us > 0 ? cost_us / 1000 : 0;
+}
+
+double DemuxerProducer::transcodeSpeed() const {
+    const int64_t cost_ms = transcodeCostMs();
+    if (cost_ms <= 0) {
+        return 0.0; // 还不足 1ms：不编数字（"亚毫秒转完"没法给出有意义的倍数）
+    }
+    return static_cast<double>(_tx_out_media_ms.load()) / static_cast<double>(cost_ms);
 }
 
 } // namespace mzmedia
