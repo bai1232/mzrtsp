@@ -15,7 +15,7 @@
 | **v0.2.1** | 补丁：**B 帧源**的时间戳（pts 不再被钳 → 显示顺序正确；TS 负时间戳整体平移；循环接缝不倒退） | ✅ **已发布**（tag `v0.2.1`；证据见 [docs/ACCEPTANCE_v0.2.1.md](docs/ACCEPTANCE_v0.2.1.md)） |
 | **v0.2.2** | v0.2 收尾：**转码 + HLS**（`/hls/x.m3u8?transcode=1&h=720`） | ✅ **已发布**（tag `v0.2.2`；证据见 [docs/ACCEPTANCE_v0.2.2.md](docs/ACCEPTANCE_v0.2.2.md)） |
 | **v0.2.3** | 重构：`DemuxerProducer` 拆成「读（`SourceSession`）/ 形状（`PacketStage`）/ 编排」 | ✅ **已发布**（tag `v0.2.3`；行为不变的证据见 [docs/ACCEPTANCE_v0.2.3.md](docs/ACCEPTANCE_v0.2.3.md)） |
-| **v0.3.0** | RTSP 输入、解码处理（滤镜/缩放/水印） | 🚧 **进行中**：**a1 RTSP 输入 ✅**（能连、能拉 FLV/HLS、缺参数集当场拒绝、凭据脱敏）、**a2 断流自愈 ✅**（读超时判据、指数退避 1→30 s、重连不踢观众、时间戳接续）、**a2b 收尾 ✅**（`#name` 进日志/stats、RTSP 音视频双轨、默认传输改 TCP）、**a3 1 小时长跑 ✅**。发布依据见 [docs/ACCEPTANCE_v0.3.0.md](docs/ACCEPTANCE_v0.3.0.md)。设计见 [docs/DESIGN_M11.md](docs/DESIGN_M11.md) |
+| **v0.3.0** | RTSP 输入（解码处理/滤镜顺延到 v0.4.0） | ✅ **已发布**：**a1 RTSP 输入 ✅**（能连、能拉 FLV/HLS、缺参数集当场拒绝、凭据脱敏）、**a2 断流自愈 ✅**（读超时判据、指数退避 1→30 s、重连不踢观众、时间戳接续）、**a2b 收尾 ✅**（`#name` 进日志/stats、RTSP 音视频双轨、默认传输改 TCP）、**a3 1 小时长跑 ✅**。发布依据见 [docs/ACCEPTANCE_v0.3.0.md](docs/ACCEPTANCE_v0.3.0.md)。设计见 [docs/DESIGN_M11.md](docs/DESIGN_M11.md) |
 
 ### v0.2.0 验收摘要（实测，完整矩阵见验收报告）
 
@@ -213,7 +213,8 @@ cd build && ctest                        # 26 个分组（297 个用例），**�
 | [docs/SPEC.md](docs/SPEC.md) | **需求规格（唯一规格来源）**：能力矩阵、流水线、功能/非功能需求、成功标准 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构设计：分层、线程模型、一源多消费者、资源管理 |
 | [docs/CODEC_MATRIX.md](docs/CODEC_MATRIX.md) | 输入 × 输出的可行性判定（何时 remux、何时必须转码） |
-| [docs/ACCEPTANCE_v0.2.3.md](docs/ACCEPTANCE_v0.2.3.md) | **v0.2.3 验收报告（当前版本）**：重构等价性（字节级）+ 门禁 + 风险 |
+| [docs/ACCEPTANCE_v0.3.0.md](docs/ACCEPTANCE_v0.3.0.md) | **v0.3.0 验收报告（当前版本）**：RTSP 输入/断流自愈/音视频的逐条证据 + 1 小时长跑实测 + 已知限制 |
+| [docs/ACCEPTANCE_v0.2.3.md](docs/ACCEPTANCE_v0.2.3.md) | v0.2.3 验收报告：重构等价性（字节级）+ 门禁 + 风险 |
 | [docs/DESIGN_REFACTOR_PIPELINE.md](docs/DESIGN_REFACTOR_PIPELINE.md) | **流水线重构设计（v0.2.3）**：为什么拆、拆成什么、两条契约、扩展方式、等价性证据、机检口径 |
 | [docs/ACCEPTANCE_v0.2.2.md](docs/ACCEPTANCE_v0.2.2.md) | **v0.2.2 验收报告**：转码 + HLS 补齐（v0.2 里程碑收尾） |
 | [docs/ACCEPTANCE_v0.2.1.md](docs/ACCEPTANCE_v0.2.1.md) | **v0.2.1 补丁验收报告**：B 帧源时间戳三处缺陷的修前/修后实测 + 变异验证 |

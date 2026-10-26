@@ -5,10 +5,18 @@
 
 ## [Unreleased]
 
-（v0.3.0：**M11-a1 ✅** RTSP 能连能拉、**a2 ✅** 断流自动重连（观众不掉线）、
-**a2b ✅** 名字进日志/stats + 音视频双轨 + 默认传输改 TCP + 网络 EOF 当断流、**a3 ✅** 1 小时长跑。
-发布依据见 [docs/ACCEPTANCE_v0.3.0.md](docs/ACCEPTANCE_v0.3.0.md)；设计见
-[docs/DESIGN_M11.md](docs/DESIGN_M11.md)）
+（下一版：详见 `docs/ROADMAP.md`）
+
+## [0.3.0] - 2026-10-26
+
+> 发布证据见 **[docs/ACCEPTANCE_v0.3.0.md](docs/ACCEPTANCE_v0.3.0.md)**；设计见
+> **[docs/DESIGN_M11.md](docs/DESIGN_M11.md)**。
+> 主题：**RTSP 输入**（能连、能拉、断流自愈、音视频双轨、名字可观测）+ **1 小时长跑通过**。
+
+**1 小时长跑实测**（`scripts/rtsp_soak.sh --duration 3600 --restart-at 1800`，
+中途第 30 分钟 kill 上游再起）：观众侧 93.3 MiB / 89,754 包 / 媒体时间轴 **3590.1 s** /
+跨重连 **0 次 dts 倒退** / 解码零（已知之外）错误 / `reconnects=1` 后继续满速 /
+RSS 33,372→35,136 KB（+5.3%）/ 持续吞吐 **67.69→67.93 包/秒**（无衰减）。
 
 ### Added（**M11-a1：RTSP 输入**，v0.3-a 的第一批）
 - `--rtsp <url>[#name]`（可重复）：把 RTSP 源注册成 `/live/<name>.flv` 与 `/hls/<name>.m3u8`
@@ -950,5 +958,5 @@
 | 版本 | 主题 | 状态 |
 |---|---|---|
 | `v0.1.0` | MP4 / H264 裸流 → HTTP-FLV（remux，多客户端共享） | ✅ **已发布** |
-| `v0.2.0` | MKV / TS 输入、HLS 输出、转码 | ⏳ 计划 |
-| `v0.3.0` | RTSP 输入、解码处理（滤镜/缩放/水印） | ⏳ 计划 |
+| `v0.2.0` | MKV / TS 输入、HLS 输出、转码 | ✅ **已发布** |
+| `v0.3.0` | RTSP 输入（含断流自愈 / 音视频） | ✅ **已发布（解码处理/滤镜顺延到 v0.4）** |

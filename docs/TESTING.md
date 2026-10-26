@@ -375,7 +375,7 @@ cmake -B build-tsan -DMZMEDIA_ENABLE_TSAN=ON -DCMAKE_CXX_COMPILER=g++-12
 | ASAN | **26/26** |
 | TSAN | **398 用例 / 已知误报 0 / 真问题 0**（严格组 + `qtimed`/`ptimed`/`ntimed`；含 `pipeline` 12 / `rtsp` 5） |
 | 脚本 | `http` / `flv_mux` **8** / `ts_mux` **29** / **`hls` 40** / **`flv_http` 104** / `transcode` **12** / **`rtsp` 41**（a1 22 + a2 11 + a2b 8）/ 等价性 **11** / **`rtsp_soak` 1 小时** —— 全绿 |
-| 长跑 | `scripts/rtsp_soak.sh --duration 3600 --restart-at 1800`：见 `ACCEPTANCE_v0.3.0.md` §4 |
+| 长跑 | `scripts/rtsp_soak.sh --duration 3600 --restart-at 1800`：**8/8 通过**（93.3 MiB / 89,754 包 / 时间轴 3590.1 s / dts 0 次倒退 / 掐断上游后 `reconnects=1` / RSS +5.3% / 持续吞吐 67.69→67.93 包/秒），见 `ACCEPTANCE_v0.3.0.md` §4 |
 
 
 > **M11-a2 那轮的唯一"已知现象"（不是 bug，已写进文档）**：假 RTSP 源**不发 RTCP SR**，
