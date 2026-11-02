@@ -42,7 +42,8 @@ SourceManager::Ptr SourceManager::create(const EventPoller::Ptr &poller) {
 }
 
 SourceManager::SourceManager(const EventPoller::Ptr &poller)
-    : _poller(poller) {
+    : _poller(poller)
+    , _quota(std::make_shared<SubscriberQuota>(0)) {
     if (!poller) {
         // 没有 poller 就挂不了空闲计时：**明确退化为"句柄释放即回收"**，
         // 而不是"看起来在缓存、其实永远不释放"（那就是泄漏）
@@ -77,10 +78,21 @@ bool SourceManager::setConfig(const Config &config) {
               << " 不在 [1, " << kHardMaxTranscoding << "]（0 = 不是「不限」）";
         return false;
     }
-    std::lock_guard<std::mutex> lock(_mutex);
-    _config = config;
-    if (!_poller) {
-        _config.idle_release_ms = 0; // 没有 poller 就没有空闲缓存这一档
+    size_t existing_sources = 0;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        // 全局观众名额：**必须在任何 acquire 之前**建好（已有源时换上限会让计数与在册订阅者不一致）
+        _quota = std::make_shared<SubscriberQuota>(config.max_total_subscribers);
+        _config = config;
+        if (!_poller) {
+            _config.idle_release_ms = 0; // 没有 poller 就没有空闲缓存这一档
+        }
+        existing_sources = _entries.size();
+    }
+    if (existing_sources != 0) {
+        // 日志在**锁外**（全仓约定：锁内只改状态）
+        WarnL << "SourceManager::setConfig：已有 " << existing_sources
+              << " 个源在册，新的全局名额上限只对之后创建的源生效";
     }
     return true;
 }
@@ -145,6 +157,7 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path, const Transcode
     const std::string key = sourceKey(path, spec);
 
     Config config;
+    SubscriberQuota::Ptr quota;
     {
         std::lock_guard<std::mutex> lock(_mutex);
         const auto it = _entries.find(key);
@@ -162,6 +175,7 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path, const Transcode
             return makeHandle(entry);
         }
         config = _config;
+        quota = _quota;
         // 【M10-b / FR-1.3】**并发上限在锁内判**：否则两个请求同时通过检查 → 超限
         if (spec.enabled) {
             const size_t running = transcodingCountLocked();
@@ -228,7 +242,7 @@ MediaSource::Ptr SourceManager::acquire(const std::string &path, const Transcode
     }
     // 把"要停了"接进 FFmpeg 的 interrupt_callback：stop() 才能真正打断 av_read_frame
     (void) fresh->producer->setAbortFlag(&fresh->pump->stopFlag());
-    fresh->source = std::make_shared<MediaSource>(config.source);
+    fresh->source = std::make_shared<MediaSource>(config.source, quota);
 
     auto producer = fresh->producer;
     auto source = fresh->source;
@@ -644,6 +658,14 @@ std::string SourceManager::dumpStatsJson() const {
         out += ",\"max_transcoding\":" + std::to_string(_config.max_transcoding);
         out += ",\"transcoding\":" + std::to_string(transcodingCountLocked());
         out += ",\"transcode_rejected\":" + std::to_string(_total_transcode_rejected.load());
+        // 【A 批】全局观众名额：上限 / 在用 / 因它被拒几次 / 归还越界次数（应恒 0）
+        out += ",\"max_total_subscribers\":" +
+               std::to_string(_config.max_total_subscribers);
+        if (_quota) {
+            out += ",\"quota_in_use\":" + std::to_string(_quota->inUse());
+            out += ",\"quota_rejected\":" + std::to_string(_quota->rejected());
+            out += ",\"quota_over_releases\":" + std::to_string(_quota->overReleases());
+        }
         out += "}";
         for (const auto &kv : _entries) {
             SnapshotItem item;

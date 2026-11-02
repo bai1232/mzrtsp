@@ -7,6 +7,20 @@
 
 （下一版：详见 `docs/ROADMAP.md`）
 
+### Added（**A 批：准入上限可配**，v0.3.1 进行中）
+- **三个旋钮，都有界、可配、可观测**（`0` 一律非法，不是"不限"）：
+  · `--max-subscribers N`：**每路源**的观众上限，默认 **512**（原先是写死的 16）；
+  · `--max-total-subscribers N`：**进程内**观众总数上限，默认 **1024**
+    （每源上限 × 源数 才是真上限：100 源 × 512 人 × 2 MB 队列 = 100 GB，所以必须有全局旋钮）；
+  · `--max-connections N`：TCP 连接上限，默认由 **`ulimit -n − 64`** 推导（16..65535）。
+- `media/subscriber_quota.h`（新）：跨源共享的**观众名额**（原子计数 + 申请/归还）。
+  归还绑在 `Subscriber` 的**析构**上 —— 消费者自己释放 shared_ptr 是最常见的路径，
+  把归还在 `unsubscribe()` 里做会漏（表现为"跑一阵之后所有人都 503"）。
+- `/api/stats` 新增 `max_total_subscribers / quota_in_use / quota_rejected / quota_over_releases`
+  与每源 `counters.rejected_by_quota`；`quota_over_releases` 恒为 0，非 0 即配额记账有 bug。
+- 订阅被拒时区分语义：**名额满 → 503 + `Retry-After: 1`**（稍后再试），
+  **关键帧灌不进队列 → 500**（这个源现在接不了人）。用计数器差判定，不 parse 错误文本。
+
 ## [0.3.0] - 2026-10-26
 
 > 发布证据见 **[docs/ACCEPTANCE_v0.3.0.md](docs/ACCEPTANCE_v0.3.0.md)**；设计见

@@ -32,6 +32,7 @@
 
 #include "media/frame_queue.h"
 #include "media/gop_cache.h"
+#include "media/subscriber_quota.h"
 #include "media/media_packet.h"
 #include "network/event_poller.h"
 
@@ -55,6 +56,16 @@ public:
     /// 消费者线程回调。参数是本订阅者的 `shared_ptr`（**drain 期间它不会被析构**）。
     /// 约定：回调里应当把队列取空；返回后框架不再做任何事
     using DrainCallback = std::function<void(const Ptr &)>;
+
+    /// 【全局名额】归还绑在**析构**上：订阅者被丢弃 / 源析构 / 惰性清理 —— 任何路径都只归还一次
+    /// @note 不能把归还放在 `MediaSource::unsubscribe()` 里：那样"消费者自己释放 shared_ptr"这条
+    ///       路径（正是最常见的路径）就永远不还名额，表现为"跑一段时间后所有人都是 503"
+    /// @note 必须是 public：`std::shared_ptr<Subscriber>` 的删除器在类外实例化
+    ~Subscriber() {
+        if (_quota) {
+            _quota->release();
+        }
+    }
 
     Id id() const {
         return _id;
@@ -127,10 +138,12 @@ public:
 private:
     friend class MediaSource;
 
-    Subscriber(Id id, const FrameQueue::Limits &limits)
-        : _id(id) {
+    Subscriber(Id id, const FrameQueue::Limits &limits, SubscriberQuota::Ptr quota = nullptr)
+        : _id(id)
+        , _quota(std::move(quota)) {
         (void) _queue.setLimits(limits);
     }
+
 
     /// @return true = 状态发生改变（已经是 broken 则返回 false，避免重复计数）
     bool markBroken() {
@@ -142,6 +155,7 @@ private:
 
     Id _id;
     FrameQueue _queue;
+    SubscriberQuota::Ptr _quota; ///< 全局名额（空 = 该源不参与全局上限，单测默认如此）
     std::atomic<bool> _broken{false};
 
     mutable std::mutex _mutex; // 保护 _poller / _drain（源线程与绑定线程可能同时碰）
@@ -163,7 +177,9 @@ public:
         size_t max_bitrate_bps = 8u * 1000u * 1000u; // 单路码率上限：8 Mbps
         uint32_t latency_budget_ms = 2000;           // 延迟额度：2 s → 队列上限 2,000,000 B
         uint32_t max_gop_ms = 2000;                  // 最大 GOP 时长：2 s → GOP 上限 2,000,000 B
-        size_t max_subscribers = 16;                 // **人数**是硬边界（0/无界不是选项）
+        /// 【工业口径】每源人数上限：默认 512（demo 时代的 16 太小，但**仍然有界**）
+        /// @note 它只保护**单条流**；跨源的总量由 `SubscriberQuota` 管（见 subscriber_quota.h）
+        size_t max_subscribers = 512;                // **人数**是硬边界（0/无界不是选项）
 
         size_t queueMaxBytes() const {
             return bytesFor(max_bitrate_bps, latency_budget_ms);
@@ -189,6 +205,8 @@ public:
 
     MediaSource();
     explicit MediaSource(const Limits &limits);
+    /// @param quota 全局名额（空 = 不参与；应用层由 SourceManager 统一注入，所有源共享一个）
+    MediaSource(const Limits &limits, SubscriberQuota::Ptr quota);
 
     /// @return false = 上限非法，保持原值不变。**可在任意线程调用**（内部加锁）
     bool setLimits(const Limits &limits);
@@ -245,6 +263,10 @@ public:
     uint64_t totalRejected() const {
         return _total_rejected.load();
     }
+    /// 【全局名额】因跨源总量已满而被拒的次数（与"每源人数满"分开计数，便于运维判断该调哪个旋钮）
+    uint64_t totalRejectedByQuota() const {
+        return _total_rejected_by_quota.load();
+    }
     uint64_t totalSubscribe() const {
         return _total_subscribe.load();
     }
@@ -259,7 +281,7 @@ public:
     }
 
 private:
-    static constexpr size_t kHardMaxSubscribers = 4096;
+    static constexpr size_t kHardMaxSubscribers = 65535;
     static constexpr size_t kHardMaxBitrateBps = 100u * 1000u * 1000u; // 100 Mbps
     static constexpr uint32_t kHardMaxLatencyMs = 10u * 1000u;         // 10 s
     static constexpr uint32_t kHardMaxGopMs = 60u * 1000u;             // 60 s
@@ -295,6 +317,8 @@ private:
     std::atomic<uint64_t> _total_seed_failed{0};
     std::atomic<uint64_t> _total_auto_unsubscribe{0};
     std::atomic<uint64_t> _total_broken{0};
+    std::atomic<uint64_t> _total_rejected_by_quota{0};
+    SubscriberQuota::Ptr _quota; ///< 全局名额（空 = 不参与）
 };
 
 } // namespace mzmedia

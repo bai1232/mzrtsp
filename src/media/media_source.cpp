@@ -107,6 +107,14 @@ bool Subscriber::notifyIfNeeded() {
 MediaSource::MediaSource()
     : MediaSource(Limits{}) {}
 
+MediaSource::MediaSource(const Limits &limits, SubscriberQuota::Ptr quota)
+    : _gop(limits.gopMaxBytes())
+    , _quota(std::move(quota)) {
+    // 先站稳默认值（有界），再由 setLimits 校验入参；非法项保持默认并记日志
+    _limits = Limits{};
+    (void) setLimits(limits);
+}
+
 MediaSource::MediaSource(const Limits &limits)
     : _gop(limits.gopMaxBytes()) {
     // 先站稳默认值（有界），再由 setLimits 校验入参；非法项保持默认并记日志
@@ -182,6 +190,7 @@ size_t MediaSource::pruneExpiredLocked() {
 Subscriber::Ptr MediaSource::subscribe() {
     Subscriber::Ptr sub;
     bool rejected_by_limit = false;
+    bool rejected_by_quota = false;
     bool seed_failed = false;
     size_t seed_size = 0;
     size_t queue_limit = 0;
@@ -193,9 +202,15 @@ Subscriber::Ptr MediaSource::subscribe() {
         if (_entries.size() >= _limits.max_subscribers) {
             ++_total_rejected;
             rejected_by_limit = true;
+        } else if (_quota && !_quota->tryAcquire()) {
+            // 【全局名额】跨源总量已满：拒绝接入（不是排队、不是降级）
+            ++_total_rejected;
+            ++_total_rejected_by_quota;
+            rejected_by_quota = true;
         } else {
             const FrameQueue::Limits queue_limits{queue_limit};
-            sub.reset(new Subscriber(_next_id++, queue_limits));
+            // 名额**随订阅者生命周期**：构造时接管，析构时归还（下面任何一条失败路径都自动还）
+            sub.reset(new Subscriber(_next_id++, queue_limits, _quota));
 
             // 灌 GOP 缓存：保证消费者拿到的第一条是视频关键帧（否则首帧解不出 = 静默错误）
             const std::vector<MediaPacket::Ptr> seed = _gop.snapshot();
@@ -228,7 +243,11 @@ Subscriber::Ptr MediaSource::subscribe() {
 
     // 日志一律在锁外（锁内只改状态）
     if (rejected_by_limit) {
-        WarnL << "MediaSource::subscribe 被拒：订阅者已达上限 " << _limits.max_subscribers;
+        WarnL << "MediaSource::subscribe 被拒：**本路**订阅者已达上限 " << _limits.max_subscribers;
+    }
+    if (rejected_by_quota) {
+        WarnL << "MediaSource::subscribe 被拒：**全局**名额已满（上限 " << _quota->limit()
+              << "，在用 " << _quota->inUse() << "）";
     }
     if (seed_failed) {
         WarnL << "MediaSource::subscribe 失败：关键帧 " << seed_size
@@ -427,6 +446,7 @@ std::string MediaSource::dumpStatsJson() {
                ",\"dropped\":" + std::to_string(_total_dropped_to_make_room.load()) +
                ",\"dropped_incoming\":" + std::to_string(_total_dropped_incoming.load()) +
                ",\"rejected\":" + std::to_string(_total_rejected.load()) +
+               ",\"rejected_by_quota\":" + std::to_string(_total_rejected_by_quota.load()) +
                ",\"subscribe\":" + std::to_string(_total_subscribe.load()) +
                ",\"seed_failed\":" + std::to_string(_total_seed_failed.load()) +
                ",\"auto_unsub\":" + std::to_string(_total_auto_unsubscribe.load()) +

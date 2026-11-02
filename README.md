@@ -137,6 +137,8 @@ cmake -B build && cmake --build build -j"$(nproc)"
 # 3) 启动服务：零参数 = 0.0.0.0:8080 + 媒体目录 ./samples
 ./build/bin/mzmedia
 #    常用选项：--port 9000 --media-root /data --loop --speed 4 --log-level debug --log-file logs/x.log --help
+#    准入上限：--max-subscribers 512（每源观众）--max-total-subscribers 1024（进程内总数）
+#              --max-connections N（默认由 ulimit -n 推导）。三个都是**有界**的，0 不是"不限"
 
 # 4) 看画面（二选一）
 #    浏览器：打开 http://127.0.0.1:8080/ ，点「播放」（页面用的是**入库**的 flv.js，离线可用）

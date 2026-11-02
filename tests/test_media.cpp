@@ -503,6 +503,91 @@ MZ_TEST(media_source_new_subscriber_starts_at_keyframe) {
     MZ_ASSERT_EQ(tiny.subscriberCount(), 0u);
 }
 
+// ---------------------------------------------------------------------------
+// 【A 批】准入上限：每源人数 + 跨源全局名额
+//
+// 什么让它红：
+//   · 每源上限没从 Limits 生效 → 第一条（第 4 个订阅仍能进）；
+//   · 全局名额没被多个源共享 / 名额不归还 → 第二、三条（泄漏后"过一会儿所有人都 503"）；
+//   · 接入失败却已扣名额 → 第四条（关键帧灌不进队列时名额必须退回）。
+// ---------------------------------------------------------------------------
+
+MZ_TEST(media_source_admission_limit_from_config) {
+    MediaSource::Limits limits;
+    limits.max_subscribers = 3; // 默认 512；这里显式设小方便断言
+    MediaSource source(limits);
+
+    std::vector<Subscriber::Ptr> subs;
+    for (int i = 0; i < 3; ++i) {
+        auto sub = source.subscribe();
+        MZ_ASSERT_NOT_NULL(sub.get());
+        if (sub) {
+            subs.push_back(sub);
+        }
+    }
+    MZ_ASSERT_EQ(source.subscriberCount(), 3u);
+    MZ_ASSERT_NULL(source.subscribe().get()); // 第 4 个必须被拒
+    MZ_ASSERT_EQ(source.totalRejected(), 1u);
+    MZ_ASSERT_EQ(source.totalRejectedByQuota(), 0u); // 不是全局名额的锅
+}
+
+MZ_TEST(media_source_global_quota_shared_across_sources) {
+    auto quota = std::make_shared<SubscriberQuota>(2); // 全局只允许 2 个观众
+    MediaSource::Limits limits;                        // 每源上限保持默认（512）
+    MediaSource a(limits, quota);
+    MediaSource b(limits, quota);
+
+    auto s1 = a.subscribe();
+    MZ_ASSERT_NOT_NULL(s1.get());
+    auto s2 = b.subscribe();
+    MZ_ASSERT_NOT_NULL(s2.get());
+    MZ_ASSERT_EQ(quota->inUse(), 2u);
+
+    // 第 3 个（换一条源也一样）必须被**全局名额**拒掉，且能区分出"是哪一类拒绝"
+    MZ_ASSERT_NULL(b.subscribe().get());
+    MZ_ASSERT_EQ(b.totalRejectedByQuota(), 1u);
+    MZ_ASSERT_EQ(quota->rejected(), 1u);
+
+    // 归还绑在 Subscriber 生命周期上：释放一个 → 名额退回 → 能再进
+    s1.reset();
+    MZ_ASSERT_EQ(quota->inUse(), 1u);
+    auto s3 = a.subscribe();
+    MZ_ASSERT_NOT_NULL(s3.get());
+    MZ_ASSERT_EQ(quota->inUse(), 2u);
+    MZ_ASSERT_EQ(quota->overReleases(), 0u); // 归还次数不能多于申请次数
+
+    // 源析构时，它名下还活着的订阅者必须归还名额（否则名额永久泄漏）
+    s2.reset();
+    s3.reset();
+    MZ_ASSERT_EQ(quota->inUse(), 0u);
+}
+
+MZ_TEST(media_source_failed_seed_returns_quota) {
+    // 关键帧比队列表量还大 → 拒绝接入；但**已经抢到的全局名额必须退回**
+    auto quota = std::make_shared<SubscriberQuota>(4);
+    MediaSource::Limits limits;
+    limits.max_bitrate_bps = 400000; // 400 kbps × 1 ms = 50 字节
+    limits.latency_budget_ms = 1;
+    MediaSource source(limits, quota);
+    (void) source.pushPacket(video(0, true, 100, 0)); // 100 字节 > 50 字节
+
+    MZ_ASSERT_NULL(source.subscribe().get());
+    MZ_ASSERT_EQ(source.totalSeedFailed(), 1u);
+    MZ_ASSERT_EQ(quota->inUse(), 0u); // ← 这条是重点：失败路径不能漏掉归还
+    MZ_ASSERT_EQ(quota->overReleases(), 0u);
+
+    // 放宽上限后能正常接入，说明名额确实还在池子里
+    MediaSource::Limits wide;
+    MediaSource wide_source(wide, quota);
+    (void) wide_source.pushPacket(video(0, true, 10, 0));
+    // 注意：必须**留住** shared_ptr —— 订阅者一析构名额就归还了（这本身也是一种验证）
+    auto wide_sub = wide_source.subscribe();
+    MZ_ASSERT_NOT_NULL(wide_sub.get());
+    MZ_ASSERT_EQ(quota->inUse(), 1u);
+    wide_sub.reset();
+    MZ_ASSERT_EQ(quota->inUse(), 0u); // 析构即归还
+}
+
 MZ_TEST(media_source_subscriber_lifetime_and_limits) {
     MediaSource source;
     MediaSource::Limits limits;
@@ -566,7 +651,11 @@ MZ_TEST(media_source_subscriber_lifetime_and_limits) {
 MZ_TEST(media_source_dump_stats_minimal) {
     // FR-6.1 的最小版（本批定）：几个 atomic 计数器 + 一行 dumpStats()，
     // 可从**任意线程**调用（HTTP 线程将来直接把它塞进 /api/stats）
-    MediaSource source;
+    // 人数上限**显式**设成 16：这条用例验的是"出账公式"（8 Mbps × 人数），
+    // 不该随 `Limits::max_subscribers` 的默认值（工业口径 512）漂移
+    MediaSource::Limits limits;
+    limits.max_subscribers = 16;
+    MediaSource source(limits);
     auto sub = source.subscribe();
     MZ_ASSERT_NOT_NULL(sub.get());
     if (!sub) {

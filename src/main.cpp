@@ -38,6 +38,8 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <sys/resource.h>
+
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -71,6 +73,9 @@ const char *kUsage =
     "  --rtsp-timeout-ms <n>  网络流读超时（默认 10000；> 这个时间没有包就判定断流）\n"
     "  --rtsp-transport <t>   tcp|auto|udp（默认 tcp = 交错传输、不丢包；auto = UDP 优先、被拒回退 TCP）\n"
     "  --hls-lease-ms <n>  HLS 拉流请求的租约（默认 60000；到期且没人拉就释放源，FR-1.3）\n"
+    "  --max-subscribers <n>        每路源最多几个观众（默认 512；1..65535，0 非法）\n"
+    "  --max-total-subscribers <n>  进程内观众总数上限（默认 1024；跨源汇总）\n"
+    "  --max-connections <n>        TCP 连接上限（默认由 ulimit -n 推导，最少 16）\n"
     "  --log-level <l>     trace|debug|info|warn|error|fatal（默认 info）\n"
     "  --log-file <path>   日志文件（默认 logs/mzmedia.log，64MB×5 滚动；FR-6.2）\n"
     "  --help              显示本帮助\n"
@@ -289,6 +294,22 @@ bool parseTranscodeQuery(const std::string &query, SourceManager::TranscodeSpec 
     return true;
 }
 
+/// 解析"有界大小"参数（名额/连接数）：拒绝空串与垃圾尾巴，0 不当"不限"
+/// @return false = 非法（已打印原因，调用方返回 2）
+bool parseBoundedSize(const std::string &text, size_t lo, size_t hi, size_t *out,
+                      const char *name) {
+    char *end = nullptr;
+    const long long value = std::strtoll(text.c_str(), &end, 10);
+    if (text.empty() || end == nullptr || *end != '\0' ||
+        value < static_cast<long long>(lo) || value > static_cast<long long>(hi)) {
+        std::fprintf(stderr, "%s 非法：%s（应为 %zu..%zu；0 不是「不限」）\n", name, text.c_str(),
+                     lo, hi);
+        return false;
+    }
+    *out = static_cast<size_t>(value);
+    return true;
+}
+
 /// 日志级别名 → 枚举；@return false = 不认识（调用方报错退出）
 bool parseLogLevel(const std::string &text, LogLevel *out) {
     if (text == "trace") {
@@ -352,6 +373,13 @@ int main(int argc, char **argv) {
     std::string log_file = "logs/mzmedia.log"; // FR-6.2 的默认值
     bool loop = false;
     double speed = 1.0;
+    // 【A 批】准入上限：三个旋钮都必须**有界**（0 = 非法，不是"不限"）
+    //   · 每源人数保护单条流；· 全局人数保护进程；· 连接数保护 fd
+    //   默认值不是拍出来的：人数按"一个源 typically 几十人"给 512，全局按"多源合计"给 1024，
+    //   连接数直接由 `ulimit -n` 推导（减掉监听/日志/媒体文件等预留）
+    size_t max_subscribers = 512;
+    size_t max_total_subscribers = 1024;
+    size_t max_connections = 0; // 0 = 未指定 → 由 ulimit 推导
     uint32_t hls_lease_ms = 60000;   // FR-1.3 的 60s 同量级；可调是为了让验收脚本能验"租约到期释放"
     LogLevel level = LogLevel::Info;
     // 【M11-a】RTSP 输入：命令行注册"名字 → URL"（**绝不**从 URL query 取地址，避免 SSRF）
@@ -476,6 +504,19 @@ int main(int argc, char **argv) {
                 return 2;
             }
             hls_lease_ms = static_cast<uint32_t>(parsed);
+        } else if (key == "--max-subscribers") {
+            if (!parseBoundedSize(value(), 1, 65535, &max_subscribers, "--max-subscribers")) {
+                return 2;
+            }
+        } else if (key == "--max-total-subscribers") {
+            if (!parseBoundedSize(value(), 1, 65535, &max_total_subscribers,
+                                  "--max-total-subscribers")) {
+                return 2;
+            }
+        } else if (key == "--max-connections") {
+            if (!parseBoundedSize(value(), 16, 65535, &max_connections, "--max-connections")) {
+                return 2;
+            }
         } else if (key == "--log-level") {
             if (!parseLogLevel(value(), &level)) {
                 std::fprintf(stderr, "--log-level 非法：%s\n", argv[i]);
@@ -539,6 +580,9 @@ int main(int argc, char **argv) {
     manager_config.throttle.speed = speed;
     manager_config.producer.loop = loop;
     manager_config.max_transcoding = transcode_max; // FR-1.3：转码并发是硬上限，0 会被拒
+    // 【A 批】三个准入旋钮（都要有界；0 不是"不限"）
+    manager_config.source.max_subscribers = max_subscribers;
+    manager_config.max_total_subscribers = max_total_subscribers;
     // 【M11-a】RTSP：开关 + 网络流超时 + 传输方式
     manager_config.rtsp.enabled = rtsp_enabled;
     manager_config.rtsp.timeout_ms = rtsp_timeout_ms;
@@ -693,6 +737,13 @@ int main(int argc, char **argv) {
                 const uint64_t rejected_before = manager->totalTranscodeRejected();
                 // 【M11-a2b】RTSP 源把 `#name` 带下去：日志前缀与 /api/stats 里能对上命令行
                 MediaSource::Ptr source = manager->acquire(path, spec, is_rtsp ? name : std::string());
+                // 【A 批】订阅被拒时用它判断"是名额满还是别的原因"（计数器差是契约，文本会变）
+                uint64_t rejected_by_quota_before = 0;
+                uint64_t rejected_before_subscribe = 0;
+                if (source) {
+                    rejected_by_quota_before = source->totalRejectedByQuota();
+                    rejected_before_subscribe = source->totalRejected();
+                }
                 if (!source) {
                     // 被拒的两类原因分开报：**并发已满是"稍后再试"（503）**，
                     // 编码解不了 / 参数非法是"这个源不行"（500）。
@@ -716,8 +767,21 @@ int main(int argc, char **argv) {
                 // 顺序讲究：**先建 sender**（它内部校验编码/初始化数据），**再**发响应头
                 auto subscriber = source->subscribe();
                 if (!subscriber) {
-                    resp.setStatus(503);
-                    resp.setBody("503 Service Unavailable：订阅失败（人数上限 / 关键帧放不下）\n");
+                    // 【A 批】两种拒绝原因语义不同：名额满 = **稍后再试**（503 + Retry-After）；
+                    // 关键帧放不下 = 这个源现在不适合接人（500）。用计数器差判定，不 parse 文本。
+                    const bool quota_full = source->totalRejectedByQuota() > rejected_by_quota_before;
+                    const bool limit_full = source->totalRejected() > rejected_before_subscribe;
+                    if (quota_full || limit_full) {
+                        resp.setStatus(503);
+                        resp.setHeader("Retry-After", "1");
+                        resp.setBody(quota_full
+                                         ? "503 Service Unavailable：**全局**观众名额已满（--max-total-subscribers）\n→ 稍后重试\n"
+                                         : "503 Service Unavailable：**本路**观众人数已满（--max-subscribers）\n→ 稍后重试\n");
+                    } else {
+                        resp.setStatus(500);
+                        resp.setBody("500 Internal Server Error：关键帧灌不进队列（这个源暂时接不了新观众）\n"
+                                     "→ 源的码率×延迟额度比单帧还小，检查码流或调大延迟额度\n");
+                    }
                     return;
                 }
                 (void) subscriber->bindPoller(poller); // 消费线程 = 连接所属的 poller 线程
@@ -813,6 +877,28 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // 【A 批】连接上限：未显式给 → 由 `ulimit -n` 推导（减 64 预留：监听 fd/日志/媒体文件/管道）
+    if (max_connections == 0) {
+        struct rlimit rl {};
+        size_t derived = 960; // getrlimit 失败时的保守值（= 1024 − 64）
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
+            const size_t cur = static_cast<size_t>(rl.rlim_cur);
+            derived = cur > 64 ? cur - 64 : 16;
+        }
+        if (derived < 16) {
+            derived = 16;
+        }
+        if (derived > 65535) {
+            derived = 65535;
+        }
+        max_connections = derived;
+    }
+    if (!server->setMaxSessionCount(max_connections)) {
+        // 连接上限是硬要求：设不上就明确失败，而不是"看起来启动了、实际无上限"
+        std::fprintf(stderr, "设置连接上限失败（%zu）→ 拒绝启动\n", max_connections);
+        return 1;
+    }
+
     if (!server->start(port)) {
         std::fprintf(stderr, "启动失败：端口 %u 被占用？\n", static_cast<unsigned>(port));
         return 1;
@@ -832,6 +918,8 @@ int main(int argc, char **argv) {
     std::printf("  媒体目录  : %s%s\n", media_root.c_str(), isDir(media_root) ? "" : "（不存在！）");
     std::printf("  日志文件  : %s\n", log_file.c_str());
     std::printf("  推送      : %gx%s\n", speed, loop ? "，循环推流" : "");
+    std::printf("  准入上限  : 每源 %zu 观众 / 全局 %zu 观众 / %zu 连接\n", max_subscribers,
+                max_total_subscribers, max_connections);
     if (transcode_allowed) {
         std::printf("  转码      : 开启（默认 %dp，最多 %u 路；URL 加 ?transcode=1&h=720）\n",
                     transcode_height, transcode_max);

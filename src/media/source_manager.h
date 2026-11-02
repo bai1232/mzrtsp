@@ -57,6 +57,10 @@ public:
         uint32_t deferred_recheck_ms = 1000;
         Throttle::Config throttle;        // FR-3.5：默认开、1 倍速（压测/单测可调 speed）
         MediaSource::Limits source;       // 每源的队列 / GOP / 人数上限（推导值在 Limits 里）
+        /// 【工业口径】跨源的**观众总数**上限（0 = 不启用；应用层默认 1024）
+        /// @note 每源上限 × 源数 才是真上限：100 路 × 512 人 × 2 MB 队列 = 100 GB，
+        ///       所以必须有一个**全局**旋钮保护进程（见 media/subscriber_quota.h）
+        size_t max_total_subscribers = 1024;
         DemuxerProducer::Config producer; // 解封装上限（流数 / 单包 / 超时 / 循环重开）
         /// 【M11-a】RTSP（网络源）：开关、超时、传输方式 —— 由 app 从命令行填
         DemuxerProducer::RtspConfig rtsp;
@@ -219,6 +223,8 @@ private:
     static constexpr size_t kHardMaxTranscoding = 64;
 
     EventPoller::Ptr _poller;
+    /// 全局观众名额：所有源共享同一个（在 `setConfig` 里按 config 建，必须在任何 acquire 之前）
+    SubscriberQuota::Ptr _quota;
     mutable std::mutex _mutex;
     Config _config;
     std::map<std::string, std::shared_ptr<Entry>> _entries;
