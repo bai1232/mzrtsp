@@ -12,7 +12,7 @@
 #   ./scripts/concurrent_test.sh                 # 10 路 × 300 秒（默认，5 分钟）
 #   ./scripts/concurrent_test.sh --quick         # 10 路 × 20 秒（冒烟/回归门禁）
 #   ./scripts/concurrent_test.sh --kill-half     # 额外做"中途 kill 一半"专项（TESTING §6）
-#   ./scripts/concurrent_test.sh --overload 8    # 额外压 max_subscribers（第 17 路起应被拒）
+#   ./scripts/concurrent_test.sh --overload 8    # 额外压 max_subscribers（超出上限的连接应被拒）
 #   ./scripts/concurrent_test.sh --duration 3600 # 1 小时跑（NFR-3 原文；建议 M7 发版前执行）
 #
 # 依赖：build/bin/mzmedia、samples/（make_samples.sh）、curl、ffmpeg、ffprobe、python3
@@ -187,7 +187,7 @@ FD_BASE="$(proc_fd "$SRV_PID")"
 RSS_BASE="$(proc_rss_kb "$SRV_PID")"
 CPU_BASE="$(proc_cpu_ticks "$SRV_PID")"
 echo "  服务已就绪（PID $SRV_PID）；基线：fd=$FD_BASE rss=${RSS_BASE}kB"
-echo "  注：第 16 路起是否被拒由 /api/stats 的 max_subscribers 决定（本脚本不硬编码 16）"
+echo "  注：第几路起被拒由 /api/stats 的 max_subscribers 决定（默认 512；本脚本不硬编码）"
 
 # ---------------------------------------------------------------------------
 # 1) 起客户端：**错开接入**（0/200/400…ms）—— 能顺带暴露订阅时序/GOP 缓存问题
