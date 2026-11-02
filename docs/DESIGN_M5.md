@@ -13,7 +13,7 @@
 | **M5-b′**（决策落地） | FR-5.1 改为**只按字节**且上限=**码率×延迟额度**；FR-5.2 改为**音视频成对丢**；GOP 上限=**码率×最大 GOP 时长**；统计最小版 `dumpStats()` | ✅（本文件） |
 | **M5-c** | `SourceManager`（懒启动 / 复用 / 空闲释放）+ `DemuxerProducer`（把 M4 的 `Demuxer` 接到 `SourcePump` 的读回调上，中止标志接 `interrupt_callback`） | ✅ |
 | **M5-d** | 节流（**FR-3.5**：按源时间轴与墙钟对齐推送，不得以磁盘速度全速灌入）；`dumpStatsJson()` + `HttpServer::setExtraStatsProvider()` 接进 `/api/stats`（**FR-6.1**）；`broken()` 只做**巡检**（真正断连留 M6） | ✅ |
-| **M5 未决回填**（在 M6-d 完成，见 §8） | 拿"10 路 × 5 分钟"的真实数据逐条定：`max_subscribers=16`（保持）、包数硬顶（**不加**）、`FrameQueue` 锁粒度（**不升级**）、唤醒合并（**够**）、节流对齐基准（**不改**） | ✅（M6-d） |
+| **M5 未决回填**（在 M6-d 完成，见 §8） | 拿"10 路 × 5 分钟"的真实数据逐条定：`max_subscribers=16`（**v0.3.1 已改**：默认 512、可配、另加全局名额，见下）、包数硬顶（**不加**）、`FrameQueue` 锁粒度（**不升级**）、唤醒合并（**够**）、节流对齐基准（**不改**） | ✅（M6-d） |
 
 **验收（对应 `docs/ROADMAP.md:15`，按批次分配）**：
 
@@ -202,7 +202,9 @@ public:
         size_t   max_bitrate_bps   = 8000000;   // 单路码率上限：8 Mbps
         uint32_t latency_budget_ms = 2000;      // 延迟额度：2 s → 队列上限 2,000,000 B
         uint32_t max_gop_ms        = 2000;      // 最大 GOP 时长：2 s → GOP 上限 2,000,000 B
-        size_t   max_subscribers   = 16;        // **人数**是硬边界
+        // **v0.3.1 改**：默认 16 → 512，并可用 --max-subscribers 配置；跨源总量另由
+        // SubscriberQuota 管（--max-total-subscribers，默认 1024）—— 每源上限 × 源数 才是真上限
+        size_t   max_subscribers   = 512;       // **人数**是硬边界（0 非法）
 
         size_t queueMaxBytes() const;           // = 码率 × 延迟额度
         size_t gopMaxBytes() const;             // = 码率 × 最大 GOP 时长
@@ -412,7 +414,7 @@ M5-a 的用例加锁之后原样通过（这就是"正交"的验证方式）。
 |---|---|---|
 | 每订阅者队列 | `max_bitrate_bps × latency_budget_ms / 8000` | 8 Mbps × 2 s = **2,000,000 B** |
 | GOP 缓存 | `max_bitrate_bps × max_gop_ms / 8000` | 8 Mbps × 2 s = **2,000,000 B** |
-| 每源输出带宽（**仅观测**） | `max_bitrate_bps × max_subscribers` | 8 Mbps × 16 = 128 Mbps |
+| 每源输出带宽（**仅观测**） | `max_bitrate_bps × max_subscribers` | 8 Mbps × 512 = 4.096 Gbps（默认人数改了，这个观测值随之变大；它不是准入判据） |
 
 为什么不当可调参数：**字节数是结果，不是参数**。直接写死字节数，换分辨率/换编码器设置就失准；
 而从"能容忍几秒延迟""一个 GOP 多长"推出来，换场景只需要改物理量。
