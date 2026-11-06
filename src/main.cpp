@@ -76,6 +76,8 @@ const char *kUsage =
     "  --max-subscribers <n>        每路源最多几个观众（默认 512；1..65535，0 非法）\n"
     "  --max-total-subscribers <n>  进程内观众总数上限（默认 1024；跨源汇总）\n"
     "  --max-connections <n>        TCP 连接上限（默认由 ulimit -n 推导，最少 16）\n"
+    "  --rtsp-out <port>            **RTSP 输出**（我们当服务端）：rtsp://<ip>:<port>/live/<name>\n"
+    "  --max-rtsp-clients <n>       RTSP 输出最多几个客户端（默认 64）\n"
     "  --log-level <l>     trace|debug|info|warn|error|fatal（默认 info）\n"
     "  --log-file <path>   日志文件（默认 logs/mzmedia.log，64MB×5 滚动；FR-6.2）\n"
     "  --help              显示本帮助\n"
@@ -380,6 +382,9 @@ int main(int argc, char **argv) {
     size_t max_subscribers = 512;
     size_t max_total_subscribers = 1024;
     size_t max_connections = 0; // 0 = 未指定 → 由 ulimit 推导
+    // 【v0.4-a】RTSP 输出：0 = 不启动（默认关；新增能力不改变既有行为）
+    uint16_t rtsp_out_port = 0;
+    size_t max_rtsp_clients = 64;
     uint32_t hls_lease_ms = 60000;   // FR-1.3 的 60s 同量级；可调是为了让验收脚本能验"租约到期释放"
     LogLevel level = LogLevel::Info;
     // 【M11-a】RTSP 输入：命令行注册"名字 → URL"（**绝不**从 URL query 取地址，避免 SSRF）
@@ -517,6 +522,16 @@ int main(int argc, char **argv) {
             if (!parseBoundedSize(value(), 16, 65535, &max_connections, "--max-connections")) {
                 return 2;
             }
+        } else if (key == "--rtsp-out") {
+            size_t parsed = 0;
+            if (!parseBoundedSize(value(), 1, 65535, &parsed, "--rtsp-out")) {
+                return 2;
+            }
+            rtsp_out_port = static_cast<uint16_t>(parsed);
+        } else if (key == "--max-rtsp-clients") {
+            if (!parseBoundedSize(value(), 1, 65535, &max_rtsp_clients, "--max-rtsp-clients")) {
+                return 2;
+            }
         } else if (key == "--log-level") {
             if (!parseLogLevel(value(), &level)) {
                 std::fprintf(stderr, "--log-level 非法：%s\n", argv[i]);
@@ -593,6 +608,31 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // 【v0.4-a】RTSP 输出的句柄：先声明（stats 提供者要用），真正启动在 HTTP 起来之后
+    RtspServer::Ptr rtsp_out;
+
+    // 【v0.4-a】RTSP **输出**：我们当服务端，客户端用标准播放器来拉。
+    // 名字走**和 /live/ 同一套校验**（防路径注入），只映射 media_root 里的文件。
+    if (rtsp_out_port > 0) {
+        RtspServer::PathResolver resolver = [media_root](const std::string &name, std::string *path) {
+            std::string why;
+            return mediaNameToPath(media_root, name, path, &why);
+        };
+        RtspServer::Config rtsp_config;
+        rtsp_config.port = rtsp_out_port;
+        rtsp_config.max_clients = max_rtsp_clients;
+        rtsp_out = RtspServer::create(poller, manager, resolver, rtsp_config);
+        if (!rtsp_out) {
+            std::fprintf(stderr, "RTSP 输出初始化失败（--rtsp-out 无效）\n");
+            return 1;
+        }
+        if (!rtsp_out->start()) {
+            std::fprintf(stderr, "RTSP 输出启动失败（端口 %u 被占用？）\n",
+                         static_cast<unsigned>(rtsp_out_port));
+            return 1;
+        }
+    }
+
     // FR-6.1：/api/stats 里带上媒体层的源与订阅统计
     (void) server->setExtraStatsProvider([manager] { return manager->dumpStatsJson(); });
 
@@ -607,8 +647,12 @@ int main(int argc, char **argv) {
     if (!hls) {
         std::fprintf(stderr, "HLS 初始化失败（/hls/ 将回 501）\n");
     } else {
-        (void) server->setExtraStatsProvider([manager, hls] {
-            return manager->dumpStatsJson() + "," + hls->dumpStatsJson();
+        (void) server->setExtraStatsProvider([manager, hls, rtsp_out] {
+            std::string extra = manager->dumpStatsJson() + "," + hls->dumpStatsJson();
+            if (rtsp_out) {
+                extra += "," + rtsp_out->statsJson();
+            }
+            return extra;
         });
         // 必须在 start() 之前注册 /hls/：HttpServer::start() 里的 501 占位有 findHandler 守卫
         if (!server->setPrefixRoute(
@@ -920,6 +964,10 @@ int main(int argc, char **argv) {
     std::printf("  推送      : %gx%s\n", speed, loop ? "，循环推流" : "");
     std::printf("  准入上限  : 每源 %zu 观众 / 全局 %zu 观众 / %zu 连接\n", max_subscribers,
                 max_total_subscribers, max_connections);
+    if (rtsp_out) {
+        std::printf("  RTSP 输出 : rtsp://<本机IP>:%u/live/<name>（最多 %zu 个客户端，TCP 交错）\n",
+                    static_cast<unsigned>(rtsp_out->port()), max_rtsp_clients);
+    }
     if (transcode_allowed) {
         std::printf("  转码      : 开启（默认 %dp，最多 %u 路；URL 加 ?transcode=1&h=720）\n",
                     transcode_height, transcode_max);

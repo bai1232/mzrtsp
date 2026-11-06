@@ -3,10 +3,6 @@
 本文件遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)，发布要求见 [docs/VERSIONING.md](docs/VERSIONING.md)。
 
-## [Unreleased]
-
-（下一版：详见 `docs/ROADMAP.md`）
-
 ### Tests（压测阶梯，v0.3.1）
 `scripts/concurrent_test.sh` 跑 10 → 20 → 50 → 100 → 200 个观众（同一台 4 核 VM、同一条源）：
 **五级全绿（每级 7/7）**，`dropped=0`、错误日志 0、fd 回基线、订阅者峰值 = N、音画偏移 2.0 ms；
@@ -27,6 +23,29 @@
   与每源 `counters.rejected_by_quota`；`quota_over_releases` 恒为 0，非 0 即配额记账有 bug。
 - 订阅被拒时区分语义：**名额满 → 503 + `Retry-After: 1`**（稍后再试），
   **关键帧灌不进队列 → 500**（这个源现在接不了人）。用计数器差判定，不 parse 错误文本。
+
+## [Unreleased]
+
+### Added（**v0.4-a / R1：RTSP 输出**——我们当服务端）
+- `--rtsp-out <port>`：启动 RTSP 服务端，客户端可用标准播放器拉 `rtsp://<ip>:<port>/live/<name>`；
+  `--max-rtsp-clients N`（默认 64）限制同时连接数。
+- **复用而非重写**：`RtspServer` **组合** `TcpServer`（监听/accept/会话表/关停排水全部复用），
+  每个连接是 `RtspSession : public Session`（只重写 `onRecv` 分帧）——与 `HttpServer` 完全同构，
+  这是"第三个协议复用同一套网络层"的证据。`media/` 一行未改。
+- 协议：`OPTIONS/DESCRIBE/SETUP/PLAY/PAUSE/TEARDOWN/GET_PARAMETER`；SDP 含 RFC 4566 必填的
+  **`c=` 行**、`sprop-parameter-sets`、`profile-level-id`、AAC `config=`；
+  `PLAY` 响应带 **`RTP-Info: seq/rtptime`（取首包真值）**。
+- RTP：**PTS×90** 时间戳（起始偏移 90000，避开 ts=0 回绕分支）、FU-A 分片
+  （`ceil((nal−1)/1386)`，marker 只在帧末）、AAC AU 头（RFC 3640）；
+  RTCP **Sender Report**（每 ~30 包）。
+- `ffmpeg::avccToNalus()`：AVCC 长度前缀直接切 NAL（**零拷贝**，不转 Annex-B 再扫起始码）。
+- `/api/stats` 新增 `rtsp_out` 段（sessions/playing/rejected + 分方法计数 + rtp/rtcp 计数）。
+- 单测 `rtspout` 组 8 例：SDP（`c=`/sprop/profile-level-id）、AVCC 零拷贝、RTP 单片头、
+  **FU-A 分片数 + 反向重组逐字节相等**、AAC AU 头、请求解析（半包/版本错/路径穿越）。
+
+**R1 不支持**（明确回 `461 Unsupported Transport`）：UDP 传输；音频轨在 R2。
+**已知现象**：ffmpeg 客户端会把首个 AU 报成 `0.24s`（服务端发出的 RTP ts 实测单调正确，
+属 FFmpeg 首包行为，与 RTCP SR 无关），见 `docs/DESIGN_RTSP_OUT.md` §4。
 
 ## [0.3.0] - 2026-10-26
 

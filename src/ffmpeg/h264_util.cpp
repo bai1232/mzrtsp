@@ -475,4 +475,32 @@ bool buildAvcC(const uint8_t *sps, size_t sps_size, const uint8_t *pps, size_t p
     return true;
 }
 
+// ============================================================================
+// 【R1/RTP 输出】AVCC（长度前缀）遍历：零拷贝切 NAL
+// ============================================================================
+
+bool avccToNalus(const uint8_t *data, size_t size, size_t length_size,
+                 const std::function<bool(const uint8_t *, size_t)> &on_nal) {
+    if (data == nullptr || size == 0 || length_size == 0 || length_size > 4 || !on_nal) {
+        return false;
+    }
+    size_t offset = 0;
+    while (offset + length_size <= size) {
+        size_t nal_size = 0;
+        for (size_t i = 0; i < length_size; ++i) {
+            nal_size = (nal_size << 8) | data[offset + i];
+        }
+        offset += length_size;
+        // 前缀为 0 或越界 = 结构坏了：明确失败，不"按剩余长度截断"（截断会把错位一路带下去）
+        if (nal_size == 0 || nal_size > size - offset) {
+            return false;
+        }
+        if (!on_nal(data + offset, nal_size)) {
+            return true; // 调用方主动停（例如已凑够一帧）
+        }
+        offset += nal_size;
+    }
+    return offset == size;
+}
+
 } // namespace mzmedia

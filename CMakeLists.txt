@@ -133,6 +133,11 @@ set(MZMEDIA_SOURCES
         # M9-b：HLS 切片器 + 租约注册表
         src/output/hls_writer.cpp
         src/output/hls_service.cpp
+        # v0.4-a：RTSP 输出（服务端）
+        src/output/rtsp_request.cpp
+        src/output/sdp_builder.cpp
+        src/output/rtp_packetizer.cpp
+        src/output/rtsp_server.cpp
         )
 
 # 骨架阶段（第 1 批）没有任何源文件，此时不能创建 STATIC 库目标

@@ -87,3 +87,4 @@
 #include "output/mpegts_muxer.h"
 #include "output/hls_writer.h"
 #include "output/hls_service.h"
+#include "output/rtsp_server.h"

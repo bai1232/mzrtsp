@@ -57,6 +57,7 @@ set(MZMEDIA_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/test_pipeline_stages.cpp
         # ---- v0.3-a RTSP 输入（用例名 rtsp_*，不依赖网络）----
         ${CMAKE_CURRENT_SOURCE_DIR}/test_rtsp_input.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_rtsp_output.cpp
         )
 
 set(MZMEDIA_TEST_GROUPS
@@ -124,7 +125,7 @@ set(MZMEDIA_TEST_GROUPS
         pipeline
         # ---- v0.3-a RTSP（纯逻辑：URL 判定 / 脱敏 / 未开启时拒绝；不联网）----
         rtsp
-        )
+         rtspout)
 
 add_executable(mzmedia_unittest ${MZMEDIA_TEST_SOURCES})
 

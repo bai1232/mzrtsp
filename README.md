@@ -139,6 +139,7 @@ cmake -B build && cmake --build build -j"$(nproc)"
 #    常用选项：--port 9000 --media-root /data --loop --speed 4 --log-level debug --log-file logs/x.log --help
 #    准入上限：--max-subscribers 512（每源观众）--max-total-subscribers 1024（进程内总数）
 #              --max-connections N（默认由 ulimit -n 推导）。三个都是**有界**的，0 不是"不限"
+#    RTSP 输出：--rtsp-out 8554 → 标准播放器直接拉 rtsp://<ip>:8554/live/sample（R1：视频 + TCP 交错）
 
 # 4) 看画面（二选一）
 #    浏览器：打开 http://127.0.0.1:8080/ ，点「播放」（页面用的是**入库**的 flv.js，离线可用）
@@ -215,6 +216,7 @@ cd build && ctest                        # 26 个分组（297 个用例），**�
 | [docs/SPEC.md](docs/SPEC.md) | **需求规格（唯一规格来源）**：能力矩阵、流水线、功能/非功能需求、成功标准 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构设计：分层、线程模型、一源多消费者、资源管理 |
 | [docs/CODEC_MATRIX.md](docs/CODEC_MATRIX.md) | 输入 × 输出的可行性判定（何时 remux、何时必须转码） |
+| [docs/DESIGN_RTSP_OUT.md](docs/DESIGN_RTSP_OUT.md) | **RTSP 输出设计（v0.4-a）**：复用 TcpServer/Session 的落点、SDP/RTP/RTCP 细节、R1 实测与已知现象 |
 | [docs/ACCEPTANCE_v0.3.0.md](docs/ACCEPTANCE_v0.3.0.md) | **v0.3.0 验收报告（当前版本）**：RTSP 输入/断流自愈/音视频的逐条证据 + 1 小时长跑实测 + 已知限制 |
 | [docs/ACCEPTANCE_v0.2.3.md](docs/ACCEPTANCE_v0.2.3.md) | v0.2.3 验收报告：重构等价性（字节级）+ 门禁 + 风险 |
 | [docs/DESIGN_REFACTOR_PIPELINE.md](docs/DESIGN_REFACTOR_PIPELINE.md) | **流水线重构设计（v0.2.3）**：为什么拆、拆成什么、两条契约、扩展方式、等价性证据、机检口径 |

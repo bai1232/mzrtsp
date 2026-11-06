@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace mzmedia {
@@ -95,5 +96,16 @@ bool parseAvcC(const uint8_t *data, size_t size, std::vector<uint8_t> *sps, std:
  */
 bool buildAvcC(const uint8_t *sps, size_t sps_size, const uint8_t *pps, size_t pps_size,
                std::vector<uint8_t> *out);
+
+/**
+ * 【R1/RTP 输出】按 **AVCC（长度前缀）** 遍历 NAL —— 不转 Annex-B、不拷贝
+ * @param length_size 长度前缀字节数（1..4，来自 avcC 的 `lengthSizeMinusOne + 1`）
+ * @param on_nal 回调拿到 `(ptr, len)`，**指向 `data` 内部**（调用方不得跨界保存）
+ * @return true = 全部遍历完；false = 结构非法（前缀为 0 / 越界）
+ * @note 为什么不"AVCC→Annex-B 再扫起始码"：多一次扫描 + 一次拷贝，而我们手上本来就是 AVCC
+ *       （`AnnexBStage` 已经把裸流转成 AVCC）。RTP 打包只需切片，直接引用原缓冲。
+ */
+bool avccToNalus(const uint8_t *data, size_t size, size_t length_size,
+                 const std::function<bool(const uint8_t *, size_t)> &on_nal);
 
 } // namespace mzmedia
