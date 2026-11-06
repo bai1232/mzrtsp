@@ -18,6 +18,7 @@
 #include "ffmpeg/h264_util.h"
 #include "output/rtp_packetizer.h"
 #include "output/rtsp_request.h"
+#include "output/rtsp_timing.h"
 #include "output/sdp_builder.h"
 
 #include <cstring>
@@ -276,4 +277,62 @@ MZ_TEST(rtspout_request_rejects_bad_name) {
     int rtcp_ch = 0;
     MZ_ASSERT_FALSE(mzmedia::RtspRequest::parseInterleaved("RTP/AVP;unicast;client_port=5000-5001",
                                                           &rtp_ch, &rtcp_ch));
+}
+
+// ---------------------------------------------------------------------------
+// 【R2】时间戳与 RTP-Info（纯函数）
+// ---------------------------------------------------------------------------
+
+MZ_TEST(rtspout_audio_ts_is_sample_count_from_pts) {
+    // 音频 RTP 时间戳是**采样数**：0 ms → 起始偏移（1 s 采样数），1000 ms → +44100
+    const uint32_t zero = mzmedia::RtspTiming::audioRtpTs(0, 44100);
+    MZ_ASSERT_EQ(zero, 44100u);
+    MZ_ASSERT_EQ(mzmedia::RtspTiming::audioRtpTs(1000, 44100), zero + 44100u);
+    // 23 ms（AAC 一帧 1024 采样 ≈ 23.22 ms）→ +1024 左右（取整误差 ±1）
+    const uint32_t frame = mzmedia::RtspTiming::audioRtpTs(23, 44100) - zero;
+    MZ_ASSERT_TRUE(frame >= 1013u && frame <= 1015u);
+    // 负 pts → 钳到起始偏移（不产生负数）
+    MZ_ASSERT_EQ(mzmedia::RtspTiming::audioRtpTs(-50, 44100), zero);
+}
+
+MZ_TEST(rtspout_video_ts_uses_pts_with_offset) {
+    // 视频 = PTS×90 + 1 s 偏移；0 ms → 90000，40 ms → +3600
+    MZ_ASSERT_EQ(mzmedia::RtspTiming::videoRtpTs(0), 90000u);
+    MZ_ASSERT_EQ(mzmedia::RtspTiming::videoRtpTs(40), 90000u + 3600u);
+    MZ_ASSERT_EQ(mzmedia::RtspTiming::videoRtpTs(-100), 90000u); // 负值钳 0
+}
+
+MZ_TEST(rtspout_rtp_info_lists_each_track) {
+    std::vector<mzmedia::RtspTiming::TrackInfo> tracks;
+    tracks.push_back({0, 120, 90000});
+    tracks.push_back({1, 45, 44100});
+    const std::string info =
+        mzmedia::RtspTiming::buildRtpInfo("rtsp://127.0.0.1:8554/live/sample", tracks);
+    MZ_ASSERT_TRUE(info ==
+                   "RTP-Info: url=rtsp://127.0.0.1:8554/live/sample/trackID=0;seq=120;rtptime=90000,"
+                   "url=rtsp://127.0.0.1:8554/live/sample/trackID=1;seq=45;rtptime=44100\r\n");
+}
+
+MZ_TEST(rtspout_sdp_advertises_audio_track) {
+    mzmedia::StreamInfo video;
+    video.is_video = true;
+    video.extradata = std::make_shared<std::vector<uint8_t>>(makeAvcC());
+    mzmedia::StreamInfo audio;
+    audio.is_audio = true;
+    audio.sample_rate = 44100;
+    audio.channels = 1;
+    audio.extradata = std::make_shared<std::vector<uint8_t>>(
+        std::vector<uint8_t>{0x12, 0x08}); // AAC-LC 44.1k mono 的 ASC
+
+    mzmedia::SdpBuilder::Streams streams;
+    streams.video = &video;
+    streams.audio = &audio;
+    std::string error;
+    const std::string sdp = mzmedia::SdpBuilder::build(streams, "s", "10.0.0.2", &error);
+    MZ_ASSERT_TRUE(!sdp.empty());
+    MZ_ASSERT_TRUE(sdp.find("m=audio 0 RTP/AVP 97\r\n") != std::string::npos);
+    MZ_ASSERT_TRUE(sdp.find("a=rtpmap:97 MPEG4-GENERIC/44100/1\r\n") != std::string::npos);
+    MZ_ASSERT_TRUE(sdp.find("mode=AAC-hbr") != std::string::npos);
+    MZ_ASSERT_TRUE(sdp.find("config=1208") != std::string::npos);
+    MZ_ASSERT_TRUE(sdp.find("a=control:trackID=1\r\n") != std::string::npos);
 }

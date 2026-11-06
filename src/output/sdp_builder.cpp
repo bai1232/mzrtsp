@@ -158,14 +158,15 @@ std::string SdpBuilder::build(const Streams &streams, const std::string &name, c
     if (streams.audio != nullptr && streams.audio->extradata != nullptr &&
         !streams.audio->extradata->empty()) {
         const auto &asc = *streams.audio->extradata;
-        if (asc.size() == 2) {
+        // ASC 是 2 字节；某些容器会给更长的 extradata（带前置头），取**前两字节**作为 config=
+        if (asc.size() >= 2) {
             const int rate = streams.audio->sample_rate > 0 ? streams.audio->sample_rate : 44100;
             const int channels = streams.audio->channels > 0 ? streams.audio->channels : 1;
             char fmtp[160];
             std::snprintf(fmtp, sizeof(fmtp),
                           "a=fmtp:97 profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;"
                           "indexdeltalength=3;config=%s\r\n",
-                          hexEncode(asc.data(), asc.size()).c_str());
+                          hexEncode(asc.data(), 2).c_str());
             sdp += "m=audio 0 RTP/AVP 97\r\n";
             sdp += "a=rtpmap:97 MPEG4-GENERIC/" + std::to_string(rate) + "/" +
                    std::to_string(channels) + "\r\n";

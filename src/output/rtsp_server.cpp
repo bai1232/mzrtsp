@@ -9,6 +9,7 @@
 #include "network/tcp_server.h"
 #include "output/rtp_packetizer.h"
 #include "output/rtsp_request.h"
+#include "output/rtsp_timing.h"
 #include "output/sdp_builder.h"
 
 #include <arpa/inet.h>
@@ -16,6 +17,7 @@
 #include <netinet/in.h>
 
 #include <cstdio>
+#include <chrono>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -108,8 +110,7 @@ public:
     RtspSession(const Socket::Ptr &sock, const EventPoller::Ptr &poller, RtspServer *owner)
         : Session(sock, poller)
         , _owner(owner) {
-        // RTSP 客户端会周期性发 OPTIONS/GET_PARAMETER 保活；空闲阈值给宽一点（60s 默认已够）
-        (void) setRecvIdleTimeout(60000);
+        (void) setRecvIdleTimeout(60000); // RTSP 客户端会周期发 OPTIONS/GET_PARAMETER 保活
         _owner->onSessionOpen();
     }
 
@@ -122,10 +123,7 @@ public:
 
 protected:
     void onRecv(const Buffer::Ptr &buf) override {
-        if (isShutdown()) {
-            return;
-        }
-        if (buf == nullptr || buf->size() == 0) {
+        if (isShutdown() || buf == nullptr || buf->size() == 0) {
             return;
         }
         _buf.append(buf->data(), buf->size());
@@ -135,8 +133,7 @@ protected:
             return;
         }
         for (;;) {
-            RtspRequest::Status status =
-                _req.parse(_buf.data(), _buf.size());
+            const RtspRequest::Status status = _req.parse(_buf.data(), _buf.size());
             if (status == RtspRequest::Status::NeedMoreData) {
                 return;
             }
@@ -148,10 +145,7 @@ protected:
             }
             const bool keep = handleOne();
             _buf.erase(0, _req.consumed());
-            if (!keep || isShutdown()) {
-                return;
-            }
-            if (_buf.empty()) {
+            if (!keep || isShutdown() || _buf.empty()) {
                 return;
             }
         }
@@ -159,33 +153,36 @@ protected:
 
     void onError(const SockException &err) override {
         Session::onError(err);
-        _playing = false;
         _owner->onPlayingChanged(false);
     }
 
 private:
     static constexpr size_t kMaxBuffer = 64u << 10;
+    /// 「待发字节」上限：超过就**跳到下一个 IDR**（TCP 交错上丢单帧只会花屏，跳整段才干净）
+    static constexpr size_t kMaxPendingBytes = 256u << 10;
+
+    static constexpr const char *statusReason(int status) {
+        switch (status) {
+        case 200: return "OK";
+        case 400: return "Bad Request";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 453: return "Not Enough Bandwidth";
+        case 454: return "Session Not Found";
+        case 455: return "Method Not Valid in This State";
+        case 461: return "Unsupported Transport";
+        case 500: return "Internal Server Error";
+        case 501: return "Not Implemented";
+        case 503: return "Service Unavailable";
+        default: return "OK";
+        }
+    }
 
     bool reply(int status, const std::string &cseq, const std::string &extra_headers = std::string(),
                const std::string &body = std::string(),
                const std::string &content_type = std::string()) {
-        const char *reason = "OK";
-        switch (status) {
-        case 200: reason = "OK"; break;
-        case 400: reason = "Bad Request"; break;
-        case 404: reason = "Not Found"; break;
-        case 405: reason = "Method Not Allowed"; break;
-        case 453: reason = "Not Enough Bandwidth"; break;
-        case 454: reason = "Session Not Found"; break;
-        case 455: reason = "Method Not Valid in This State"; break;
-        case 461: reason = "Unsupported Transport"; break;
-        case 500: reason = "Internal Server Error"; break;
-        case 501: reason = "Not Implemented"; break;
-        case 503: reason = "Service Unavailable"; break;
-        default: reason = "OK"; break;
-        }
         std::string out;
-        out += "RTSP/1.0 " + std::to_string(status) + " " + reason + "\r\n";
+        out += "RTSP/1.0 " + std::to_string(status) + " " + statusReason(status) + "\r\n";
         if (!cseq.empty()) {
             out += "CSeq: " + cseq + "\r\n";
         }
@@ -208,7 +205,7 @@ private:
         return send(out) >= 0;
     }
 
-    /// @return false = 本次处理要做收尾（已关连接），调用方停止继续解析
+    /// @return false = 已收尾（调用方停止继续解析）
     bool handleOne() {
         _owner->onRequest(_req.methodStr().c_str());
         if (_session_id.empty()) {
@@ -216,11 +213,9 @@ private:
         }
         const std::string cseq = _req.cseq();
         switch (_req.method()) {
-        case RtspRequest::Method::Options: {
-            std::string public_hdr =
-                "Public: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER\r\n";
-            return reply(200, cseq, public_hdr);
-        }
+        case RtspRequest::Method::Options:
+            return reply(200, cseq,
+                         "Public: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER\r\n");
         case RtspRequest::Method::Describe:
             return handleDescribe(cseq);
         case RtspRequest::Method::Setup:
@@ -228,11 +223,9 @@ private:
         case RtspRequest::Method::Play:
             return handlePlay(cseq);
         case RtspRequest::Method::Pause:
-            _playing = false;
             _owner->onPlayingChanged(false);
             return reply(200, cseq, "Range: npt=0.000-\r\n");
         case RtspRequest::Method::Teardown:
-            _playing = false;
             _owner->onPlayingChanged(false);
             _sub.reset();
             _source.reset();
@@ -240,8 +233,7 @@ private:
             (void) shutdownAfterFlush(500);
             return false;
         case RtspRequest::Method::GetParameter:
-            _owner->onRequest("GET_PARAMETER");
-            return reply(200, cseq);
+            return reply(200, cseq); // 保活
         case RtspRequest::Method::Unsupported:
         default:
             return reply(501, cseq);
@@ -252,7 +244,7 @@ private:
         const std::string name = RtspRequest::pathName(_req.uri());
         std::string path;
         if (name.empty() || !_owner->_resolve(name, &path)) {
-            return reply(404, cseq); // 名字未注册：与 /live/ 的 404 语义一致，不暴露路径
+            return reply(404, cseq);
         }
         std::string error;
         const std::string sdp = _owner->sdpFor(path, &error);
@@ -268,66 +260,77 @@ private:
 
     bool handleSetup(const std::string &cseq) {
         const std::string transport = _req.header("transport");
-        int rtp_ch = 0;
-        int rtcp_ch = 1;
+        const int track = trackIndexOf(_req.uri());
+        int rtp_ch = 2 * track;
+        int rtcp_ch = 2 * track + 1;
         if (!RtspRequest::parseInterleaved(transport, &rtp_ch, &rtcp_ch)) {
-            // R1 只支持 TCP 交错：UDP 的 SETUP 明确回 461（语义正确，FFmpeg 会自动回退 TCP）
-            _owner->onRejected("UDP SETUP（R1 只支持 TCP 交错）");
+            // R1/R2 只支持 TCP 交错：UDP 的 SETUP 明确回 461（FFmpeg 会自动回退 TCP）
+            _owner->onRejected("UDP SETUP（只支持 TCP 交错）");
             return reply(461, cseq);
         }
-        _rtp_ch = rtp_ch;
-        _rtcp_ch = rtcp_ch;
+        if (track == 0) {
+            _v_rtp_ch = rtp_ch;
+            _v_rtcp_ch = rtcp_ch;
+        } else {
+            _a_rtp_ch = rtp_ch;
+            _a_rtcp_ch = rtcp_ch;
+        }
         char hdr[160];
         std::snprintf(hdr, sizeof(hdr), "Transport: RTP/AVP/TCP;unicast;interleaved=%d-%d\r\n",
-                      _rtp_ch, _rtcp_ch);
+                      rtp_ch, rtcp_ch);
         return reply(200, cseq, hdr);
     }
 
     bool handlePlay(const std::string &cseq) {
-        if (_sub != nullptr && _playing) {
+        if (_sub != nullptr) {
             return reply(200, cseq, "Range: npt=0.000-\r\n"); // 重复 PLAY：幂等
         }
-        if (_source == nullptr) {
-            const std::string name = RtspRequest::pathName(_req.uri());
-            std::string path;
-            if (name.empty() || !_owner->_resolve(name, &path)) {
-                return reply(404, cseq);
-            }
-            auto source = _owner->_manager->acquire(path);
-            if (!source) {
-                WarnL << "RtspSession: PLAY 取源失败：" << _owner->_manager->lastError();
-                return reply(503, cseq, "Retry-After: 1\r\n");
-            }
-            _source = source;
-            _path = path;
-            const SourceManager::MuxerStreams streams = _owner->_manager->muxerStreamsFor(path);
-            if (streams.video == nullptr) {
-                return reply(404, cseq, "", "这个源没有视频轨", "text/plain");
-            }
-            _video_index = streams.video->index;
-            std::vector<uint8_t> sps;
-            std::vector<uint8_t> pps;
-            size_t length_size = 4;
-            if (!streams.video->extradata ||
-                !SdpBuilder::parseAvcC(*streams.video->extradata, &sps, &pps, nullptr, nullptr, nullptr,
-                                       &length_size)) {
-                return reply(404, cseq, "", "视频没有 avcC", "text/plain");
-            }
-            _length_size = length_size;
-            RtpPacketizer::Config config;
-            config.payload_type = 96;
-            config.mtu = 1400;
-            _video_packetizer = std::make_unique<RtpPacketizer>(config);
+        const std::string name = RtspRequest::pathName(_req.uri());
+        std::string path;
+        if (name.empty() || !_owner->_resolve(name, &path)) {
+            return reply(404, cseq);
+        }
+        auto source = _owner->_manager->acquire(path);
+        if (!source) {
+            WarnL << "RtspSession: PLAY 取源失败：" << _owner->_manager->lastError();
+            return reply(503, cseq, "Retry-After: 1\r\n");
+        }
+        _source = source;
+        _path = path;
+        const SourceManager::MuxerStreams streams = _owner->_manager->muxerStreamsFor(path);
+        if (streams.video == nullptr) {
+            return reply(404, cseq, "", "这个源没有视频轨", "text/plain");
+        }
+        _video_index = streams.video->index;
+        std::vector<uint8_t> sps;
+        std::vector<uint8_t> pps;
+        size_t length_size = 4;
+        if (!streams.video->extradata ||
+            !SdpBuilder::parseAvcC(*streams.video->extradata, &sps, &pps, nullptr, nullptr, nullptr,
+                                   &length_size)) {
+            return reply(404, cseq, "", "视频没有 avcC", "text/plain");
+        }
+        _length_size = length_size;
+        RtpPacketizer::Config video_config;
+        video_config.payload_type = 96;
+        video_config.mtu = 1400;
+        _video_pkt = std::make_unique<RtpPacketizer>(video_config);
+
+        if (streams.audio != nullptr && streams.audio->extradata != nullptr &&
+            streams.audio->extradata->size() == 2) {
+            _audio_index = streams.audio->index;
+            _audio_rate = streams.audio->sample_rate > 0 ? streams.audio->sample_rate : 44100;
+            RtpPacketizer::Config audio_config;
+            audio_config.payload_type = 97;
+            audio_config.mtu = 1400;
+            _audio_pkt = std::make_unique<RtpPacketizer>(audio_config);
         }
 
-        // 订阅：GOP 缓存保证第一条是视频关键帧
         Subscriber::Ptr sub = _source->subscribe();
         if (!sub) {
             return reply(503, cseq, "Retry-After: 1\r\n");
         }
         (void) sub->bindPoller(poller());
-        // 注：`Session` 是 `enable_shared_from_this<Session>`，所以拿到的是 weak_ptr<Session>；
-        // 回调里再 dynamic_pointer_cast 回 RtspSession（弱引用：不与订阅者成环）
         std::weak_ptr<Session> weak = weak_from_this();
         sub->setDrainCallback([weak](const Subscriber::Ptr &) {
             if (auto base = weak.lock()) {
@@ -338,84 +341,58 @@ private:
         });
         _sub = std::move(sub);
 
-        // 先把队列头部（GOP 缓存灌进来的）打出来，拿到首包的 seq/rtptime —— RTP-Info 要用真值
+        // 先把队列头部（GOP 缓存灌进来的）打出来，顺便拿到**两轨首包**的 seq/rtptime —— RTP-Info 用真值
         std::string first_frames;
-        const uint16_t first_seq = _video_packetizer->nextSeq();
-        uint32_t first_ts = 0;
-        bool got_first = false;
+        std::vector<RtspTiming::TrackInfo> tracks;
+        RtspTiming::TrackInfo video_info;
+        video_info.track_id = 0;
+        video_info.seq = _video_pkt->nextSeq();
+        video_info.rtptime = RtspTiming::videoRtpTs(0);
+        RtspTiming::TrackInfo audio_info;
+        audio_info.track_id = 1;
+        if (_audio_pkt) {
+            audio_info.seq = _audio_pkt->nextSeq();
+            audio_info.rtptime = RtspTiming::audioRtpTs(0, _audio_rate);
+        }
+        bool got_video = false;
+        bool got_audio = (_audio_pkt == nullptr);
         for (;;) {
             MediaPacket::Ptr packet;
             if (_sub->queue().pop(&packet) != FrameQueue::PopResult::Packet) {
                 break;
             }
-            if (!got_first && packet && packet->kind() == MediaKind::Video) {
-                first_ts = rtpTimestampOf(*packet);
-                got_first = true;
+            if (!got_video && packet && packet->kind() == MediaKind::Video) {
+                video_info.seq = _video_pkt->nextSeq();
+                video_info.rtptime = videoTimestampOf(packet->ptsMs());
+                got_video = true;
+            }
+            if (!got_audio && packet && packet->kind() == MediaKind::Audio) {
+                audio_info.seq = _audio_pkt->nextSeq();
+                audio_info.rtptime = audioTimestampOf(packet->ptsMs());
+                got_audio = true;
             }
             packetToInterleaved(packet, &first_frames);
             if (_pending_bytes > kMaxPendingBytes) {
-                break; // 首屏最多推这么多，剩下的交给 drain（别在这里写爆发送队列）
+                break; // 首屏别写爆发送队列，剩下的交给 drain
             }
         }
-
-        char extra[420];
-        std::snprintf(extra, sizeof(extra),
-                      "Range: npt=0.000-\r\n"
-                      "RTP-Info: url=rtsp://%s:%u/live/%s/trackID=0;seq=%u;rtptime=%u\r\n",
-                      _owner->sdpIp().c_str(), static_cast<unsigned>(_owner->port()), nameOf(_path).c_str(),
-                      static_cast<unsigned>(first_seq), static_cast<unsigned>(first_ts));
-        if (!reply(200, cseq, extra)) {
+        tracks.push_back(video_info);
+        if (_audio_pkt) {
+            tracks.push_back(audio_info);
+        }
+        char base_url[300];
+        std::snprintf(base_url, sizeof(base_url), "rtsp://%s:%u/live/%s", _owner->sdpIp().c_str(),
+                      static_cast<unsigned>(_owner->port()), name.c_str());
+        const std::string rtp_info = RtspTiming::buildRtpInfo(base_url, tracks);
+        if (!reply(200, cseq, "Range: npt=0.000-\r\n" + rtp_info)) {
             return false;
         }
-        if (!first_frames.empty()) {
-            if (send(first_frames) < 0) {
-                return false;
-            }
+        if (!first_frames.empty() && send(first_frames) < 0) {
+            return false;
         }
-        _playing = true;
+        _pending_bytes = 0;
         _owner->onPlayingChanged(true);
         return true;
-    }
-
-    /// 发一个 RTCP Sender Report（RFC 3550 §6.4.1）：把 RTP 时钟映射到墙上时钟。
-    /// 作用：**A/V 同步与客户端统计**（不是修时间戳；首包时间戳靠 SDP + RTP-Info）。
-    void appendSenderReport(std::string *out) {
-        if (_video_packetizer == nullptr) {
-            return;
-        }
-        const auto now = std::chrono::system_clock::now();
-        const auto secs = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch());
-        const auto frac = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()) -
-                          std::chrono::duration_cast<std::chrono::microseconds>(secs);
-        const uint64_t ntp_sec = static_cast<uint64_t>(secs.count()) + 2208988800ull; // 1900 起算
-        const uint64_t ntp_frac =
-            (static_cast<uint64_t>(frac.count()) << 32) / 1000000ull;
-        std::string sr;
-        sr.push_back(static_cast<char>(0x80)); // V=2, P=0, RC=0
-        sr.push_back(static_cast<char>(200));  // PT=SR
-        sr.push_back(0x00);
-        sr.push_back(0x06); // length = 6（(28/4)-1）
-        const uint32_t ssrc = _video_packetizer->ssrc();
-        sr.append(reinterpret_cast<const char *>(&ssrc), 0); // 占位，下面按大端写
-        sr.clear();
-        sr.push_back(static_cast<char>(0x80));
-        sr.push_back(static_cast<char>(200));
-        sr.push_back(0x00);
-        sr.push_back(0x06);
-        auto put32 = [&sr](uint32_t v) {
-            sr.push_back(static_cast<char>((v >> 24) & 0xFF));
-            sr.push_back(static_cast<char>((v >> 16) & 0xFF));
-            sr.push_back(static_cast<char>((v >> 8) & 0xFF));
-            sr.push_back(static_cast<char>(v & 0xFF));
-        };
-        put32(ssrc);
-        put32(static_cast<uint32_t>(ntp_sec & 0xFFFFFFFFu));
-        put32(static_cast<uint32_t>(ntp_frac & 0xFFFFFFFFu));
-        put32(_last_rtp_ts);
-        put32(static_cast<uint32_t>(_video_packetizer->packets() & 0xFFFFFFFFu));
-        put32(static_cast<uint32_t>(_video_packetizer->bytes() & 0xFFFFFFFFu));
-        out->append(interleavedFrame(_rtcp_ch, sr));
-        _owner->_c_rtcp_sr.fetch_add(1);
     }
 
     void onDrain() {
@@ -430,112 +407,176 @@ private:
                 break;
             }
             if (result == FrameQueue::PopResult::EndOfStream) {
-                _playing = false;
                 _owner->onPlayingChanged(false);
-                (void) shutdownAfterFlush(500); // 源结束：把已排队的数据发完再关
+                (void) shutdownAfterFlush(500); // 源结束：把已排队的发完再关
                 break;
-            }
-            if (!_playing) {
-                continue; // 暂停中：丢弃（计数在 R2 加）
             }
             packetToInterleaved(packet, &out);
             if (out.size() >= kMaxPendingBytes) {
-                break; // 剩下的下次唤醒继续（队列有界，不会无限涨）
+                // 慢客户端：**跳到下一个 IDR**（丢掉这半个 GOP，计数），不要无限缓冲
+                if (!_skip_to_idr) {
+                    _skip_to_idr = true;
+                    _owner->_c_skipped_to_idr.fetch_add(1);
+                }
+                break;
             }
         }
-        if (!out.empty() && send(out) < 0) {
-            (void) shutdown();
+        if (!out.empty()) {
+            if (send(out) < 0) {
+                (void) shutdown();
+            }
+            _pending_bytes = 0;
         }
     }
 
     void packetToInterleaved(const MediaPacket::Ptr &packet, std::string *out) {
-        if (!packet || _video_packetizer == nullptr) {
+        if (!packet) {
             return;
         }
-        if (packet->kind() != MediaKind::Video || packet->streamIndex() != _video_index) {
-            return; // R1：音频先不发（SDP 里也没有 audio 轨 → 客户端不会等）
+        const bool is_video = packet->kind() == MediaKind::Video &&
+                              packet->streamIndex() == _video_index;
+        const bool is_audio = _audio_pkt != nullptr && packet->kind() == MediaKind::Audio &&
+                              packet->streamIndex() == _audio_index;
+        if (!is_video && !is_audio) {
+            return;
         }
-        const uint32_t rtp_ts = rtpTimestampOf(*packet);
-        std::vector<std::pair<const uint8_t *, size_t>> nals;
-        const auto &payload = *packet->payload();
-        const bool ok = avccToNalus(payload.data(), payload.size(), _length_size,
-                                    [&nals](const uint8_t *nal, size_t len) {
-                                        nals.emplace_back(nal, len);
-                                        return true;
-                                    });
-        if (!ok || nals.empty()) {
-            return; // 结构非法：跳过该帧（计数在 R2）
+        // 跳 IDR 状态下只放行视频关键帧（音频照发：它不影响解码参考链）
+        if (_skip_to_idr) {
+            if (!(is_video && packet->isKeyFrame())) {
+                return;
+            }
+            _skip_to_idr = false;
         }
+
         std::vector<std::string> rtp_packets;
-        for (size_t i = 0; i < nals.size(); ++i) {
-            const bool marker = (i + 1 == nals.size()); // 一帧的最后一个 NAL 才置 marker
-            _video_packetizer->packetizeNal(nals[i].first, nals[i].second, rtp_ts, marker, &rtp_packets);
+        if (is_video) {
+            std::vector<std::pair<const uint8_t *, size_t>> nals;
+            const auto &payload = *packet->payload();
+            const bool ok = avccToNalus(payload.data(), payload.size(), _length_size,
+                                        [&nals](const uint8_t *nal, size_t len) {
+                                            nals.emplace_back(nal, len);
+                                            return true;
+                                        });
+            if (!ok || nals.empty()) {
+                return; // 结构非法：跳过该帧（计数见 R3）
+            }
+            const uint32_t rtp_ts = videoTimestampOf(packet->ptsMs());
+            for (size_t i = 0; i < nals.size(); ++i) {
+                const bool marker = (i + 1 == nals.size());
+                _video_pkt->packetizeNal(nals[i].first, nals[i].second, rtp_ts, marker, &rtp_packets);
+            }
+            for (const auto &rtp : rtp_packets) {
+                out->append(interleavedFrame(_v_rtp_ch, rtp));
+                _pending_bytes += rtp.size() + 4;
+                _owner->_c_rtp_pkts.fetch_add(1);
+                _owner->_c_rtp_bytes.fetch_add(rtp.size());
+            }
+        } else {
+            const uint32_t rtp_ts = audioTimestampOf(packet->ptsMs());
+            _audio_pkt->packetizeAac(packet->payload()->data(), packet->payload()->size(), rtp_ts,
+                                     &rtp_packets);
+            for (const auto &rtp : rtp_packets) {
+                out->append(interleavedFrame(_a_rtp_ch, rtp));
+                _owner->_c_rtp_pkts.fetch_add(1);
+                _owner->_c_rtp_bytes.fetch_add(rtp.size());
+            }
+            _owner->_c_audio_pkts.fetch_add(1);
         }
-        for (const auto &rtp : rtp_packets) {
-            out->append(interleavedFrame(_rtp_ch, rtp));
-            _pending_bytes += rtp.size() + 4;
-            _owner->_c_rtp_pkts.fetch_add(1);
-            _owner->_c_rtp_bytes.fetch_add(rtp.size());
-        }
-        // 每 ~30 包（≈1.2 s）跟一个 SR：客户端据此把 RTP 时钟映射到墙上时钟（A/V 同步）
-        _pkts_since_sr += rtp_packets.size();
-        if (_pkts_since_sr >= 30) {
-            _pkts_since_sr = 0;
-            appendSenderReport(out);
+
+        // 每 ~30 个视频包跟一个 RTCP SR（≈1.2 s）：A/V 同步与客户端统计
+        if (is_video) {
+            _pkts_since_sr += rtp_packets.size();
+            if (_pkts_since_sr >= 30) {
+                _pkts_since_sr = 0;
+                appendSenderReport(out);
+            }
         }
     }
 
-    /**
-     * RTP 时间戳 = **呈现时间**（PTS）折算到 90 kHz，并以"本会话首个视频包"为基准。
-     * 为什么要减基准：RTP 时间戳本来就是相对量（客户端用 RTP-Info 的 rtptime 对齐），
-     * 而源的首包 pts 可能是"容器起始偏移"（`sample.mp4` 实测首包 200 ms、后续 0/40/80…）。
-     * 不减基准就会让 ts 先给一个大值再跳回去，客户端算出负 dts → 直接不再出流
-     * （实测：`ffmpeg -c copy` 报 `Non-monotonous DTS … current: -200`，落地 0 字节）。
-     *
-     * 单调化（`_last_rtp_ts + 1`）：R1 先保证"绝不倒退"，代价是 B 帧源的显示顺序会退化。
-     * B 帧源（samples/bf.mp4）在 R1 **没有样本验收**，R2 改成"按 pts 原样发 + 依赖客户端重排"，
-     * 并用 bf.mp4 专项验一次 —— 这条是已知限制，不假装已经支持。
-     */
-    uint32_t rtpTimestampOf(MediaPacket &packet) {
-        if (!_ts_base_set) {
-            _ts_base_ms = packet.ptsMs();
-            _ts_base_set = true;
+    /// 视频 ts = **PTS** 相对本会话首包折算到 90 kHz + 1 s 偏移。
+    /// @note **绝不单调化**：B 帧源的 pts 天然乱序（`sample1080.mp4` 实测 pts=0,160,80,40,120…），
+    ///       强行改成单调会把呈现顺序压平（实测 `ts_reordered` 涨到 124 次、客户端报
+    ///       `non monotonically increasing dts`）。RTP 的语义就是"时间戳可以回退、重排靠 seq"。
+    uint32_t videoTimestampOf(int64_t pts_ms) {
+        if (!_video_base_set) {
+            _video_base_ms = pts_ms; // 以本会话首包为基准（首包 ts 恰好 = 90000）
+            _video_base_set = true;
         }
-        int64_t pts_ms = packet.ptsMs();
-        if (pts_ms < 0) {
-            _owner->_c_neg_ts.fetch_add(1);
-            pts_ms = 0;
-        }
-        int64_t rel_ms = pts_ms - _ts_base_ms;
-        if (rel_ms < 0) {
-            rel_ms = 0;
+        const int64_t rel = pts_ms - _video_base_ms;
+        if (rel < 0) {
             _owner->_c_neg_ts.fetch_add(1);
         }
-        // 起始偏移 1 秒（90000 = RFC 3550 认可的"非 0 初始值"）：ffmpeg 的 RTSP/TS 解复用器
-        // 遇到 ts=0 会走"33 位回绕"分支（我们在 MPEG-TS 侧也踩过：PTS=0 被吐成 2^33），
-        // 表现就是客户端首个包时间戳凭空多出 0.2s、随后又回到 0 → dts 为负。
-        uint32_t ts = static_cast<uint32_t>((kRtpStartOffset90k + static_cast<uint64_t>(rel_ms) * 90u) &
-                                          0xFFFFFFFFu);
-        if (_has_last_rtp_ts && static_cast<int32_t>(ts - _last_rtp_ts) <= 0) {
-            ts = _last_rtp_ts + 1; // 同值/倒退都往前提 1 tick（11 µs，肉眼不可见）
-            _owner->_c_ts_reordered.fetch_add(1);
+        const uint32_t ts = RtspTiming::videoRtpTs(rel);
+        if (_has_last_video_ts && static_cast<int32_t>(ts - _last_video_ts) < 0) {
+            _owner->_c_ts_reordered.fetch_add(1); // 只**计数**（B 帧的正常现象），不改数据
         }
-        _last_rtp_ts = ts;
-        _has_last_rtp_ts = true;
+        if (!_has_last_video_ts || static_cast<int32_t>(ts - _last_video_ts) > 0) {
+            _last_video_ts = ts;
+        }
+        _has_last_video_ts = true;
         return ts;
     }
 
-    static std::string nameOf(const std::string &path) {
-        const size_t slash = path.find_last_of('/');
-        std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
-        const size_t dot = name.find_last_of('.');
-        if (dot != std::string::npos) {
-            name = name.substr(0, dot);
+    /// 音频 ts：采样数（**由 pts 推导，不累加 1024**）；同样做同轨单调保护
+    uint32_t audioTimestampOf(int64_t pts_ms) {
+        uint32_t ts = RtspTiming::audioRtpTs(pts_ms, _audio_rate);
+        if (pts_ms < 0) {
+            _owner->_c_neg_ts.fetch_add(1);
         }
-        return name;
+        if (_has_last_audio_ts && static_cast<int32_t>(ts - _last_audio_ts) <= 0) {
+            ts = _last_audio_ts + 1;
+        }
+        _last_audio_ts = ts;
+        _has_last_audio_ts = true;
+        return ts;
     }
 
-    static constexpr size_t kMaxPendingBytes = 256u << 10;
+    /// RTCP Sender Report（RFC 3550 §6.4.1）：把 RTP 时钟映射到墙上时钟
+    void appendSenderReport(std::string *out) {
+        if (_video_pkt == nullptr) {
+            return;
+        }
+        const auto now = std::chrono::system_clock::now();
+        const auto secs = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch());
+        const auto micros =
+            std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()) -
+            std::chrono::duration_cast<std::chrono::microseconds>(secs);
+        const uint64_t ntp_sec = static_cast<uint64_t>(secs.count()) + 2208988800ull; // 1900 起算
+        const uint64_t ntp_frac = (static_cast<uint64_t>(micros.count()) << 32) / 1000000ull;
+        std::string sr;
+        auto put32 = [&sr](uint32_t v) {
+            sr.push_back(static_cast<char>((v >> 24) & 0xFF));
+            sr.push_back(static_cast<char>((v >> 16) & 0xFF));
+            sr.push_back(static_cast<char>((v >> 8) & 0xFF));
+            sr.push_back(static_cast<char>(v & 0xFF));
+        };
+        sr.push_back(static_cast<char>(0x80)); // V=2, P=0, RC=0
+        sr.push_back(static_cast<char>(200));  // PT=SR
+        sr.push_back(0x00);
+        sr.push_back(0x06); // length = 6
+        put32(_video_pkt->ssrc());
+        put32(static_cast<uint32_t>(ntp_sec & 0xFFFFFFFFu));
+        put32(static_cast<uint32_t>(ntp_frac & 0xFFFFFFFFu));
+        put32(_last_video_ts);
+        put32(static_cast<uint32_t>(_video_pkt->packets() & 0xFFFFFFFFu));
+        put32(static_cast<uint32_t>(_video_pkt->bytes() & 0xFFFFFFFFu));
+        out->append(interleavedFrame(_v_rtcp_ch, sr));
+        _owner->_c_rtcp_sr.fetch_add(1);
+    }
+
+    /// SETUP 的 URI 里 `trackID=N` → N（0=视频，1=音频）；没有就按 0
+    static int trackIndexOf(const std::string &uri) {
+        const std::string key = "trackID=";
+        const size_t at = uri.find(key);
+        if (at == std::string::npos || at + key.size() >= uri.size()) {
+            return 0;
+        }
+        const char c = uri[at + key.size()];
+        if (c < '0' || c > '9') {
+            return 0;
+        }
+        return c - '0';
+    }
 
     RtspServer *_owner;
     std::string _buf;
@@ -544,19 +585,25 @@ private:
     std::string _path;
     MediaSource::Ptr _source;
     Subscriber::Ptr _sub;
-    std::unique_ptr<RtpPacketizer> _video_packetizer;
+    std::unique_ptr<RtpPacketizer> _video_pkt;
+    std::unique_ptr<RtpPacketizer> _audio_pkt;
     int _video_index = -1;
+    int _audio_index = -1;
+    int _audio_rate = 44100;
     size_t _length_size = 4;
-    int _rtp_ch = 0;
-    int _rtcp_ch = 1;
-    bool _playing = false;
+    int _v_rtp_ch = 0;
+    int _v_rtcp_ch = 1;
+    int _a_rtp_ch = 2;
+    int _a_rtcp_ch = 3;
     size_t _pending_bytes = 0;
     size_t _pkts_since_sr = 0;
-    static constexpr uint32_t kRtpStartOffset90k = 90000; // 1 秒（避开 ts=0 的回绕分支）
-    int64_t _ts_base_ms = 0;
-    bool _ts_base_set = false;
-    uint32_t _last_rtp_ts = 0;
-    bool _has_last_rtp_ts = false;
+    uint32_t _last_video_ts = 0;
+    int64_t _video_base_ms = 0;
+    bool _video_base_set = false;
+    uint32_t _last_audio_ts = 0;
+    bool _has_last_video_ts = false;
+    bool _has_last_audio_ts = false;
+    bool _skip_to_idr = false;
 };
 
 // ============================================================================
@@ -712,6 +759,8 @@ std::string RtspServer::statsJson() const {
     out += ",\"negative_ts_clamped\":" + std::to_string(_c_neg_ts.load());
     out += ",\"ts_reordered\":" + std::to_string(_c_ts_reordered.load());
     out += ",\"rtcp_sr\":" + std::to_string(_c_rtcp_sr.load());
+    out += ",\"audio_pkts\":" + std::to_string(_c_audio_pkts.load());
+    out += ",\"skipped_to_idr\":" + std::to_string(_c_skipped_to_idr.load());
     out += "}}";
     return out;
 }

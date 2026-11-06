@@ -108,6 +108,8 @@ private:
     std::atomic<uint64_t> _c_neg_ts{0};
     std::atomic<uint64_t> _c_ts_reordered{0};
     std::atomic<uint64_t> _c_rtcp_sr{0};
+    std::atomic<uint64_t> _c_audio_pkts{0};
+    std::atomic<uint64_t> _c_skipped_to_idr{0};
 };
 
 } // namespace mzmedia

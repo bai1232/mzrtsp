@@ -137,6 +137,7 @@ set(MZMEDIA_SOURCES
         src/output/rtsp_request.cpp
         src/output/sdp_builder.cpp
         src/output/rtp_packetizer.cpp
+        src/output/rtsp_timing.cpp
         src/output/rtsp_server.cpp
         )
 

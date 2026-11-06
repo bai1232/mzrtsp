@@ -44,6 +44,28 @@ ffmpeg -v error -y -rtsp_transport tcp -i rtsp://127.0.0.1:33271/live/sample -t 
 RTP 单片头字段、**FU-A 分片数 + 反向重组逐字节相等**、AAC AU 头、请求解析（半包/版本错/路径穿越）、
 `parseInterleaved` 的 TCP/UDP 分支。
 
+## 3.1 R2 增量（音频 + 慢客户端 + 第二实现验收）
+
+| 能力 | 状态 |
+|---|---|
+| **音频轨**：SDP `m=audio`（`MPEG4-GENERIC` + `aac-hbr` + `config=`） | ✅ `ffprobe` 认 `aac 44100/1` |
+| 每轨独立 SETUP 通道（`trackID=0/1` → `0-1` / `2-3`） | ✅ |
+| AAC 打包（RFC 3640 AU 头）+ **音频 ts = 采样数**（由 pts 推导，**不累加 1024**） | ✅ |
+| `RTP-Info` 同时列出两条轨（`seq`/`rtptime` 各取首包真值） | ✅ 单测逐字节 |
+| **慢客户端**：待发超 256 KB → **跳到下一个 IDR** 并计数（不无限缓冲） | ✅ 实现 + 计数；**未做压力注入验证**（R2 待补） |
+| 第二独立实现验收：`gst-launch-1.0 rtspsrc ! rtph264depay ! fakesink` | ✅ 10 s 收到 274 个 buffer、无 ERROR |
+| 音视频解码：`ffmpeg -rtsp_transport tcp -i …/sample -t 5 -f null -` | ✅ **零 error** |
+
+### 1080p（新测试文件 `samples/sample1080.mp4`，1920×1080 / 5 s / **High profile + B 帧**）
+
+`ffprobe` 认 `h264 1920x1080`；`ffmpeg -t 4 -f null -` **rc=0**（能解）。
+但客户端会打 `non monotonically increasing dts`：**RTP 没有 dts 字段**，ffmpeg 把 RTP ts 同时当
+pts/dts 用，而 B 帧的呈现序天然乱序（实测 pts = 0,160,80,40,120…）。
+我们**不做单调化**（那会把呈现顺序压平，`ts_reordered` 曾涨到 124），只计数。
+
+由此：`ffmpeg -c copy` 把一路 B 帧 RTSP **重新封装成 FLV 会失败**（`Invalid argument`），
+这是客户端侧的约束，不是服务端时间戳错。**基线样本（无 B 帧）不受影响**。
+
 ## 4. 已知现象（**不是本仓的 bug**）
 
 ffmpeg 客户端拉我们的流时，`ffprobe` 会把**首个 AU** 报成 `0.24s`、随后的包才是 `0.04, 0.08 …`，

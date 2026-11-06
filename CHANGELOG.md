@@ -43,7 +43,14 @@
 - 单测 `rtspout` 组 8 例：SDP（`c=`/sprop/profile-level-id）、AVCC 零拷贝、RTP 单片头、
   **FU-A 分片数 + 反向重组逐字节相等**、AAC AU 头、请求解析（半包/版本错/路径穿越）。
 
-**R1 不支持**（明确回 `461 Unsupported Transport`）：UDP 传输；音频轨在 R2。
+**R2 增量**：音频轨（SDP `m=audio` + AAC-hbr + `config=`、每轨独立 SETUP 通道、音频 ts = 采样数）、
+`RTP-Info` 同时列两条轨、慢客户端**跳到下一个 IDR** 并计数；
+验收：`ffprobe` 认 `h264 + aac 44100/1`、音视频 `-f null -` 5 s **零 error**、
+GStreamer `rtspsrc → rtph264depay` 作为第二独立实现收到 274 个 buffer。
+1080p 新测试文件（`samples/sample1080.mp4`，含 B 帧）：能解，但客户端会打
+`non monotonically increasing dts`——RTP 无 dts 字段 + B 帧呈现乱序所致，**我们不做单调化**。
+
+**R1 不支持**（明确回 `461 Unsupported Transport`）：UDP 传输。
 **已知现象**：ffmpeg 客户端会把首个 AU 报成 `0.24s`（服务端发出的 RTP ts 实测单调正确，
 属 FFmpeg 首包行为，与 RTCP SR 无关），见 `docs/DESIGN_RTSP_OUT.md` §4。
 
