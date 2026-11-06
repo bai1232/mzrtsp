@@ -50,6 +50,12 @@ GStreamer `rtspsrc → rtph264depay` 作为第二独立实现收到 274 个 buff
 1080p 新测试文件（`samples/sample1080.mp4`，含 B 帧）：能解，但客户端会打
 `non monotonically increasing dts`——RTP 无 dts 字段 + B 帧呈现乱序所致，**我们不做单调化**。
 
+**R4 验收**：慢客户端（1080p/8 Mbps 下完全停止读取）约 **15 s 被断开**，同期另一观众
+`rtp_pkts` 7,978 → 44,254 持续增长（不受影响），`skipped_to_idr=1`；
+**1 小时“自己拉自己”**（A 的 RTSP 输出 → B 的 RTSP 输入 → 观众拉 FLV）：
+**3.42 GiB / 89,988 帧 / 时间轴 3599.7 s / 跨接缝 dts 倒退 0 次 / 解码零 error /
+A、B 错误日志 0 条 / B 重连 0 次 / RSS 与 fd 1 小时稳定**。
+
 **R3（UDP 传输）**：`--rtsp-udp-pool-pairs N` 预绑定 N 对端口（RTP 偶数/RTCP 紧随），
 每轨租一对；新增 `Socket::sendTo()`；RTCP SR 走 `client_port+1`；
 状态码按语义分离：**未开 UDP → 461**、**池满 → 503 + Retry-After**、缺 `client_port` → 400；
