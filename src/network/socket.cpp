@@ -415,6 +415,35 @@ Socket::Ptr Socket::create(Domain domain, int type) {
     return std::make_shared<Socket>(fd);
 }
 
+ssize_t Socket::sendTo(const void *data, size_t len, const std::string &ip, uint16_t port, int *err,
+                       int flags) {
+    if (err != nullptr) {
+        *err = 0;
+    }
+    if (_fd < 0 || data == nullptr || len == 0) {
+        if (err != nullptr) {
+            *err = EINVAL;
+        }
+        return -1;
+    }
+    struct sockaddr_in addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
+        if (err != nullptr) {
+            *err = EAFNOSUPPORT; // 只支持 IPv4（与项目其余部分一致）
+        }
+        return -1;
+    }
+    const ssize_t n = ::sendto(_fd, data, len, flags, reinterpret_cast<const struct sockaddr *>(&addr),
+                               sizeof(addr));
+    if (n < 0 && err != nullptr) {
+        *err = errno;
+    }
+    return n;
+}
+
 bool Socket::isEagain(int err) {
     return err == EAGAIN || err == EWOULDBLOCK || err == EINTR;
 }

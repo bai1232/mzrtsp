@@ -140,6 +140,16 @@ public:
     /// @return >0 收到的字节数；0 = 对端关闭（EOF）；-1 出错（同样要区分 EAGAIN）
     ssize_t recv(void *buf, size_t len, int flags = 0);
 
+    /**
+     * 【RTSP/UDP 输出】向任意地址发一个数据报（**仅 SOCK_DGRAM**）
+     * @return >=0 已发字节数；-1 出错（*err 带 errno；EAGAIN 不是错误，丢弃本包即可）
+     * @note UDP 是**无连接**的：目标地址由 RTP 客户端的 `client_port` 决定，
+     *       所以不能用 `connect()` + `send()`；收不到 ICMP 错误（未 connect 的 UDP），
+     *       对端消失只能靠会话超时发现 —— 这条写进了 DESIGN_RTSP_OUT §5
+     */
+    ssize_t sendTo(const void *data, size_t len, const std::string &ip, uint16_t port, int *err = nullptr,
+                   int flags = 0);
+
     // ------------------------------------------------------------------
     // 地址
     // ------------------------------------------------------------------

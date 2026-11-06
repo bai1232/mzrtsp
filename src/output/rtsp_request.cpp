@@ -187,6 +187,42 @@ bool RtspRequest::parseInterleaved(const std::string &transport, int *rtp_ch, in
     return true;
 }
 
+bool RtspRequest::parseClientPort(const std::string &transport, int *rtp_port, int *rtcp_port) {
+    if (rtp_port == nullptr || rtcp_port == nullptr || transport.empty()) {
+        return false;
+    }
+    const std::string key = "client_port=";
+    const size_t at = toLower(transport).find(key);
+    if (at == std::string::npos) {
+        return false;
+    }
+    size_t pos = at + key.size();
+    size_t first = 0;
+    size_t second = 0;
+    // 只取数字（端口最多 5 位）
+    std::string a;
+    while (pos < transport.size() && transport[pos] >= '0' && transport[pos] <= '9') {
+        a.push_back(transport[pos++]);
+    }
+    if (!parseUint(a, &first)) {
+        return false;
+    }
+    second = first + 1;
+    if (pos < transport.size() && transport[pos] == '-') {
+        ++pos;
+        std::string b;
+        while (pos < transport.size() && transport[pos] >= '0' && transport[pos] <= '9') {
+            b.push_back(transport[pos++]);
+        }
+        if (!parseUint(b, &second)) {
+            return false;
+        }
+    }
+    *rtp_port = static_cast<int>(first);
+    *rtcp_port = static_cast<int>(second);
+    return true;
+}
+
 std::string RtspRequest::pathName(const std::string &uri) {
     // 只接受 .../live/<name>（与 HTTP 侧 /live/ 同一套名字规则，防路径注入）
     const std::string marker = "/live/";

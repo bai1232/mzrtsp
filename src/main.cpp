@@ -78,6 +78,7 @@ const char *kUsage =
     "  --max-connections <n>        TCP 连接上限（默认由 ulimit -n 推导，最少 16）\n"
     "  --rtsp-out <port>            **RTSP 输出**（我们当服务端）：rtsp://<ip>:<port>/live/<name>\n"
     "  --max-rtsp-clients <n>       RTSP 输出最多几个客户端（默认 64）\n"
+    "  --rtsp-udp-pool-pairs <n>    RTSP 输出的 UDP 端口池对数（默认 0 = 只支持 TCP 交错）\n"
     "  --log-level <l>     trace|debug|info|warn|error|fatal（默认 info）\n"
     "  --log-file <path>   日志文件（默认 logs/mzmedia.log，64MB×5 滚动；FR-6.2）\n"
     "  --help              显示本帮助\n"
@@ -385,6 +386,7 @@ int main(int argc, char **argv) {
     // 【v0.4-a】RTSP 输出：0 = 不启动（默认关；新增能力不改变既有行为）
     uint16_t rtsp_out_port = 0;
     size_t max_rtsp_clients = 64;
+    size_t rtsp_udp_pairs = 0;
     uint32_t hls_lease_ms = 60000;   // FR-1.3 的 60s 同量级；可调是为了让验收脚本能验"租约到期释放"
     LogLevel level = LogLevel::Info;
     // 【M11-a】RTSP 输入：命令行注册"名字 → URL"（**绝不**从 URL query 取地址，避免 SSRF）
@@ -528,6 +530,10 @@ int main(int argc, char **argv) {
                 return 2;
             }
             rtsp_out_port = static_cast<uint16_t>(parsed);
+        } else if (key == "--rtsp-udp-pool-pairs") {
+            if (!parseBoundedSize(value(), 0, 2048, &rtsp_udp_pairs, "--rtsp-udp-pool-pairs")) {
+                return 2;
+            }
         } else if (key == "--max-rtsp-clients") {
             if (!parseBoundedSize(value(), 1, 65535, &max_rtsp_clients, "--max-rtsp-clients")) {
                 return 2;
@@ -621,6 +627,7 @@ int main(int argc, char **argv) {
         RtspServer::Config rtsp_config;
         rtsp_config.port = rtsp_out_port;
         rtsp_config.max_clients = max_rtsp_clients;
+        rtsp_config.udp_pool_pairs = rtsp_udp_pairs;
         rtsp_out = RtspServer::create(poller, manager, resolver, rtsp_config);
         if (!rtsp_out) {
             std::fprintf(stderr, "RTSP 输出初始化失败（--rtsp-out 无效）\n");

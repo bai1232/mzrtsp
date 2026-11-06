@@ -17,6 +17,7 @@
 
 #include "ffmpeg/h264_util.h"
 #include "output/rtp_packetizer.h"
+#include "output/udp_port_pool.h"
 #include "output/rtsp_request.h"
 #include "output/rtsp_timing.h"
 #include "output/sdp_builder.h"
@@ -335,4 +336,74 @@ MZ_TEST(rtspout_sdp_advertises_audio_track) {
     MZ_ASSERT_TRUE(sdp.find("mode=AAC-hbr") != std::string::npos);
     MZ_ASSERT_TRUE(sdp.find("config=1208") != std::string::npos);
     MZ_ASSERT_TRUE(sdp.find("a=control:trackID=1\r\n") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// 【R3】UDP 端口池 + client_port 解析
+// ---------------------------------------------------------------------------
+
+MZ_TEST(rtspout_udp_pool_acquire_release_and_exhaust) {
+    mzmedia::UdpPortPool::Config config;
+    config.pairs = 2;
+    config.port_base = 21800; // 独立段，避免和运行中的服务撞
+    config.bind_ip = "127.0.0.1";
+    std::string error;
+    auto pool = mzmedia::UdpPortPool::create(config, &error);
+    MZ_ASSERT_NOT_NULL(pool.get());
+    if (!pool) {
+        return; // 端口被占（宿主噪声）：不判失败，但要在日志里看到
+    }
+    MZ_ASSERT_EQ(pool->size(), 2u);
+    MZ_ASSERT_EQ(pool->used(), 0u);
+
+    auto *a = pool->acquire();
+    auto *b = pool->acquire();
+    MZ_ASSERT_NOT_NULL(a);
+    MZ_ASSERT_NOT_NULL(b);
+    if (a == nullptr || b == nullptr) {
+        return;
+    }
+    MZ_ASSERT_TRUE(a != b);
+    MZ_ASSERT_EQ(pool->used(), 2u);
+    // 端口对：RTP 偶数、RTCP 紧随（RFC 3551 约定）
+    MZ_ASSERT_EQ(static_cast<int>(b->rtcp_port), static_cast<int>(b->rtp_port) + 1);
+
+    // 池满 → nullptr 且计数（调用方回 503，不是 461）
+    MZ_ASSERT_NULL(pool->acquire());
+    MZ_ASSERT_EQ(pool->exhausted(), 1u);
+
+    // 归还后可再租（幂等：重复归还无害）
+    pool->release(a);
+    pool->release(a);
+    MZ_ASSERT_EQ(pool->used(), 1u);
+    MZ_ASSERT_NOT_NULL(pool->acquire());
+    pool->release(b);
+}
+
+MZ_TEST(rtspout_udp_pool_rejects_zero_and_huge) {
+    std::string error;
+    mzmedia::UdpPortPool::Config zero;
+    zero.pairs = 0;
+    MZ_ASSERT_NULL(mzmedia::UdpPortPool::create(zero, &error).get()); // 0 不是"无限"，是不启用
+
+    mzmedia::UdpPortPool::Config huge;
+    huge.pairs = 4096; // 超过硬上限 2048
+    MZ_ASSERT_NULL(mzmedia::UdpPortPool::create(huge, &error).get());
+}
+
+MZ_TEST(rtspout_parse_client_port) {
+    int rtp = 0;
+    int rtcp = 0;
+    MZ_ASSERT_TRUE(mzmedia::RtspRequest::parseClientPort(
+        "RTP/AVP;unicast;client_port=5000-5001", &rtp, &rtcp));
+    MZ_ASSERT_EQ(rtp, 5000);
+    MZ_ASSERT_EQ(rtcp, 5001);
+    // 只给一个端口 → RTCP 默认紧随
+    MZ_ASSERT_TRUE(
+        mzmedia::RtspRequest::parseClientPort("RTP/AVP;unicast;client_port=6000", &rtp, &rtcp));
+    MZ_ASSERT_EQ(rtp, 6000);
+    MZ_ASSERT_EQ(rtcp, 6001);
+    // 没有 client_port（这是 TCP 交错或畸形请求）
+    MZ_ASSERT_FALSE(mzmedia::RtspRequest::parseClientPort(
+        "RTP/AVP/TCP;unicast;interleaved=0-1", &rtp, &rtcp));
 }

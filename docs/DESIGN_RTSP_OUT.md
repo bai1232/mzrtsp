@@ -66,6 +66,22 @@ pts/dts 用，而 B 帧的呈现序天然乱序（实测 pts = 0,160,80,40,120�
 由此：`ffmpeg -c copy` 把一路 B 帧 RTSP **重新封装成 FLV 会失败**（`Invalid argument`），
 这是客户端侧的约束，不是服务端时间戳错。**基线样本（无 B 帧）不受影响**。
 
+## 3.2 R3：UDP 传输 + 端口池（已落地）
+
+| 能力 | 实现 |
+|---|---|
+| `--rtsp-udp-pool-pairs N`（默认 0 = 只支持 TCP） | `output/udp_port_pool.{h,cpp}`：启动时**预绑定** N 对（RTP 偶数 / RTCP 紧随），运行期只租/还 |
+| UDP SETUP | 解析 `client_port=A-B`，每**轨**租一对，回 `server_port=<rtp>-<rtcp>` + `ssrc` |
+| UDP 发送 | `Socket::sendTo()`（新增，SOCK_DGRAM）直接 fire-and-forget；RTCP SR 发到 `client_port+1` |
+| **状态码语义** | 未开 UDP → 池为空 → **461**（传输方式不支持）；池已满 → **503 + Retry-After**（资源临时不足）；缺 `client_port` → 400 |
+| 端口归还 | 会话析构里归还（幂等）；池里的 socket **不关**，端口继续被池占着 |
+| 观测 | `/api/stats` 的 `rtsp_out.udp_pool{size,used,exhausted}` + `counters.udp_sent` |
+| fd 账 | `fd 预算 = 20 + max_connections + 2 × 池对数`（预绑定口径，不是"每会话 2 个"） |
+
+**实测**：
+- `ffmpeg -rtsp_transport udp -i rtsp://…/live/sample -t 4 -f null -` → **rc=0**；`udp_sent=304`、`audio_pkts=184`；
+- 池 4 对（= 2 个会话）、**3 个并发 UDP 客户端**：2 个被拒（`exhausted=2`、HTTP 层 503 语义），1 个正常拉完（rc=0）——池上限生效，且不是 461 冒充。
+
 ## 4. 已知现象（**不是本仓的 bug**）
 
 ffmpeg 客户端拉我们的流时，`ffprobe` 会把**首个 AU** 报成 `0.24s`、随后的包才是 `0.04, 0.08 …`，

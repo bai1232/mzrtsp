@@ -73,6 +73,10 @@ public:
     /// @return false = 没有 interleaved 参数（调用方据此判断走 UDP 还是回 461）
     static bool parseInterleaved(const std::string &transport, int *rtp_ch, int *rtcp_ch);
 
+    /// `Transport: RTP/AVP;unicast;client_port=5000-5001` → (5000, 5001)
+    /// @return false = 没有 client_port（UDP 的 SETUP 必须带，没有就是客户端 bug → 400）
+    static bool parseClientPort(const std::string &transport, int *rtp_port, int *rtcp_port);
+
     /// 从 URI 里取媒体名：`rtsp://host:554/live/sample` → `sample`
     /// @return 空串 = URI 不合法（不是 /live/<name> 形式）
     static std::string pathName(const std::string &uri);

@@ -139,7 +139,8 @@ cmake -B build && cmake --build build -j"$(nproc)"
 #    常用选项：--port 9000 --media-root /data --loop --speed 4 --log-level debug --log-file logs/x.log --help
 #    准入上限：--max-subscribers 512（每源观众）--max-total-subscribers 1024（进程内总数）
 #              --max-connections N（默认由 ulimit -n 推导）。三个都是**有界**的，0 不是"不限"
-#    RTSP 输出：--rtsp-out 8554 → 标准播放器直接拉 rtsp://<ip>:8554/live/sample（R1：视频 + TCP 交错）
+#    RTSP 输出：--rtsp-out 8554 → 标准播放器直接拉 rtsp://<ip>:8554/live/sample
+#              默认 TCP 交错；要 UDP 就加 --rtsp-udp-pool-pairs 8（预绑定端口池，池满回 503）
 
 # 4) 看画面（二选一）
 #    浏览器：打开 http://127.0.0.1:8080/ ，点「播放」（页面用的是**入库**的 flv.js，离线可用）

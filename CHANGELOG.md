@@ -50,7 +50,12 @@ GStreamer `rtspsrc → rtph264depay` 作为第二独立实现收到 274 个 buff
 1080p 新测试文件（`samples/sample1080.mp4`，含 B 帧）：能解，但客户端会打
 `non monotonically increasing dts`——RTP 无 dts 字段 + B 帧呈现乱序所致，**我们不做单调化**。
 
-**R1 不支持**（明确回 `461 Unsupported Transport`）：UDP 传输。
+**R3（UDP 传输）**：`--rtsp-udp-pool-pairs N` 预绑定 N 对端口（RTP 偶数/RTCP 紧随），
+每轨租一对；新增 `Socket::sendTo()`；RTCP SR 走 `client_port+1`；
+状态码按语义分离：**未开 UDP → 461**、**池满 → 503 + Retry-After**、缺 `client_port` → 400；
+`/api/stats` 增 `udp_pool{size,used,exhausted}` 与 `udp_sent`。
+实测：`ffmpeg -rtsp_transport udp` 拉 4 s → rc=0（`udp_sent=304`）；池 4 对下 3 个并发客户端
+→ 2 个被拒（`exhausted=2`）、1 个正常。
 **已知现象**：ffmpeg 客户端会把首个 AU 报成 `0.24s`（服务端发出的 RTP ts 实测单调正确，
 属 FFmpeg 首包行为，与 RTCP SR 无关），见 `docs/DESIGN_RTSP_OUT.md` §4。
 

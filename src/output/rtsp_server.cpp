@@ -118,6 +118,11 @@ public:
         // 订阅者在成员析构时释放 → 名额/资源自动归还（Subscriber 析构里 release）
         _sub.reset();
         _source.reset();
+        // UDP 端口归还（幂等；池里的 socket 不关，端口继续被池占着）
+        if (_owner->_udp_pool != nullptr) {
+            _owner->_udp_pool->release(_v_udp);
+            _owner->_udp_pool->release(_a_udp);
+        }
         _owner->onSessionClose();
     }
 
@@ -264,9 +269,43 @@ private:
         int rtp_ch = 2 * track;
         int rtcp_ch = 2 * track + 1;
         if (!RtspRequest::parseInterleaved(transport, &rtp_ch, &rtcp_ch)) {
-            // R1/R2 只支持 TCP 交错：UDP 的 SETUP 明确回 461（FFmpeg 会自动回退 TCP）
-            _owner->onRejected("UDP SETUP（只支持 TCP 交错）");
-            return reply(461, cseq);
+            // 【R3】UDP：从池里租一对（每**轨**一对：RTP 偶数、RTCP 紧随）
+            if (_owner->_udp_pool == nullptr) {
+                _owner->onRejected("UDP SETUP（未开启 --rtsp-udp-pool-pairs）");
+                return reply(461, cseq); // 461 = 传输方式不支持（语义正确）
+            }
+            int client_port = 0;
+            int client_rtcp = 0;
+            if (!RtspRequest::parseClientPort(transport, &client_port, &client_rtcp)) {
+                _owner->onRejected("UDP SETUP 缺 client_port");
+                return reply(400, cseq);
+            }
+            UdpPortPool::Pair *pair = _owner->_udp_pool->acquire();
+            if (pair == nullptr) {
+                // 池满 = 资源临时不足 → **503**（不是 461；461 留给"传输方式不支持"）
+                _owner->onRejected("UDP 端口池已满");
+                return reply(503, cseq, "Retry-After: 1\r\n");
+            }
+            if (track == 0) {
+                _v_udp = pair;
+            } else {
+                _a_udp = pair;
+            }
+            _udp = true;
+            _client_ip = peerIP();
+            if (track == 0) {
+                _v_client_port = static_cast<uint16_t>(client_port);
+                _v_client_rtcp_port = static_cast<uint16_t>(client_rtcp);
+            } else {
+                _a_client_port = static_cast<uint16_t>(client_port);
+                _a_client_rtcp_port = static_cast<uint16_t>(client_rtcp);
+            }
+            char hdr[220];
+            std::snprintf(hdr, sizeof(hdr),
+                          "Transport: RTP/AVP;unicast;client_port=%d-%d;server_port=%u-%u;ssrc=%08X\r\n",
+                          client_port, client_rtcp, static_cast<unsigned>(pair->rtp_port),
+                          static_cast<unsigned>(pair->rtcp_port), _video_pkt ? _video_pkt->ssrc() : 1u);
+            return reply(200, cseq, hdr);
         }
         if (track == 0) {
             _v_rtp_ch = rtp_ch;
@@ -316,8 +355,9 @@ private:
         video_config.mtu = 1400;
         _video_pkt = std::make_unique<RtpPacketizer>(video_config);
 
+        // 与 SDP 同一口径：extradata ≥2 字节即可（容器可能给更长，ASC 取前两字节）
         if (streams.audio != nullptr && streams.audio->extradata != nullptr &&
-            streams.audio->extradata->size() == 2) {
+            streams.audio->extradata->size() >= 2) {
             _audio_index = streams.audio->index;
             _audio_rate = streams.audio->sample_rate > 0 ? streams.audio->sample_rate : 44100;
             RtpPacketizer::Config audio_config;
@@ -429,6 +469,23 @@ private:
         }
     }
 
+    /// 发一个 RTP 包：UDP → sendto 到该轨的 client_port；TCP → 交错帧进 out
+    void emitRtp(bool video, const std::string &rtp, std::string *out) {
+        if (_udp && video && _v_udp != nullptr) {
+            int err = 0;
+            (void) _v_udp->rtp->sendTo(rtp.data(), rtp.size(), _client_ip, _v_client_port, &err);
+            _owner->_c_udp_sent.fetch_add(1);
+            return;
+        }
+        if (_udp && !video && _a_udp != nullptr) {
+            int err = 0;
+            (void) _a_udp->rtp->sendTo(rtp.data(), rtp.size(), _client_ip, _a_client_port, &err);
+            _owner->_c_udp_sent.fetch_add(1);
+            return;
+        }
+        out->append(interleavedFrame(video ? _v_rtp_ch : _a_rtp_ch, rtp));
+    }
+
     void packetToInterleaved(const MediaPacket::Ptr &packet, std::string *out) {
         if (!packet) {
             return;
@@ -466,7 +523,7 @@ private:
                 _video_pkt->packetizeNal(nals[i].first, nals[i].second, rtp_ts, marker, &rtp_packets);
             }
             for (const auto &rtp : rtp_packets) {
-                out->append(interleavedFrame(_v_rtp_ch, rtp));
+                emitRtp(true, rtp, out);
                 _pending_bytes += rtp.size() + 4;
                 _owner->_c_rtp_pkts.fetch_add(1);
                 _owner->_c_rtp_bytes.fetch_add(rtp.size());
@@ -476,7 +533,7 @@ private:
             _audio_pkt->packetizeAac(packet->payload()->data(), packet->payload()->size(), rtp_ts,
                                      &rtp_packets);
             for (const auto &rtp : rtp_packets) {
-                out->append(interleavedFrame(_a_rtp_ch, rtp));
+                emitRtp(false, rtp, out);
                 _owner->_c_rtp_pkts.fetch_add(1);
                 _owner->_c_rtp_bytes.fetch_add(rtp.size());
             }
@@ -560,7 +617,12 @@ private:
         put32(_last_video_ts);
         put32(static_cast<uint32_t>(_video_pkt->packets() & 0xFFFFFFFFu));
         put32(static_cast<uint32_t>(_video_pkt->bytes() & 0xFFFFFFFFu));
-        out->append(interleavedFrame(_v_rtcp_ch, sr));
+        if (_udp && _v_udp != nullptr) {
+            int err = 0;
+            (void) _v_udp->rtcp->sendTo(sr.data(), sr.size(), _client_ip, _v_client_rtcp_port, &err);
+        } else {
+            out->append(interleavedFrame(_v_rtcp_ch, sr));
+        }
         _owner->_c_rtcp_sr.fetch_add(1);
     }
 
@@ -604,6 +666,14 @@ private:
     bool _has_last_video_ts = false;
     bool _has_last_audio_ts = false;
     bool _skip_to_idr = false;
+    bool _udp = false;
+    UdpPortPool::Pair *_v_udp = nullptr;
+    UdpPortPool::Pair *_a_udp = nullptr;
+    std::string _client_ip;
+    uint16_t _v_client_port = 0;
+    uint16_t _v_client_rtcp_port = 0;
+    uint16_t _a_client_port = 0;
+    uint16_t _a_client_rtcp_port = 0;
 };
 
 // ============================================================================
@@ -639,6 +709,18 @@ bool RtspServer::start() {
     }
     if (_sdp_ip.empty()) {
         _sdp_ip = detectLocalIpv4();
+    }
+    if (_config.udp_pool_pairs > 0) {
+        UdpPortPool::Config pool_config;
+        pool_config.pairs = _config.udp_pool_pairs;
+        pool_config.port_base = _config.udp_port_base;
+        std::string pool_error;
+        _udp_pool = UdpPortPool::create(pool_config, &pool_error);
+        if (!_udp_pool) {
+            // UDP 是显式开启的：开不起来就**明确失败**（不静默退化成"只支持 TCP"）
+            ErrorL << "RtspServer：UDP 端口池创建失败（" << pool_error << "）";
+            return false;
+        }
     }
     (void) _tcp->setMaxSessionCount(_config.max_clients);
     RtspServer *raw = this;
@@ -746,6 +828,11 @@ std::string RtspServer::statsJson() const {
     out += ",\"sessions_max\":" + std::to_string(_config.max_clients);
     out += ",\"playing\":" + std::to_string(_playing.load());
     out += ",\"rejected\":" + std::to_string(_total_rejected.load());
+    if (_udp_pool) {
+        out += ",\"udp_pool\":{\"size\":" + std::to_string(_udp_pool->size()) +
+               ",\"used\":" + std::to_string(_udp_pool->used()) +
+               ",\"exhausted\":" + std::to_string(_udp_pool->exhausted()) + "}";
+    }
     out += ",\"requests\":" + std::to_string(_total_requests.load());
     out += ",\"counters\":{\"describe\":" + std::to_string(_c_describe.load());
     out += ",\"setup\":" + std::to_string(_c_setup.load());
@@ -761,6 +848,7 @@ std::string RtspServer::statsJson() const {
     out += ",\"rtcp_sr\":" + std::to_string(_c_rtcp_sr.load());
     out += ",\"audio_pkts\":" + std::to_string(_c_audio_pkts.load());
     out += ",\"skipped_to_idr\":" + std::to_string(_c_skipped_to_idr.load());
+    out += ",\"udp_sent\":" + std::to_string(_c_udp_sent.load());
     out += "}}";
     return out;
 }

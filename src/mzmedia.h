@@ -89,3 +89,4 @@
 #include "output/hls_service.h"
 #include "output/rtsp_server.h"
 #include "output/rtsp_timing.h"
+#include "output/udp_port_pool.h"

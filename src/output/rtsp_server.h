@@ -17,6 +17,7 @@
 #pragma once
 
 #include "media/source_manager.h"
+#include "output/udp_port_pool.h"
 #include "network/event_poller.h"
 
 #include <atomic>
@@ -39,6 +40,9 @@ public:
         uint16_t port = 0;          ///< 0 = 不启动 RTSP 输出
         size_t max_clients = 64;    ///< 同时最多几个 RTSP 客户端（0 非法）
         std::string sdp_ip;         ///< SDP 的 `c=` 地址；空 = 自动探测本机出口 IP
+        /// 【R3】UDP 端口池的对数（0 = 不启用 UDP：客户端 SETUP 会收到 461）
+        size_t udp_pool_pairs = 0;
+        uint16_t udp_port_base = 20000; ///< 池起始端口（RTP 偶数、RTCP 紧随）
     };
 
     static Ptr create(const EventPoller::Ptr &poller, const SourceManager::Ptr &manager,
@@ -90,6 +94,7 @@ private:
     PathResolver _resolve;
     Config _config;
     std::shared_ptr<class TcpServer> _tcp;
+    UdpPortPool::Ptr _udp_pool; ///< 【R3】UDP 端口池（空 = 不启用）
     std::string _sdp_ip;
 
     std::atomic<uint64_t> _total_sessions{0};
@@ -110,6 +115,7 @@ private:
     std::atomic<uint64_t> _c_rtcp_sr{0};
     std::atomic<uint64_t> _c_audio_pkts{0};
     std::atomic<uint64_t> _c_skipped_to_idr{0};
+    std::atomic<uint64_t> _c_udp_sent{0};
 };
 
 } // namespace mzmedia
